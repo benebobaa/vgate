@@ -39,7 +39,7 @@ export function atLeast(found: number[], min: number[]): boolean {
   return true;
 }
 
-interface ToolSpec {
+export interface ToolSpec {
   id: string;
   command: string;
   args: string[];
@@ -50,7 +50,7 @@ interface ToolSpec {
   fix: string;
 }
 
-function checkTool(spec: ToolSpec): Check {
+export function checkTool(spec: ToolSpec): Check {
   // Asked from a neutral directory: a version check run inside the project would read the project's package manager
   // (corepack refuses pnpm in a bun or yarn project), which says nothing about the tool vgate will use.
   const run = capture(spec.command, spec.args, tmpdir(), 15_000, toolEnv());
