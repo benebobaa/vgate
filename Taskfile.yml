@@ -93,8 +93,11 @@ tasks:
         {{if .FOREIGN}}
         cd "{{.PROJECT}}"
         status=0
-        "{{.BIN}}/eslint" --config "{{.ROOT_DIR}}/eslint.config.js" "{{.SERVICES_DIR}}" || status=1
-        find "{{.SERVICES_DIR}}" -name '*.ts' -not -path '*/node_modules/*' -not -path '*/generated/*' -print0 |
+        # The files the generated tsconfig includes (each service's *.ts, support/ and tests/), and no others: a mock
+        # server or a seed script elsewhere under a service is not test code, and typed linting cannot parse it.
+        set -- "{{.SERVICES_DIR}}"/*/*.ts "{{.SERVICES_DIR}}"/*/support "{{.SERVICES_DIR}}"/*/tests
+        "{{.BIN}}/eslint" --config "{{.ROOT_DIR}}/eslint.config.js" --no-error-on-unmatched-pattern "$@" || status=1
+        find "$@" -name '*.ts' -not -path '*/node_modules/*' -not -path '*/generated/*' -print0 2>/dev/null |
           xargs -0 -r "{{.BIN}}/prettier" --config "{{.ROOT_DIR}}/.prettierrc.json" --no-editorconfig --check || status=1
         exit $status
         {{else}}
