@@ -98,6 +98,8 @@ jobs:
           cd "$project"
           git init -q
           "$bin/vgate" init --service api --ci github --json | jq -e '.ok'
+          # A helper outside tests/ and support/ (a mock server, a seed script) is not test code: lint must leave it be.
+          mkdir -p regression/api/tools && printf 'const port: number = 1;\nexport default port;\n' > regression/api/tools/mock.ts
           "$bin/vgate" doctor --fix --service api --json | jq -e '.data.checks | map(select(.status == "fail")) | length == 0'
           "$bin/vgate" gate --service api --steps selftest,typecheck,lint --json | jq -e '.data.verdict == "pass"'
       - run: pnpm exec tsx scripts/release.ts --dry-run
