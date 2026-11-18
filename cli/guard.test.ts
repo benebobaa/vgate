@@ -442,6 +442,22 @@ function run(root: string, base = 'main') {
 }
 
 describe('guard', () => {
+  it('judges the change since its branch point: a scenario main gained afterwards is not "removed"', () => {
+    const p = project();
+    const top = join(p.root);
+    git(top, 'checkout', '-q', '-b', 'feature');
+    // main moves on: a new scenario and its test land there after the branch was cut.
+    git(top, 'checkout', '-q', 'main');
+    p.write('services/svc/inventory.yaml', PLAN.replace('- id: GET-404', '- id: GET-404\n      - id: GET-401-BUILTIN'));
+    p.write('services/svc/tests/builtin.spec.ts', `test('[GET-401-BUILTIN] x', () => { expect(1).toBe(1); });\n`);
+    git(top, 'add', '-A');
+    git(top, 'commit', '-q', '-m', 'main gains a scenario');
+    git(top, 'checkout', '-q', 'feature');
+    p.write('services/svc/tests/notes.spec.ts', TESTS + `// a harmless edit on the branch\n`);
+    const { report } = run(p.root);
+    assert.equal(report.decision, 'auto', JSON.stringify(report.findings));
+  });
+
   it('decides auto on additive changes and writes the report', () => {
     const p = project();
     p.write(

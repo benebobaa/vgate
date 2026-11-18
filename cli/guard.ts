@@ -760,7 +760,10 @@ export function guard(root: string, options: { service: string; base: string | u
   if (git(topDir, ['rev-parse', '--verify', '--quiet', `${options.base}^{commit}`]).code !== 0)
     throw new UsageError(`Unknown base ref "${options.base}" (fetch it first, e.g. git fetch origin <branch>)`);
 
-  const repo = new Repo(topDir, realRoot, options.base);
+  // Judge what this change did, not what the base gained since it branched: compare with the merge base, as
+  // `affected` does. Otherwise an expectation added to main after the branch point reads as removed by the change.
+  const mb = git(topDir, ['merge-base', options.base, 'HEAD']);
+  const repo = new Repo(topDir, realRoot, mb.code === 0 ? mb.out.trim() : options.base);
   const project = readProject(realRoot);
   const servicesDir = project.servicesDirName;
   const svc = `${servicesDir}/${options.service}`;
