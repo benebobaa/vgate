@@ -1,0 +1,34 @@
+# Test plan of example-migrations: the reference for `vgate migrations` (README.md).
+service: example-migrations
+contract: openapi.yaml
+backend:
+  repo: app
+  commit: n/a (in this repository)
+sources:
+  - openapi.yaml
+  - README.md
+personas:
+  anonymous: { kind: seeded, note: the API has no authentication }
+operations:
+  - id: health
+    operation: GET /health
+    area: HLT
+    permission: null
+    responses: { '200': [] }
+    scenarios:
+      - id: HLT-200
+        title: answers UP
+        as: anonymous
+        expect: { status: 200, response: [status is UP] }
+        sources: [openapi.yaml health]
+  - id: listItems
+    operation: GET /items
+    area: ITM
+    permission: null
+    responses: { '200': [] }
+    scenarios:
+      - id: ITM-200
+        title: lists the seeded items by id, each with its name
+        as: anonymous
+        expect: { status: 200, response: [apple and pear present, every item has a name] }
+        sources: [README.md rule 1, openapi.yaml listItems]

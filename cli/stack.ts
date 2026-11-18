@@ -2,7 +2,8 @@
 import { spawn } from 'node:child_process';
 import { existsSync, type WriteStream } from 'node:fs';
 import { join, relative } from 'node:path';
-import { loadService } from '../framework/config.ts';
+import { loadService, type ServiceConfig } from '../framework/config.ts';
+import { envDown, envStatus, envUp, readState } from '../framework/env/lifecycle.ts';
 import type { ProjectConfig } from '../framework/project.ts';
 import { stackUp } from './doctor.ts';
 import { CLI, EXIT, UsageError, tail, type Result } from './output.ts';
@@ -67,6 +68,25 @@ export async function stack(project: ProjectConfig, runtime: Runtime, options: S
   // The CLI never prompts (its caller may be an agent with no terminal): the flag is the consent.
   if (action === 'reset' && !options.yes)
     throw new UsageError(`reset wipes the local test data of ${service}: pass --yes to confirm`);
+
+  // A declared environment (service.yaml `environment:`) is started by vgate itself, sealed and per run.
+  let declared: ServiceConfig | undefined;
+  try {
+    const svc = loadService(service, options.env, root);
+    if (svc.environment) declared = svc;
+  } catch (error) {
+    if (!existsSync(join(project.servicesDir, service, 'stack.sh'))) {
+      return {
+        command: action,
+        ok: false,
+        exitCode: EXIT.notReady,
+        summary: (error as Error).message,
+        data: { service, action },
+        next: [`${CLI} doctor --service ${service}`],
+      };
+    }
+  }
+  if (declared) return declaredStack(project, declared, options);
 
   const script = relative(root, join(project.servicesDir, service, 'stack.sh'));
   if (!existsSync(join(root, script))) {
@@ -133,4 +153,80 @@ export async function stack(project: ProjectConfig, runtime: Runtime, options: S
     // Live runs already showed the output on stderr.
     text: options.live ? [] : tail(run.output, 30),
   };
+}
+
+/** up / down / status / reset of a declared environment: vgate starts it from service.yaml, sealed, for this run. */
+async function declaredStack(project: ProjectConfig, svc: ServiceConfig, options: StackOptions): Promise<Result> {
+  const { action } = options;
+  const service = svc.name;
+  const decl = svc.environment!;
+  const reports = project.reportsDir;
+  const started = Date.now();
+  const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
+  try {
+    if (action === 'down') {
+      // With what a killed `vgate migrations` left behind (its environment is labelled `<service>-mig`).
+      const removed = await envDown(reports, service, options.live);
+      const leftover = await envDown(reports, `${service}-mig`, options.live);
+      return {
+        command: action,
+        ok: true,
+        exitCode: EXIT.ok,
+        summary:
+          removed || leftover
+            ? `${service}: environment removed (containers, networks, volumes) in ${elapsed()}`
+            : `${service}: no environment of this project was running`,
+        data: { service, action, removed: removed || leftover },
+        next: [],
+      };
+    }
+    if (action === 'status') {
+      const status = await envStatus(reports, service);
+      const state = readState(reports, service);
+      return {
+        command: action,
+        ok: true,
+        exitCode: EXIT.ok,
+        summary: `${service}: ${status.up ? `UP (${status.project})` : 'DOWN'}`,
+        data: {
+          service,
+          action,
+          up: status.up,
+          project: status.project,
+          containers: status.containers,
+          published: state?.published ?? [],
+        },
+        next: status.up ? [] : [`${CLI} up --service ${service}`],
+        text: status.containers.map((c) => `${c.state.padEnd(8)}  ${c.service}`),
+      };
+    }
+    // up and reset: a declared environment is disposable, so a reset is a fresh environment.
+    const state = await envUp({ service, decl, reportsDir: reports, live: options.live, projectRoot: project.root });
+    return {
+      command: action,
+      ok: true,
+      exitCode: EXIT.ok,
+      summary: `${service}: ${state.sealed ? 'sealed ' : ''}environment ${state.project} up in ${elapsed()} (app at ${state.external.app?.url ?? '?'})`,
+      data: {
+        service,
+        action,
+        project: state.project,
+        runId: state.runId,
+        sealed: state.sealed,
+        published: state.published,
+        app: state.external.app,
+      },
+      next: [`${CLI} gate --service ${service}`, `${CLI} down --service ${service}`],
+    };
+  } catch (error) {
+    return {
+      command: action,
+      ok: false,
+      exitCode: EXIT.notReady,
+      summary: `${service}: ${action} failed: ${((error as Error).message.split('\n')[0] ?? '').slice(0, 300)}`,
+      data: { service, action, error: tail((error as Error).message, 60) },
+      next: [`${CLI} doctor --service ${service}`],
+      text: options.live ? [] : tail((error as Error).message, 60),
+    };
+  }
 }

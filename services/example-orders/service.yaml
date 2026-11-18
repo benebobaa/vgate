@@ -1,5 +1,6 @@
-# example-orders: the framework's reference for a service with dependencies (README.md). The app runs on the host,
-# its dependencies in compose.yaml: `pnpm vgate up --service example-orders`.
+# example-orders: the framework's reference for a service with dependencies (README.md). Every run starts its own
+# sealed environment from the block below - the app as a container, its dependencies, no route out - and removes it
+# afterwards: `pnpm vgate up --service example-orders` (docs/environments.md).
 name: example-orders
 
 spec: openapi.yaml
@@ -21,30 +22,54 @@ schemathesis:
   users: [clerk]
   maxExamples: 25
 
+environment:
+  app:
+    build: { context: services/example-orders/app } # relative to the project root
+    port: 8091
+    health: /health
+    env:
+      ORDERS_PORT: '8091'
+      ORDERS_CLERK_KEY: '${EXAMPLE_ORDERS_CLERK_KEY:-clerk-key}'
+      ORDERS_DB_URL: '{postgres.url}'
+      ORDERS_REDIS_URL: '{cache.url}'
+      ORDERS_KAFKA_BROKERS: '{events.brokers}'
+      ORDERS_PAYMENTS_URL: '{payments.url}' # through the edge (faults: true), so the tests can slow or cut it
+      ORDERS_SMTP_HOST: '{mail.smtpHost}' # README rule 9
+      ORDERS_SMTP_PORT: '{mail.smtpPort}'
+      ORDERS_CALL_HOME: '${EXAMPLE_ORDERS_CALL_HOME:-}' # empty; the outbound self-check sets it (docs/environments.md)
+  dependencies:
+    postgres: { kind: postgres, options: { database: orders, user: orders, password: orders } }
+    cache: { kind: redis }
+    events: { kind: kafka, topics: { orders.created: { partitions: 3 } } } # partitions: the consumer sees several
+    payments: { kind: wiremock, faults: true } # the third-party payment provider
+    mail: { kind: mailpit } # where the confirmation mails go (README rule 9); keeps them for the tests
+
 environments:
   local:
-    disposable: true # every dependency is a local container; `vgate reset` empties them
-    baseUrl: http://localhost:${EXAMPLE_ORDERS_PORT:-8091} # the app runs on the host; its containers at STACK_HOST
+    disposable: true # a sealed environment of this run's own; `vgate down` removes it with its data
+    baseUrl: '{app.url}'
     healthPath: /health
     auth: { header: X-Api-Key, scheme: '' } # README rule 1
-    db: { url: 'postgres://orders:orders@${STACK_HOST:-localhost}:55432/orders' }
-    compose: { file: compose.yaml, project: example-orders }
+    db: { url: '{postgres.url}' }
     users:
       clerk: { token: '${EXAMPLE_ORDERS_CLERK_KEY:-clerk-key}', role: clerk }
     dependencies:
       payments: # the third-party payment provider, stubbed and held to its own contract
         kind: http-stub
-        adminUrl: http://${STACK_HOST:-localhost}:58080
+        adminUrl: '{payments.adminUrl}'
         contract: deps/payments.openapi.yaml
-        proxy: payments # toxiproxy sits between the app and the stub (deps/toxiproxy.json)
+        proxy: '{payments.proxy}' # the edge's proxy between the app and the stub
       events:
         kind: kafka
-        brokers: ['${STACK_HOST:-localhost}:59092']
+        brokers: ['{events.brokers}']
         topics:
           orders.created: { schema: deps/events/orders.created.schema.json }
       cache:
         kind: redis
-        url: redis://${STACK_HOST:-localhost}:56379
+        url: '{cache.url}'
       proxies:
         kind: toxiproxy
-        url: http://${STACK_HOST:-localhost}:58474
+        url: '{edge.api}'
+      mail: # the inbox the tests read (README rule 9)
+        kind: mailpit
+        apiUrl: '{mail.apiUrl}'

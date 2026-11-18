@@ -1,0 +1,326 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { after, describe, it } from 'node:test';
+import { readProject } from '../framework/project.ts';
+import { treeState, type TreeState } from './commit.ts';
+import { decide, decideFrom, judgeMigrations, renderMarkdown, type Decision } from './decide.ts';
+import { lint, migrations, planEnvironment, type MigrationsReport } from './migrations.ts';
+import { parseEnvironment } from '../framework/env/declare.ts';
+import { migrateConfigs } from '../framework/env/migrate.ts';
+import type { ServiceConfig } from '../framework/config.ts';
+import type { Runtime } from './runtime.ts';
+import type { RiskReport } from './risk.ts';
+
+const dirs: string[] = [];
+after(() => dirs.forEach((dir) => rmSync(dir, { recursive: true, force: true })));
+
+const write = (root: string, path: string, text: string) => {
+  mkdirSync(dirname(join(root, path)), { recursive: true });
+  writeFileSync(join(root, path), text);
+};
+const git = (cwd: string, ...args: string[]) => {
+  const run = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  return run.stdout.trim();
+};
+
+const report = (over: Partial<MigrationsReport>): MigrationsReport => ({
+  schema: 'vgate.migrations/1',
+  service: 'items',
+  base: 'main',
+  mergeBase: 'mb',
+  commit: { sha: 'abc', dirty: false, fingerprint: 'f' },
+  verdict: 'safe',
+  reasons: [],
+  dirs: ['db/migrations'],
+  added: ['2.up.sql'],
+  lint: [],
+  steps: [],
+  startedAt: '2026-11-18T00:00:00.000Z',
+  durationMs: 1,
+  ...over,
+});
+const now: TreeState = { sha: 'abc', dirty: false, fingerprint: 'f' };
+const touched = ['db/migrations/2.up.sql'];
+
+describe('judgeMigrations', () => {
+  it('counts no evidence, another merge base or another tree as not verified', () => {
+    assert.equal(judgeMigrations('items', touched, undefined, 'mb', now).state, 'missing');
+    assert.equal(judgeMigrations('items', touched, report({ mergeBase: 'other' }), 'mb', now).state, 'missing');
+    const stale = judgeMigrations('items', touched, report({ commit: { ...now, sha: 'old' } }), 'mb', now);
+    assert.equal(stale.state, 'missing');
+    assert.match(stale.reasons[0], /stale/);
+  });
+  it('carries a blocked or risky verdict with its reasons, and passes a safe one', () => {
+    const blocked = judgeMigrations('items', touched, report({ verdict: 'blocked', reasons: ['x'] }), 'mb', now);
+    assert.deepEqual([blocked.state, blocked.reasons], ['blocked', ['items migrations: x']]);
+    assert.equal(
+      judgeMigrations('items', touched, report({ verdict: 'needs-approval' }), 'mb', now).state,
+      'needs-approval',
+    );
+    assert.equal(judgeMigrations('items', touched, report({}), 'mb', now).state, 'safe');
+  });
+});
+
+describe('decide with migrations', () => {
+  const lowRisk: RiskReport = { tier: 'low', rules: 'built-in', matches: [], low: 1 } as unknown as RiskReport;
+  const green = [
+    {
+      name: 'items',
+      change: 'affected' as const,
+      gate: 'pass' as const,
+      guard: 'auto' as const,
+      failures: [],
+      guardFindings: [],
+      knownFailures: [],
+    },
+  ];
+  const decideWith = (state: 'safe' | 'needs-approval' | 'blocked' | 'missing') =>
+    decideFrom({
+      affected: ['items'],
+      risk: lowRisk,
+      policy: { autoMerge: 'low' },
+      services: green,
+      migrations: [{ service: 'items', state, touched, reasons: [`items: ${state}`] }],
+    });
+  it('blocks on blocked or unverified migrations, asks a human on risky ones, merges safe ones', () => {
+    assert.equal(decideWith('blocked').decision, 'blocked');
+    assert.equal(decideWith('missing').decision, 'blocked');
+    assert.deepEqual(decideWith('needs-approval'), { decision: 'needs-approval', reasons: ['items: needs-approval'] });
+    assert.equal(decideWith('safe').decision, 'merge');
+  });
+
+  it('reads migrations.json evidence end to end: unverified blocks, current and safe merges', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'vgate-decide-migrations-'));
+    dirs.push(root);
+    git(root, 'init', '-q', '-b', 'main');
+    git(root, 'config', 'user.email', 't@example.invalid');
+    git(root, 'config', 'user.name', 't');
+    // autoMerge: high, so the migrations rule is what decides (a migrations directory is high risk by default).
+    write(root, 'vgate.yaml', 'version: 0.2.0\nservicesDir: regression\npolicy:\n  autoMerge: high\n');
+    write(
+      root,
+      'regression/items/service.yaml',
+      [
+        'spec: openapi.yaml',
+        "paths: ['app/**']",
+        'environment:',
+        '  app: { image: items:1, port: 8080 }',
+        '  dependencies:',
+        '    db:',
+        '      kind: postgres',
+        '      migrate: { dir: app/db/migrations, command: up }',
+        '',
+      ].join('\n'),
+    );
+    write(root, 'regression/items/openapi.yaml', 'openapi: 3.1.0\n');
+    write(root, 'app/db/migrations/1.up.sql', 'CREATE TABLE items (id int);\n');
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'base');
+    git(root, 'checkout', '-q', '-b', 'feature');
+    write(root, 'app/db/migrations/2.up.sql', 'ALTER TABLE items ADD COLUMN note text;\n');
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'feature');
+    const project = readProject(root);
+    const head = treeState(project);
+    const mergeBase = git(root, 'merge-base', 'main', 'HEAD');
+    write(
+      root,
+      'evidence/items/verdict.json',
+      JSON.stringify({
+        schema: 'vgate.verdict/1',
+        service: 'items',
+        verdict: 'pass',
+        complete: true,
+        startedAt: '2026-11-18T00:00:00.000Z',
+        expectations: {},
+        steps: [],
+        commit: head,
+      }),
+    );
+    write(
+      root,
+      'evidence/items/guard.json',
+      JSON.stringify({ schema: 'vgate.guard/1', service: 'items', base: 'main', head, decision: 'auto', findings: [] }),
+    );
+    const evidence = join(root, 'evidence');
+    const first = (await decide(project, { base: 'main', evidence })).data as Decision;
+    assert.equal(first.decision, 'blocked', first.reasons.join('; '));
+    assert.match(first.reasons.join(' '), /touches 1 migration file, but they were not verified/);
+
+    write(root, 'evidence/items/migrations.json', JSON.stringify(report({ mergeBase, commit: head })));
+    const second = (await decide(project, { base: 'main', evidence })).data as Decision;
+    assert.equal(second.decision, 'merge', second.reasons.join('; '));
+    assert.deepEqual(
+      second.migrations.map((m) => [m.service, m.state, m.touched]),
+      [['items', 'safe', ['app/db/migrations/2.up.sql']]],
+    );
+    const md = readFileSync(join(root, 'reports/decision.md'), 'utf8');
+    assert.match(md, /Database migrations/);
+    assert.match(md, /the deployed version keeps working on the new schema/);
+
+    // Read in name order, the blocked file comes first and the safe one last: the worse verdict still wins.
+    write(
+      root,
+      'evidence/aa/migrations.json',
+      JSON.stringify(report({ mergeBase, commit: head, verdict: 'blocked', reasons: ['old code fails'] })),
+    );
+    const third = (await decide(project, { base: 'main', evidence })).data as Decision;
+    assert.equal(third.decision, 'blocked');
+    assert.match(renderMarkdown(third), /not safe to deploy/);
+  });
+
+  /** A repo whose base declares `migrate:` on app/db/migrations; `change` edits the branch, then decide runs. */
+  async function decideAfter(change: (root: string) => void, paths = "['app/**']"): Promise<Decision> {
+    const root = mkdtempSync(join(tmpdir(), 'vgate-decide-migrations-'));
+    dirs.push(root);
+    git(root, 'init', '-q', '-b', 'main');
+    git(root, 'config', 'user.email', 't@example.invalid');
+    git(root, 'config', 'user.name', 't');
+    write(root, 'vgate.yaml', 'version: 0.2.0\nservicesDir: regression\npolicy:\n  autoMerge: high\n');
+    const service = (migrate: string) =>
+      `spec: openapi.yaml\npaths: ${paths}\nenvironment:\n  app: { image: items:1, port: 8080 }\n  dependencies:\n    db:\n      kind: postgres\n${migrate}`;
+    write(root, 'regression/items/service.yaml', service('      migrate: { dir: app/db/migrations, command: up }\n'));
+    write(root, 'regression/items/openapi.yaml', 'openapi: 3.1.0\n');
+    write(root, 'app/db/migrations/1.up.sql', 'CREATE TABLE items (id int);\n');
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'base');
+    git(root, 'checkout', '-q', '-b', 'feature');
+    change(root);
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'feature');
+    const project = readProject(root);
+    const head = treeState(project);
+    write(
+      root,
+      'evidence/items/verdict.json',
+      JSON.stringify({
+        schema: 'vgate.verdict/1',
+        service: 'items',
+        verdict: 'pass',
+        complete: true,
+        startedAt: '2026-11-18T00:00:00.000Z',
+        expectations: {},
+        steps: [],
+        commit: head,
+      }),
+    );
+    write(
+      root,
+      'evidence/items/guard.json',
+      JSON.stringify({ schema: 'vgate.guard/1', service: 'items', base: 'main', head, decision: 'auto', findings: [] }),
+    );
+    return (await decide(project, { base: 'main', evidence: join(root, 'evidence') })).data as Decision;
+  }
+
+  it('still sees a migration added where the base kept them after `migrate:` is dropped', async () => {
+    const d = await decideAfter((root) => {
+      write(
+        root,
+        'regression/items/service.yaml',
+        "spec: openapi.yaml\npaths: ['app/**']\nenvironment:\n  app: { image: items:1, port: 8080 }\n  dependencies:\n    db: { kind: postgres }\n",
+      );
+      write(root, 'app/db/migrations/2.up.sql', 'ALTER TABLE items DROP COLUMN id;\n');
+    });
+    assert.equal(d.decision, 'blocked', d.reasons.join('; '));
+    assert.deepEqual(
+      d.migrations.map((m) => [m.state, m.touched]),
+      [['missing', ['app/db/migrations/2.up.sql']]],
+    );
+  });
+
+  it("counts a service's migrations as affecting it even when its paths: leave them out", async () => {
+    const d = await decideAfter(
+      (root) => write(root, 'app/db/migrations/2.up.sql', 'ALTER TABLE items DROP COLUMN id;\n'),
+      "['app/src/**']",
+    );
+    assert.equal(d.decision, 'blocked', d.reasons.join('; '));
+    assert.deepEqual(
+      d.migrations.map((m) => [m.service, m.state]),
+      [['items', 'missing']],
+    );
+  });
+});
+
+describe('vgate migrations: what it cannot verify is not safe', () => {
+  it('asks a human for an edited migration the deployed databases already applied, without Docker', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'vgate-migrations-edit-'));
+    dirs.push(root);
+    git(root, 'init', '-q', '-b', 'main');
+    git(root, 'config', 'user.email', 't@example.invalid');
+    git(root, 'config', 'user.name', 't');
+    write(root, 'vgate.yaml', 'version: 0.2.0\nservicesDir: regression\n');
+    write(
+      root,
+      'regression/items/service.yaml',
+      [
+        'spec: openapi.yaml',
+        "environments: { local: { baseUrl: 'http://127.0.0.1:1' } }",
+        'environment:',
+        '  app: { image: items:1, port: 8080 }',
+        '  dependencies:',
+        '    db: { kind: postgres, migrate: { dir: app/db/migrations, command: up } }',
+        '',
+      ].join('\n'),
+    );
+    write(root, 'regression/items/openapi.yaml', 'openapi: 3.1.0\n');
+    write(root, 'app/db/migrations/1.up.sql', 'CREATE TABLE items (id int);\n');
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'base');
+    git(root, 'checkout', '-q', '-b', 'feature');
+    write(root, 'app/db/migrations/1.up.sql', 'CREATE TABLE items (id bigint, note text);\n');
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'edit an applied migration');
+    const result = await migrations(readProject(root), {} as Runtime, {
+      service: 'items',
+      base: 'main',
+      env: 'local',
+      live: false,
+    });
+    const data = result.data as MigrationsReport;
+    assert.equal(result.exitCode, 1, result.summary);
+    assert.equal(data.verdict, 'needs-approval');
+    assert.match(data.reasons[0], /1\.up\.sql is edited, but the deployed databases already applied it/);
+  });
+
+  it('reports a squawk that did not run as unlinted, never as no findings', async () => {
+    const saved = process.env.PATH;
+    process.env.PATH = '/nonexistent';
+    try {
+      const cfg = { dependency: 'db', kind: 'postgres', dir: '/tmp', command: 'up', smoke: 'GET /' };
+      const linted = await lint(cfg, ['2.up.sql'], '/tmp', false);
+      assert.deepEqual(linted.findings, []);
+      assert.match(linted.unlinted ?? '', /not linted: squawk did not run/);
+    } finally {
+      process.env.PATH = saved;
+    }
+  });
+
+  it("labels the check's environment, so `vgate down` finds what a killed check left", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vgate-migrations-plan-'));
+    dirs.push(dir);
+    const decl = parseEnvironment(
+      {
+        app: { image: 'items:1', port: 8080 },
+        dependencies: { db: { kind: 'postgres', migrate: { dir: 'db', command: 'up' } } },
+      },
+      { service: dir, project: dir },
+    );
+    const [cfg] = migrateConfigs(decl, dir);
+    const env = await planEnvironment(
+      { name: 'items', environment: decl } as ServiceConfig,
+      cfg,
+      dir,
+      dir,
+      'r1',
+      '/p/reports',
+    );
+    const compose = readFileSync(env.composeFile, 'utf8');
+    assert.match(compose, /dev\.vgate\.service: items-mig/);
+    assert.match(compose, /dev\.vgate\.reports: \/p\/reports/);
+    assert.equal(env.project, 'vgate-items-mig-r1');
+  });
+});

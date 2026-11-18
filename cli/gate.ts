@@ -15,6 +15,7 @@ import { mergeSummaries, parseJunit, testcaseNames, type TestSummary } from './j
 import { CLI, EXIT, UsageError, tail, type Result } from './output.ts';
 import { prepare, stepEnv, type Runtime } from './runtime.ts';
 import { runStreamed } from './stack.ts';
+import { envOutbound, type Outbound } from '../framework/env/lifecycle.ts';
 
 export const STEPS = ['selftest', 'typecheck', 'lint', 'test', 'contract', 'coverage'] as const;
 export type Step = (typeof STEPS)[number];
@@ -82,7 +83,20 @@ export interface Verdict {
   tests?: TestSummary;
   registry?: RegistrySummary;
   coverage?: CoverageSummary;
+  /**
+   * Where the service ran (named `sandbox` because `environment` is the service.yaml environment's name): `declared` (a sealed environment of its own, docs/environments.md) or `script` (its
+   * stack.sh). `outbound` lists every name a container of the environment tried to reach outside it; in a sealed
+   * environment one from the app fails the verdict.
+   */
+  sandbox: EnvironmentFacts;
   evidence: Record<string, string | string[]>;
+}
+
+export interface EnvironmentFacts {
+  kind: 'declared' | 'script';
+  sealed: boolean;
+  project?: string;
+  outbound: Outbound[];
 }
 
 export interface GateOptions {
@@ -194,6 +208,17 @@ export function summarise(verdict: Verdict): string {
     parts.push(`registry: ${registry.expired.length} expired, ${registry.stale.length} stale`);
   if (verdict.coverage) parts.push(`coverage ${verdict.coverage.covered}/${verdict.coverage.demanded}`);
   if (!verdict.complete) parts.push('partial run');
+  const env = verdict.sandbox;
+  if (env?.kind === 'declared') {
+    const escaped = env.sealed ? env.outbound.filter((a) => a.from === 'app') : [];
+    parts.push(
+      escaped.length > 0
+        ? `the app tried to reach ${escaped.map((a) => a.host).join(', ')} from its sealed environment`
+        : env.sealed
+          ? 'sealed environment, no outbound call'
+          : 'environment not sealed',
+    );
+  }
   const head = `GATE ${verdict.verdict === 'pass' ? 'PASSED' : 'FAILED'} ${verdict.service}/${verdict.environment}`;
   return `${head}: ${parts.join('; ')} (${seconds(verdict.durationMs)})`;
 }
@@ -311,13 +336,25 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
     if (result.name === 'coverage' && coverage) delete result.tail;
   }
 
+  const sandbox: EnvironmentFacts = svc.environment
+    ? {
+        kind: 'declared',
+        sealed: svc.environment.sealed && svc.environment.app.command === undefined,
+        project: svc.env.declared?.project,
+        outbound: await envOutbound(reports, service),
+      }
+    : { kind: 'script', sealed: false, outbound: [] };
+  // The point of a sealed environment: the app reached nothing outside it. An attempt is a failure, not a warning.
+  const escaped = sandbox.sealed ? sandbox.outbound.filter((attempt) => attempt.from === 'app') : [];
+
   const buildFile = join(reports, 'stack', `${service}.build`);
   const failed = results.filter((result) => result.status === 'fail').map((result) => result.name);
+  const pass = failed.length === 0 && escaped.length === 0;
   const verdict: Verdict = {
     schema: 'vgate.verdict/1',
     service,
     environment: env,
-    verdict: failed.length === 0 ? 'pass' : 'fail',
+    verdict: pass ? 'pass' : 'fail',
     complete: steps.length === STEPS.length,
     startedAt: startedAt.toISOString(),
     durationMs: Date.now() - started,
@@ -328,6 +365,7 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
     tests,
     registry,
     coverage,
+    sandbox,
     evidence: {
       junit,
       traces: shown(join(reports, 'test-results')),
@@ -338,13 +376,16 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
   };
   writeFileSync(join(reports, 'verdict.json'), `${JSON.stringify(verdict, null, 2)}\n`);
 
+  const next = failed.length === 0 ? [] : [`${CLI} gate --service ${service} --steps ${failed.join(',')}`];
+  // The summary names the hosts; the fix is in the app's configuration, after which the gate runs again.
+  if (escaped.length > 0 && next.length === 0) next.push(`${CLI} gate --service ${service}`);
   return {
     command: 'gate',
-    ok: failed.length === 0,
-    exitCode: failed.length === 0 ? EXIT.ok : EXIT.failed,
+    ok: pass,
+    exitCode: pass ? EXIT.ok : EXIT.failed,
     summary: summarise(verdict),
     data: verdict,
-    next: failed.length === 0 ? [] : [`${CLI} gate --service ${service} --steps ${failed.join(',')}`],
+    next,
     text: render(verdict),
   };
 }

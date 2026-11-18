@@ -41,4 +41,11 @@ describe('uniqueFactory', () => {
       assert.ok(id.includes('.k3x9a.3'), id);
     }
   });
+
+  it("never repeats another project's ids under the same run id and worker (api, then faults)", () => {
+    const api = uniqueFactory('k3x9a', 0, 50, 'api');
+    const faults = uniqueFactory('k3x9a', 0, 50, 'faults');
+    const first = Array.from({ length: 20 }, () => api('cus'));
+    for (let i = 0; i < 20; i++) assert.ok(!first.includes(faults('cus')));
+  });
 });

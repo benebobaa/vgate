@@ -14,9 +14,7 @@ HEALTH="http://localhost:$PORT/health"
 BUILD_REPO="$STACK_ROOT" # the service's code lives in this repo
 
 up() {
-  if http_ok "$HEALTH"; then echo "example already UP at $HEALTH"; return; fi
-  app_start "$STACK_ROOT" env EXAMPLE_PORT="$PORT" "$STACK_RUNTIME/node_modules/.bin/tsx" "$HERE/server.ts"
-  app_wait "$HEALTH" 30
+  app_up "$HEALTH" "$PORT" 30 "$STACK_ROOT" env EXAMPLE_PORT="$PORT" "$STACK_RUNTIME/node_modules/.bin/tsx" "$HERE/server.ts"
 }
 
 down() { app_stop; }

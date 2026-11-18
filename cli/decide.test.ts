@@ -278,28 +278,28 @@ describe('decide (git and evidence files)', () => {
     return root;
   }
 
-  it('merges with a current, passing verdict and an auto guard, and writes the comment', () => {
+  it('merges with a current, passing verdict and an auto guard, and writes the comment', async () => {
     const root = featureRepo();
     const head = treeState(readProject(root));
     write(root, 'evidence/notes/verdict.json', verdict(root, 'notes', { commit: head }));
     write(root, 'evidence/notes/guard.json', JSON.stringify({ ...(JSON.parse(guardJson('notes')) as object), head }));
-    const result = decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
+    const result = await decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
     assert.equal(result.exitCode, EXIT.ok, result.summary);
     const md = readFileSync(join(root, 'reports/decision.md'), 'utf8');
     assert.ok(md.startsWith(DECISION_MARKER));
     assert.match(md, /Verified: may merge/);
     assert.equal((JSON.parse(readFileSync(join(root, 'reports/decision.json'), 'utf8')) as Decision).decision, 'merge');
   });
-  it('blocks when the verdict was computed against other expectations (stale evidence)', () => {
+  it('blocks when the verdict was computed against other expectations (stale evidence)', async () => {
     const root = featureRepo();
     write(root, 'evidence/notes/verdict.json', verdict(root, 'notes'));
     write(root, 'evidence/notes/guard.json', guardJson('notes'));
     write(root, 'regression/notes/openapi.yaml', 'openapi: 3.1.0\n# changed after the gate\n');
-    const result = decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
+    const result = await decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
     assert.equal((result.data as Decision).decision, 'blocked');
     assert.match((result.data as Decision).reasons[0], /stale/);
   });
-  it('does not accept a guard that compared with another base', () => {
+  it('does not accept a guard that compared with another base', async () => {
     const root = featureRepo();
     const head = treeState(readProject(root));
     write(root, 'evidence/notes/verdict.json', verdict(root, 'notes', { commit: head }));
@@ -308,11 +308,11 @@ describe('decide (git and evidence files)', () => {
       'evidence/notes/guard.json',
       JSON.stringify({ ...(JSON.parse(guardJson('notes', 'auto', 'feature')) as object), head }),
     );
-    const result = decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
+    const result = await decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
     assert.equal((result.data as Decision).decision, 'needs-approval');
     assert.equal(result.exitCode, EXIT.failed);
   });
-  it('lets a failing or partial verdict win over another file that claims a pass, whatever its date', () => {
+  it('lets a failing or partial verdict win over another file that claims a pass, whatever its date', async () => {
     for (const [first, second] of [
       ['a', 'z'],
       ['z', 'a'],
@@ -322,23 +322,23 @@ describe('decide (git and evidence files)', () => {
       const forged = verdict(root, 'notes', { startedAt: '9999-01-01T00:00:00.000Z' });
       write(root, `evidence/${second}/notes/verdict.json`, forged);
       write(root, 'evidence/notes/guard.json', guardJson('notes'));
-      const result = decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
+      const result = await decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
       assert.equal((result.data as Decision).decision, 'blocked', `${first} fails, ${second} claims a pass`);
     }
   });
-  it('removes an earlier decision before deciding, so a run that stops early leaves none behind', () => {
+  it('removes an earlier decision before deciding, so a run that stops early leaves none behind', async () => {
     const root = featureRepo();
     write(root, 'reports/decision.json', '{"decision":"merge"}');
     write(root, 'regression/notes/service.yaml', 'paths: not-a-list\n');
-    assert.throws(() => decide(readProject(root), { base: 'main', evidence: join(root, 'regression') }));
+    await assert.rejects(() => decide(readProject(root), { base: 'main', evidence: join(root, 'regression') }));
     assert.ok(!existsSync(join(root, 'reports/decision.json')));
   });
-  it('blocks on a partial gate run', () => {
+  it('blocks on a partial gate run', async () => {
     const root = featureRepo();
     write(root, 'evidence/notes/verdict.json', verdict(root, 'notes', { complete: false }));
     write(root, 'evidence/notes/guard.json', guardJson('notes'));
     assert.equal(
-      (decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') }).data as Decision).decision,
+      ((await decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') })).data as Decision).decision,
       'blocked',
     );
   });
@@ -358,42 +358,42 @@ describe('decide: evidence bound to the commit', () => {
     write(root, 'evidence/notes/verdict.json', verdict(root, 'notes', { commit: head, ...overrides }));
     write(root, 'evidence/notes/guard.json', JSON.stringify({ ...(JSON.parse(guardJson('notes')) as object), head }));
   }
-  const decision = (root: string) =>
-    decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') }).data as Decision;
+  const decision = async (root: string) =>
+    (await decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') })).data as Decision;
 
-  it('merges on evidence taken on this commit and this tree (vgate output and the evidence itself do not count)', () => {
+  it('merges on evidence taken on this commit and this tree (vgate output and the evidence itself do not count)', async () => {
     const root = featureRepo();
     evidenceNow(root);
     // Written by vgate after the gate ran: reports and generated types are its output, not the code under judgement.
     write(root, 'reports/stack/notes.log', 'vgate output, not part of the change');
     write(root, 'regression/notes/generated/openapi.ts', 'export {};');
-    const d = decision(root);
+    const d = await decision(root);
     assert.equal(d.decision, 'merge', d.reasons.join('; '));
     assert.equal(d.services[0].gateDetail, undefined);
   });
-  it('blocks on a verdict from an earlier commit, and asks again for a guard from one', () => {
+  it('blocks on a verdict from an earlier commit, and asks again for a guard from one', async () => {
     const root = featureRepo();
     evidenceNow(root);
     write(root, 'apps/notes/main.go', 'package main // pushed after the gate\n');
     run(root, 'commit', '-qam', 'later push');
-    const d = decision(root);
+    const d = await decision(root);
     assert.equal(d.decision, 'blocked');
     assert.match(d.services[0].gateDetail ?? '', /computed on commit [0-9a-f]{12}, this is [0-9a-f]{12}/);
     assert.match(d.services[0].guardDetail ?? '', /stale/);
   });
-  it('blocks on a verdict when the working tree changed after the gate ran', () => {
+  it('blocks on a verdict when the working tree changed after the gate ran', async () => {
     const root = featureRepo();
     evidenceNow(root);
     write(root, 'apps/notes/main.go', 'package main // edited, not committed\n');
-    const d = decision(root);
+    const d = await decision(root);
     assert.equal(d.decision, 'blocked');
     assert.match(d.services[0].gateDetail ?? '', /working tree changed/);
   });
-  it('never counts evidence that names no commit inside git: a change can commit such a file itself', () => {
+  it('never counts evidence that names no commit inside git: a change can commit such a file itself', async () => {
     for (const commit of [undefined, { sha: null, dirty: false, fingerprint: null }]) {
       const root = featureRepo();
       evidenceNow(root, { commit });
-      const d = decision(root);
+      const d = await decision(root);
       assert.equal(d.decision, 'blocked', d.reasons.join('; '));
       assert.match(d.services[0].gateDetail ?? '', /not bound to a commit/);
     }
@@ -485,6 +485,8 @@ describe('renderMarkdown', () => {
       schema: 'vgate.decision/1',
       decision: 'blocked',
       reasons: ['notes: gate failed (failed: test)'],
+      deploy: { configured: false, checks: [] },
+      migrations: [],
       base: 'main',
       mergeBase: 'abc',
       head: 'def',

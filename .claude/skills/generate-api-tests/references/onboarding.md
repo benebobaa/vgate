@@ -111,7 +111,7 @@ stack_init <svc>
 Keep only what is the service's own: its dependencies (`docker compose` with the backend's compose file or the
 service's own), the command that starts the app (`app_start <dir> <cmd...>`, which detaches it properly and records
 the commit it is built from in `BUILD_REPO`), and the seeding of test data. `STACK_ROOT` is the project.
-`example/stack.sh` is the minimal case, `example-orders/stack.sh` one with compose dependencies.
+`example/stack.sh` is the minimal case. A service with dependencies is better declared than scripted: `example-orders/service.yaml` (`environment:`) gives every run its own sealed environment (vgate docs `environments.md`).
 
 `up` must be idempotent: a stack that is already healthy is left alone, and a fresh database gets the seeded users of
 `service.yaml` (`up` on a clean machine must be enough for `gate`). `down` stops without deleting data. `reset` is

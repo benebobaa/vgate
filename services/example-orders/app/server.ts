@@ -3,10 +3,15 @@
  * third-party payment provider. It is the system under test of the framework's dependency example, written to follow
  * its README; it is not part of the framework.
  *
- *   ORDERS_PORT=8091 tsx services/example-orders/server.ts   (stack.sh sets every variable below)
+ * It runs as a container in the service's sealed environment (service.yaml `environment:`, app/Dockerfile), which
+ * sets every variable below.
+ *
+ * ORDERS_CALL_HOME, when set, makes the app call that URL at start-up: a deliberate outbound call, so the framework's
+ * self-check can show that a sealed environment refuses it and the gate names it (docs/environments.md).
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createConnection } from 'node:net';
 import { Producer, stringSerializers } from '@platformatic/kafka';
 import pg from 'pg';
 import { createClient } from 'redis';
@@ -19,6 +24,15 @@ const paymentTimeoutMs = Number(env('ORDERS_PAYMENT_TIMEOUT_MS', '2000')); // ru
 const IDEMPOTENCY_TTL = 86_400; // rule 3
 const ORDER_CACHE_TTL = 300; // rule 7
 const TOPIC = 'orders.created';
+const smtpHost = env('ORDERS_SMTP_HOST', 'localhost'); // rule 9
+const smtpPort = Number(env('ORDERS_SMTP_PORT', '1025'));
+
+const callHome = env('ORDERS_CALL_HOME', '');
+if (callHome !== '') {
+  fetch(callHome, { signal: AbortSignal.timeout(3000) })
+    .then(() => process.stdout.write(`called ${callHome}\n`))
+    .catch((error: Error) => process.stderr.write(`call home to ${callHome} failed: ${error.message}\n`));
+}
 
 const db = new pg.Pool({
   connectionString: env('ORDERS_DB_URL', 'postgres://orders:orders@localhost:55432/orders'),
@@ -180,7 +194,50 @@ async function createOrder(req: IncomingMessage): Promise<{ status: number; body
     ],
   });
   await redis.set(`idempotency:${key}`, JSON.stringify({ hash, order }), { EX: IDEMPOTENCY_TTL });
+  // Rule 9: the confirmation goes out after the answer; a mail failure never undoes a paid order.
+  confirm(order).catch((error: Error) => process.stderr.write(`confirmation of ${order.id}: ${error.message}\n`));
   return { status: 201, body: order };
+}
+
+/** Rule 9: one confirmation mail per created order, to the customer's address. */
+function confirm(order: Order): Promise<void> {
+  return sendMail(
+    `${order.customerId}@customers.example`,
+    `Order ${order.id} confirmed`,
+    `Your order ${order.id} of ${order.amount} ${order.currency} is paid (charge ${order.chargeId}).`,
+  );
+}
+
+/** A minimal SMTP client (no auth, no TLS: the environment's mail server keeps every message for the tests). */
+function sendMail(to: string, subject: string, text: string): Promise<void> {
+  const from = 'orders@shop.example';
+  const script = [
+    'HELO example-orders',
+    `MAIL FROM:<${from}>`,
+    `RCPT TO:<${to}>`,
+    'DATA',
+    `From: ${from}\r\nTo: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${text}\r\n.`,
+    'QUIT',
+  ];
+  return new Promise((done, fail) => {
+    const socket = createConnection({ host: smtpHost, port: smtpPort });
+    socket.setTimeout(5000, () => socket.destroy(new Error('SMTP timeout')));
+    let buffer = '';
+    let step = 0;
+    socket.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString();
+      // Each reply ends with a line "NNN text"; continuation lines are "NNN-text".
+      const lines = buffer.split('\r\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!/^\d{3} /.test(line)) continue;
+        if (!/^[23]/.test(line)) return socket.destroy(new Error(`SMTP refused: ${line}`));
+        if (step < script.length) socket.write(`${script[step++]}\r\n`);
+      }
+    });
+    socket.on('error', fail);
+    socket.on('close', () => (step >= script.length ? done() : fail(new Error('SMTP connection closed early'))));
+  });
 }
 
 /** Rule 7: read through the cache. */

@@ -90,7 +90,7 @@ export function createTest<P>() {
     ],
     unique: [
       async ({}, use, workerInfo) => {
-        await use(uniqueFactory(process.env.RUN_ID ?? newRunId(), workerInfo.workerIndex));
+        await use(uniqueFactory(process.env.RUN_ID ?? newRunId(), workerInfo.workerIndex, 50, workerInfo.project.name));
       },
       { scope: 'worker' },
     ],

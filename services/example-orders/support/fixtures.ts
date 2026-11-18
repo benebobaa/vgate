@@ -1,13 +1,17 @@
 import type { HttpStub, StubHandle } from '@vgate/framework/deps/stubs.ts';
-import { createDepsTest, expect } from '@vgate/framework/deps/fixtures.ts';
+import { createCatalogTest } from '@vgate/framework/deps/catalog-fixtures.ts';
+import { expect } from '@vgate/framework/deps/fixtures.ts';
 import type { Db } from '@vgate/framework/db/postgres.ts';
 import type { components, paths } from '../generated/openapi.ts';
 
 export type Order = components['schemas']['Order'];
 export type OrderInput = components['schemas']['OrderInput'];
 
-/** The framework's test with the dependency fixtures (stubs, events, cache, faults), typed by the contract. */
-export const test = createDepsTest<paths>();
+/**
+ * The framework's test with the dependency fixtures (stubs, events, cache, faults) and the catalog's (inbox), typed
+ * by the contract.
+ */
+export const test = createCatalogTest<paths>();
 
 /** The event of README rule 6, as deps/events/orders.created.schema.json describes it. */
 export interface OrderCreated {

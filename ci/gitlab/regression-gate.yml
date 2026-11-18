@@ -149,6 +149,16 @@ vgate:gate:$[[ inputs.service ]]:
       jq -e --arg s "$SERVICE" '.data | select(.schema == "vgate.verdict/1" and .service == $s)' "$VGATE_TMP/gate.json" \
         > "vgate-evidence/$SERVICE/verdict.json" 2>/dev/null \
         || { rm -f "vgate-evidence/$SERVICE/verdict.json"; echo "No verdict for $SERVICE: the gate did not finish."; }
+      # Database migrations, on merge requests only (they have a base): lint, apply, round trip, the deployed code on
+      # the new schema. A service without `migrate:` answers "not configured" at once.
+      if [ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" ]; then
+        vgate migrations --root "$CI_PROJECT_DIR" --service "$SERVICE" --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" \
+          --json > "$VGATE_TMP/migrations.json"
+        jq -r '.summary' "$VGATE_TMP/migrations.json" 2>/dev/null || true
+        jq -e --arg s "$SERVICE" '.data | select(.schema == "vgate.migrations/1" and .service == $s)' \
+          "$VGATE_TMP/migrations.json" > "vgate-evidence/$SERVICE/migrations.json" 2>/dev/null \
+          || rm -f "vgate-evidence/$SERVICE/migrations.json"
+      fi
       exit $status
   artifacts:
     when: always

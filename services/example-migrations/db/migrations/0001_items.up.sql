@@ -1,0 +1,4 @@
+CREATE TABLE items (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);

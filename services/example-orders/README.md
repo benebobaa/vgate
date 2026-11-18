@@ -1,13 +1,16 @@
 # example-orders: the framework's reference for a service with dependencies
 
-An orders API that lives in this repo (`server.ts`) and talks to everything a typical microservice does: its own
-PostgreSQL, a Redis cache, Kafka, and a third-party payment provider over HTTP. The dependencies run as real
-containers (`compose.yaml`); the provider is WireMock, reached through toxiproxy, and every answer it gives comes from
-a test's stub that its own contract (`deps/payments.openapi.yaml`) allows.
+An orders API that lives in this repo (`app/server.ts`) and talks to everything a typical microservice does: its own
+PostgreSQL, a Redis cache, Kafka, and a third-party payment provider over HTTP. Every run starts its own sealed
+environment from `service.yaml` (`environment:`): the app as a container built from `app/Dockerfile`, the dependencies
+as real containers, all on a network with no route out, reached by the tests through one edge on ports chosen per run
+(docs/environments.md). The provider is WireMock, reached through the edge, and every answer it gives comes from a
+test's stub that its own contract (`deps/payments.openapi.yaml`) allows.
 
 ```bash
-pnpm vgate up --service example-orders     # containers + app, about 10s once the images are pulled
-pnpm vgate gate --service example-orders
+pnpm vgate up --service example-orders     # build the app, start the environment: about 15s once images are pulled
+pnpm vgate gate --service example-orders   # the verdict also says: sealed, no outbound call
+pnpm vgate down --service example-orders   # removes containers, networks and volumes
 ```
 
 | Dependency       | Kind (service.yaml) | What the tests do with it                                                                   |
@@ -15,7 +18,7 @@ pnpm vgate gate --service example-orders
 | Payment provider | `http-stub`         | stub its answers (refused when the contract does not document them), read what the app sent |
 | `orders.created` | `kafka`             | find the event of this test, schema-checked; prove nothing was published                    |
 | Redis            | `redis`             | read idempotency and cache entries and their TTLs                                           |
-| toxiproxy        | `toxiproxy`         | slow the provider down past the timeout, take it down (tests/faults only)                   |
+| The edge         | `toxiproxy`         | slow the provider down past the timeout, take it down (tests/faults only)                   |
 | PostgreSQL       | `db`                | rows written, or not written                                                                |
 
 The backend's own documentation would normally be the spec source; here it is this file, `openapi.yaml`, the
@@ -45,3 +48,6 @@ provider's contract and the event schema in `deps/`.
 7. `GET /orders/{orderId}` answers the order, or 404 `not_found` for an unknown id or one that is not a UUID. It reads
    through Redis: the first read caches the order at `order:<id>` for 300 seconds.
 8. Every response carries an `X-Request-Id` (UUID); every body is JSON; every datetime is UTC (`Z`).
+9. A created order (rule 6) sends one confirmation mail, after answering, to `<customerId>@customers.example` from
+   `orders@shop.example` with the subject `Order <id> confirmed`. A repeat (rule 3) and an order whose payment does
+   not succeed (rule 5) send none.

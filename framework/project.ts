@@ -10,6 +10,12 @@
  *     autoMerge: low        # the highest risk tier a PR may merge at without a human (default: none)
  *   risk:                   # path globs -> tier; first match wins per file (default: cli/risk.ts DEFAULT_RISK)
  *     high: [{ path: 'db/migrations/**', reason: schema change }]
+ *   deploy:                 # safe to put next to what runs there? (cli/compat.ts, cli/config-check.ts)
+ *     environments:
+ *       production:
+ *         contract: { ref: 'tag:v*' }                     # or { url: https://api.example.com/openapi.json }
+ *         config: { file: deploy/production.env.example } # the keys production provides
+ *     policy: { breaking: needs-approval }               # or block
  *
  * The runtime reads the project from VGATE_PROJECT (set by vgate for every step it runs); without it, the project
  * is the runtime's own directory, which is how this repository runs its own services.
@@ -38,6 +44,106 @@ export interface Policy {
   autoMerge: 'none' | RiskTier;
 }
 
+/**
+ * Where the version running in an environment publishes its contract: a git ref of the deployed version
+ * (`tag:<glob>` = the newest tag matching, by version order; or any branch, tag or sha), or the live contract's URL.
+ */
+export type ContractSource = { ref: string } | { url: string };
+
+/** How a config source lists its keys; absent: guessed from the file (cli/config-check.ts). */
+export const CONFIG_FORMATS = ['dotenv', 'k8s', 'keys'] as const;
+export type ConfigFormat = (typeof CONFIG_FORMATS)[number];
+
+/** A file in the project that lists the configuration keys an environment provides (never their values). */
+export interface ConfigSource {
+  /** Project-relative path. */
+  file: string;
+  format?: ConfigFormat;
+}
+
+/** One deployment target: what runs there (its contract) and what configuration it provides. */
+export interface DeployEnvironment {
+  name: string;
+  contract?: ContractSource;
+  config: ConfigSource[];
+}
+
+/** `deploy:` in vgate.yaml: is a change safe to put next to what is running (docs/deploy-safety.md)? */
+export interface DeployConfig {
+  environments: DeployEnvironment[];
+  policy: {
+    /** What a change that breaks the deployed contract gets: a human's approval, or no merge at all. */
+    breaking: 'needs-approval' | 'block';
+  };
+}
+
+const ENVIRONMENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function parseContractSource(value: unknown, where: string): ContractSource | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value))
+    throw new Error(`${where}: contract must be { ref: 'tag:v*' } or { url: https://... }`);
+  const { ref, url } = value as Record<string, unknown>;
+  if ((ref === undefined) === (url === undefined))
+    throw new Error(
+      `${where}: contract needs exactly one of ref (the deployed version in git) or url (the live contract)`,
+    );
+  if (ref !== undefined) {
+    if (typeof ref !== 'string' || ref.trim() === '' || ref.startsWith('-'))
+      throw new Error(`${where}: contract.ref must be a git ref, or tag:<glob> for the newest matching tag`);
+    return { ref: ref.trim() };
+  }
+  if (typeof url !== 'string' || !/^https?:\/\/\S+$/.test(url))
+    throw new Error(`${where}: contract.url must be an http(s) URL`);
+  return { url };
+}
+
+function parseConfigSources(value: unknown, where: string): ConfigSource[] {
+  if (value === undefined || value === null) return [];
+  const entries = Array.isArray(value) ? value : [value];
+  return entries.map((entry, index) => {
+    const at = Array.isArray(value) ? `${where}.config[${index}]` : `${where}.config`;
+    const raw = typeof entry === 'string' ? { file: entry } : (entry as Record<string, unknown> | null);
+    if (!raw || typeof raw !== 'object') throw new Error(`${at}: expected { file, format }`);
+    const file = raw.file;
+    if (typeof file !== 'string' || file === '' || file.startsWith('/') || file.split(/[\\/]/).includes('..'))
+      throw new Error(`${at}.file must be a file inside the project, e.g. deploy/production.env.example`);
+    if (raw.format !== undefined && !CONFIG_FORMATS.includes(raw.format as ConfigFormat))
+      throw new Error(`${at}.format must be one of ${CONFIG_FORMATS.join(', ')}`);
+    return { file, format: raw.format as ConfigFormat | undefined };
+  });
+}
+
+function parseDeploy(value: unknown, file: string): DeployConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${file}: deploy must be a mapping`);
+  const raw = value as Record<string, unknown>;
+  const envs = raw.environments;
+  if (!envs || typeof envs !== 'object' || Array.isArray(envs) || Object.keys(envs).length === 0)
+    throw new Error(`${file}: deploy.environments must name at least one environment, e.g. production`);
+  const environments = Object.entries(envs as Record<string, unknown>).map(([name, env]) => {
+    const where = `${file}: deploy.environments.${name}`;
+    if (!ENVIRONMENT_NAME.test(name)) throw new Error(`${where}: not a usable environment name`);
+    if (!env || typeof env !== 'object' || Array.isArray(env))
+      throw new Error(`${where}: expected { contract, config }`);
+    const e = env as Record<string, unknown>;
+    const parsed = {
+      name,
+      contract: parseContractSource(e.contract, where),
+      config: parseConfigSources(e.config, where),
+    };
+    if (!parsed.contract && parsed.config.length === 0)
+      throw new Error(`${where}: give a contract source, a config source or both`);
+    return parsed;
+  });
+  const policy = (raw.policy ?? {}) as Record<string, unknown>;
+  if (typeof policy !== 'object' || Array.isArray(policy)) throw new Error(`${file}: deploy.policy must be a mapping`);
+  const breaking = policy.breaking ?? 'needs-approval';
+  if (breaking !== 'needs-approval' && breaking !== 'block')
+    throw new Error(`${file}: deploy.policy.breaking must be needs-approval or block`);
+  return { environments, policy: { breaking } };
+}
+
 /** The directory that holds the framework, its configs and its node_modules. */
 export const runtimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -58,6 +164,8 @@ export interface ProjectConfig {
   policy: Policy;
   /** `risk:` in the order written (first match wins per file); absent: the built-in defaults of cli/risk.ts. */
   risk?: RiskRule[];
+  /** `deploy:`: the environments a change must stay safe for; absent: deploy safety is not checked. */
+  deploy?: DeployConfig;
 }
 
 const DEFAULT_POLICY: Policy = { autoMerge: 'none' };
@@ -131,6 +239,7 @@ export function readProject(root: string): ProjectConfig {
     declared: true,
     policy: parsePolicy(raw.policy, file),
     risk: parseRisk(raw.risk, file),
+    deploy: parseDeploy(raw.deploy, file),
   };
 }
 
