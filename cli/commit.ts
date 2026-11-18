@@ -85,7 +85,12 @@ export function treeState(project: ProjectConfig, exclude: string[] = []): TreeS
  * recorded commit (a gate run outside git) is not judged here: the expectation hashes are its only binding.
  */
 export function staleTree(then: TreeState | undefined, now: TreeState): string | undefined {
-  if (!then || then.sha === null) return undefined;
+  // Outside git nothing can be bound: the expectation hashes are the only check. Inside git, evidence that names no
+  // commit cannot be told apart from a file the change itself committed, so it never counts.
+  if (!then || then.sha === null)
+    return now.sha === null
+      ? undefined
+      : 'it is not bound to a commit, and this tree is in git (a committed or hand-made file?)';
   if (now.sha === null) return 'it names a commit, but this tree has none to compare with';
   if (then.sha !== now.sha)
     return `it was computed on commit ${then.sha.slice(0, 12)}, this is ${now.sha.slice(0, 12)}`;

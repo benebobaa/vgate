@@ -49,6 +49,11 @@ vgate:decide:
       set +e
       work=$(mktemp -d)
       mkdir -p "$work/evidence"
+      # Evidence comes only from this pipeline's artifacts: a merge request that commits vgate-evidence/ is refused.
+      if git -C "$CI_PROJECT_DIR" ls-files --error-unmatch vgate-evidence >/dev/null 2>&1; then
+        echo "vgate-evidence/ is committed in this merge request; evidence must come from the pipeline. Blocked." >&2
+        exit 1
+      fi
       if [ -d vgate-evidence ]; then cp -R vgate-evidence/. "$work/evidence/"; fi
       rm -rf vgate-evidence "$VGATE_REPORTS_DIR"
       vgate decide --root "$CI_PROJECT_DIR" --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --evidence "$work/evidence" \

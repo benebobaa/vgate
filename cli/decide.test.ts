@@ -280,8 +280,9 @@ describe('decide (git and evidence files)', () => {
 
   it('merges with a current, passing verdict and an auto guard, and writes the comment', () => {
     const root = featureRepo();
-    write(root, 'evidence/notes/verdict.json', verdict(root, 'notes'));
-    write(root, 'evidence/notes/guard.json', guardJson('notes'));
+    const head = treeState(readProject(root));
+    write(root, 'evidence/notes/verdict.json', verdict(root, 'notes', { commit: head }));
+    write(root, 'evidence/notes/guard.json', JSON.stringify({ ...(JSON.parse(guardJson('notes')) as object), head }));
     const result = decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
     assert.equal(result.exitCode, EXIT.ok, result.summary);
     const md = readFileSync(join(root, 'reports/decision.md'), 'utf8');
@@ -300,8 +301,13 @@ describe('decide (git and evidence files)', () => {
   });
   it('does not accept a guard that compared with another base', () => {
     const root = featureRepo();
-    write(root, 'evidence/notes/verdict.json', verdict(root, 'notes'));
-    write(root, 'evidence/notes/guard.json', guardJson('notes', 'auto', 'feature'));
+    const head = treeState(readProject(root));
+    write(root, 'evidence/notes/verdict.json', verdict(root, 'notes', { commit: head }));
+    write(
+      root,
+      'evidence/notes/guard.json',
+      JSON.stringify({ ...(JSON.parse(guardJson('notes', 'auto', 'feature')) as object), head }),
+    );
     const result = decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') });
     assert.equal((result.data as Decision).decision, 'needs-approval');
     assert.equal(result.exitCode, EXIT.failed);
@@ -383,12 +389,14 @@ describe('decide: evidence bound to the commit', () => {
     assert.equal(d.decision, 'blocked');
     assert.match(d.services[0].gateDetail ?? '', /working tree changed/);
   });
-  it('accepts a verdict from outside git on its expectation hashes alone, and says so', () => {
-    const root = featureRepo();
-    evidenceNow(root, { commit: { sha: null, dirty: false, fingerprint: null } });
-    const d = decision(root);
-    assert.equal(d.decision, 'merge', d.reasons.join('; '));
-    assert.match(d.services[0].gateDetail ?? '', /not bound to a commit/);
+  it('never counts evidence that names no commit inside git: a change can commit such a file itself', () => {
+    for (const commit of [undefined, { sha: null, dirty: false, fingerprint: null }]) {
+      const root = featureRepo();
+      evidenceNow(root, { commit });
+      const d = decision(root);
+      assert.equal(d.decision, 'blocked', d.reasons.join('; '));
+      assert.match(d.services[0].gateDetail ?? '', /not bound to a commit/);
+    }
   });
   it('records no commit outside git, and a full sha with a clean or dirty state inside', () => {
     const plain = mkdtempSync(join(tmpdir(), 'vgate-tree-'));
