@@ -64,6 +64,9 @@ forward.
 | `gate --service <svc> [--steps a,b]`             | Runs every step and writes `reports/verdict.json`: steps, failed tests (scenario id, file, line, message), coverage, known failures |
 | `guard --service <svc> --base <ref>`             | Compares the expectations with a base ref: exit 0 `auto`, exit 1 `needs-human` with the findings; writes `reports/guard.json`       |
 | `inventory --service <svc> [--write]`            | The test plan's skeleton from the vendored contract, for the agent to enrich                                                        |
+| `affected --base <ref>`                          | The services a change touches (by each `service.yaml`'s `paths:`) and the ones it deletes                                           |
+| `risk --base <ref>`                              | The change's risk tier (low, medium, high) and the file and rule behind it                                                          |
+| `decide --base <ref> --evidence <dir>`           | The pull request's decision from every verdict and guard result: `merge`, `needs-approval` or `blocked`, and the PR comment         |
 | `up` / `down` / `status --service <svc>`         | The service's local stack                                                                                                           |
 | `reset --service <svc> --yes`                    | **Destructive**: wipes the service's local test data; refused without `--yes`                                                       |
 | `skills list` / `skills install`                 | The agent skills the binary carries                                                                                                 |
@@ -79,10 +82,26 @@ Global flags: `--json`, `--quiet`, `--root <dir>` (default: the nearest parent h
 | 2         | The call was wrong: an unknown command, flag value or service                    |
 | 3         | Nothing was verified, because the machine, the project or the stack is not ready |
 
+## Pull request verification
+
+Every pull request gets one decision. `vgate affected` picks the services the change touches, `vgate gate` and
+`vgate guard` run for each, and `vgate decide` reads their evidence:
+
+- **merge**: every affected gate passed, nothing weakened the expectations, and the change's risk tier is within
+  `policy.autoMerge` in `vgate.yaml`. It merges without a person (GitHub auto-merge, GitLab merge when the pipeline
+  succeeds).
+- **needs-approval**: the gates passed, but the guard flagged weakened expectations or the change is riskier than the
+  policy allows. One person answers the specific questions in the pull request comment, not the whole diff.
+- **blocked**: a gate failed or evidence is missing. The author, person or agent, fixes the change.
+
+`vgate init --ci github` installs the workflow; GitLab gets two CI/CD components. How the decision works, risk rules,
+monorepos, regulated teams and adoption in shadow mode: [docs/pr-verification.md](docs/pr-verification.md). Setup:
+[docs/ci.md](docs/ci.md).
+
 ## A project
 
 ```
-vgate.yaml                 version: 0.1.2, servicesDir: regression
+vgate.yaml                 version: 0.2.0, servicesDir: regression
 regression/<svc>/
   service.yaml             rules, auth, dependencies, environments
   openapi.yaml             the vendored contract: approved behaviour, changed only by a sync

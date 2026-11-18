@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
 # The vgate image: the judge of the merge-request gate. It carries the framework, the CLI and every tool the gate
-# runs, all pinned, so a merge request can change the tests under judgement but never the judge. A CI job copies the
-# service's directory (services/<svc>, later a service repo's regression/) into /opt/vgate/services/ and runs the
-# image's vgate there.
+# runs, all pinned, so a merge request can change the tests under judgement but never the judge. A CI job runs the
+# image's vgate against the checkout (`vgate gate --root "$CI_PROJECT_DIR"`): the framework comes from the binary,
+# the tests from the merge request.
 #
 #   docker build -f ci/Dockerfile -t vgate:dev .            (or: pnpm task image:build)
 #   docker build -f ci/Dockerfile --build-arg WITH_JAVA=true --build-arg WITH_K6=true -t vgate:full .

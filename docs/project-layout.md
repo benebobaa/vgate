@@ -8,7 +8,7 @@ framework that verifies it, called the runtime, never lives there, so a merge re
 A project is any directory with a `vgate.yaml`. `vgate init` writes it:
 
 ```yaml
-version: 0.1.2 # the vgate this project is pinned to
+version: 0.2.0 # the vgate this project is pinned to
 servicesDir: regression # default regression: <servicesDir>/<service>/service.yaml
 reportsDir: reports # default reports: verdict.json, guard.json, JUnit, traces, logs
 ```

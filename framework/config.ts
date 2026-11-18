@@ -194,10 +194,23 @@ export interface ServiceConfig {
   /** Absolute path of the vendored OpenAPI contract. */
   specPath: string;
   backend?: { repo: string; syncedCommit?: string };
+  /**
+   * Repository paths (globs relative to the git top level) whose change can affect the service, so a pull request
+   * gates only the services it can break (`vgate affected`). Absent: every change affects it.
+   */
+  paths?: string[];
   rules: Rules;
   coverage: { exclude: CoverageExclusion[] };
   schemathesis: SchemathesisConfig;
   env: EnvironmentConfig;
+}
+
+/** `paths:` of a service.yaml: a list of non-empty globs, or absent. Shared with `vgate affected`. */
+export function parsePaths(value: unknown, where: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || entry === ''))
+    throw new Error(`${where}: paths must be a list of path globs, e.g. ['services/api/**', 'libs/shared/**']`);
+  return value as string[];
 }
 
 const VAR = /\$\{([A-Z0-9_]+)(?::-([^}]*))?\}/g;
@@ -274,6 +287,7 @@ export function loadService(
     backend: backend
       ? { repo: resolve(dir, required(text(backend.repo), 'backend.repo')), syncedCommit: text(backend.syncedCommit) }
       : undefined,
+    paths: parsePaths(top.paths, `${name} service.yaml`),
     rules: record(top.rules),
     coverage: { exclude: (record(top.coverage).exclude ?? []) as CoverageExclusion[] },
     schemathesis: record(top.schemathesis),

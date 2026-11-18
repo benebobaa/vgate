@@ -11,6 +11,8 @@ import { parseArgs, str } from '../framework/cli/args.ts';
 import { loadService } from '../framework/config.ts';
 import { inventorySkeleton } from '../framework/inventory.ts';
 import { PROJECT_FILE, type ProjectConfig } from '../framework/project.ts';
+import { affected } from './affected.ts';
+import { decide, DECISION_FILE } from './decide.ts';
 import { doctor } from './doctor.ts';
 import { gate, STEPS, VERDICT_FILE } from './gate.ts';
 import { GUARD_FILE, guard } from './guard.ts';
@@ -18,6 +20,7 @@ import { init } from './init.ts';
 import { CLI, emit, EXIT, UsageError, type Result } from './output.ts';
 import { listServices, requireProject, resolveService } from './project.ts';
 import { currentRuntime } from './runtime.ts';
+import { risk } from './risk.ts';
 import { skills } from './skills.ts';
 import { stack, STACK_ACTIONS, type StackAction } from './stack.ts';
 import { checkPin, installCommand, VERSION } from './version.ts';
@@ -72,6 +75,23 @@ const CATALOGUE = {
       about: `Compare the expectations (contract, plan, service.yaml, known failures, tests, gate machinery) of the working tree with a base ref: auto when nothing was weakened, needs-human (exit 1) otherwise. Writes ${GUARD_FILE}.`,
     },
     {
+      name: 'affected',
+      usage: `${CLI} affected --base <git ref>`,
+      about:
+        "The services a change can break: files changed since the merge base with --base (commits, uncommitted and untracked), mapped through each service's own directory and its `paths:` in service.yaml. Lists deleted services too.",
+    },
+    {
+      name: 'risk',
+      usage: `${CLI} risk --base <git ref>`,
+      about:
+        'How risky the change is (low, medium, high) from the paths it touches: the `risk:` rules of vgate.yaml, or the built-in rules (migrations, auth, money, secrets, CI, infrastructure high; dependencies, containers, contracts medium). The judge files are always high.',
+    },
+    {
+      name: 'decide',
+      usage: `${CLI} decide --base <git ref> --evidence <dir> [--details-url <url>]`,
+      about: `The pull request's verdict from the gate and guard reports under --evidence: merge (exit 0), needs-approval or blocked (exit 1). Missing or stale evidence never passes. Writes ${DECISION_FILE} and reports/decision.md (the PR comment).`,
+    },
+    {
       name: 'inventory',
       usage: `${CLI} inventory --service <name> [--write]`,
       about:
@@ -111,6 +131,7 @@ const CATALOGUE = {
     next: 'Commands to run next, most useful first.',
     verdictFile: VERDICT_FILE,
     guardFile: GUARD_FILE,
+    decisionFile: DECISION_FILE,
   },
 };
 
@@ -239,6 +260,17 @@ async function run(argv: string[]): Promise<Result> {
       .filter(Boolean);
     if (args.steps === true) throw new UsageError(`--steps needs a value: ${STEPS.join(',')}`);
     return gate(project, runtime, { service: resolveService(root, serviceFlag), env: envName, steps, live });
+  }
+  if (command === 'affected' || command === 'risk' || command === 'decide') {
+    if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');
+    if (command === 'affected') return affected(project, str(args.base));
+    if (command === 'risk') return risk(project, str(args.base));
+    if (args.evidence === true) throw new UsageError('--evidence needs a directory, e.g. reports');
+    return decide(project, {
+      base: str(args.base),
+      evidence: str(args.evidence),
+      detailsUrl: str(args['details-url']),
+    });
   }
   if (command === 'guard') {
     if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');

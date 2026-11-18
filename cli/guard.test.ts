@@ -3,7 +3,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -283,6 +283,15 @@ describe('configRule', () => {
     assert.deepEqual(details(narrowed), ['schemathesis.users narrowed from every user to ["a"]']);
   });
 
+  it('flags paths: that stop covering a change (vgate affected would skip the gate), not ones that widen', () => {
+    const paths = (before: unknown, after: unknown) =>
+      details(configRule('s', stringify({ paths: before }), stringify({ paths: after })));
+    assert.deepEqual(paths(['apps/a/**', 'libs/**'], ['apps/a/**']), ['paths lost libs/**']);
+    assert.deepEqual(paths(null, ['apps/a/**']), ['paths narrowed from every change to ["apps/a/**"]']);
+    assert.deepEqual(paths(['apps/a/**'], ['apps/a/**', 'libs/**']), []);
+    assert.deepEqual(paths(['apps/a/**'], null), [], 'no paths: means every change');
+  });
+
   it('flags a streaming rule that changed or went away', () => {
     assert.deepEqual(
       rule((c) => delete c.rules.streaming),
@@ -500,6 +509,25 @@ describe('guard', () => {
     const { report } = run(p.root);
     assert.ok(report.findings.some((f) => f.rule === 'tests-weakened' && f.detail.startsWith('test source deleted')));
     assert.ok(report.findings.some((f) => f.rule === 'machinery-changed' && f.file === 'framework/new-helper.ts'));
+  });
+
+  it('sees files whose names git would quote (non-ASCII)', () => {
+    const p = project();
+    p.write('services/svc/tests/über.spec.ts', TESTS);
+    git(p.root, 'add', '-A');
+    git(p.root, 'commit', '-q', '-m', 'umlaut');
+    p.remove('services/svc/tests/über.spec.ts');
+    p.write('framework/día.ts', 'export {};\n');
+    const { report } = run(p.root);
+    assert.ok(report.findings.some((f) => f.rule === 'tests-weakened' && f.file.endsWith('über.spec.ts')));
+    assert.ok(report.findings.some((f) => f.rule === 'machinery-changed' && f.file === 'framework/día.ts'));
+  });
+
+  it('leaves no earlier guard.json behind when it stops before judging', () => {
+    const p = project();
+    p.write('reports/guard.json', '{"schema":"vgate.guard/1","service":"svc","base":"main","decision":"auto"}');
+    assert.throws(() => guard(p.root, { service: 'svc', base: 'no-such-ref' }), UsageError);
+    assert.ok(!existsSync(join(p.root, 'reports/guard.json')));
   });
 
   it('still guards a service the change deletes, and refuses one that exists nowhere', () => {
