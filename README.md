@@ -82,7 +82,7 @@ Global flags: `--json`, `--quiet`, `--root <dir>` (default: the nearest parent h
 ## A project
 
 ```
-vgate.yaml                 version: 0.1.0, servicesDir: regression
+vgate.yaml                 version: 0.1.1, servicesDir: regression
 regression/<svc>/
   service.yaml             rules, auth, dependencies, environments
   openapi.yaml             the vendored contract: approved behaviour, changed only by a sync

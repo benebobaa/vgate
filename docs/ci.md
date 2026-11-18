@@ -58,7 +58,7 @@ include:
   - component: $CI_SERVER_FQDN/<your-components-project>/regression-gate@1
     inputs:
       service: orders
-      image: registry.example/your-group/vgate:0.1.0
+      image: registry.example/your-group/vgate:0.1.1
       approvers: group:your-group/verification-owners, some.username
       tests_dir: regression/orders
 ```
