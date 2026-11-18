@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "orders.created",
+  "description": "Published by example-orders once an order is paid and stored (README rule 6). Key: the order id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["orderId", "customerId", "amount", "currency", "chargeId", "createdAt"],
+  "properties": {
+    "orderId": { "type": "string", "format": "uuid" },
+    "customerId": { "type": "string", "minLength": 1 },
+    "amount": { "type": "integer", "minimum": 1 },
+    "currency": { "type": "string", "enum": ["IDR", "USD"] },
+    "chargeId": { "type": "string", "pattern": "^ch_" },
+    "createdAt": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  }
+}

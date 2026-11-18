@@ -1,0 +1,50 @@
+# The dependencies of example-orders (the app itself runs on the host: stack.sh). Host ports are unusual on purpose,
+# so this stack runs beside another service's. Passwords are trivial, so ports bind to 127.0.0.1 by default.
+# Under Docker-in-Docker (CI) the containers are reached at another host: set STACK_HOST to it (e.g. `docker`) and
+# STACK_BIND=0.0.0.0, so the ports answer there and Kafka advertises the address its clients dial.
+name: example-orders
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+    ports:
+      - '${STACK_BIND:-127.0.0.1}:55432:5432'
+  redis:
+    image: redis:8.2.2-alpine
+    ports:
+      - '${STACK_BIND:-127.0.0.1}:56379:6379'
+  kafka: # single-node KRaft; EXTERNAL is what the host (the app and the tests) connects to
+    image: apache/kafka:4.1.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:59092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://${STACK_HOST:-localhost}:59092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false' # topics are created by stack.sh, as a real platform would
+    ports:
+      - '${STACK_BIND:-127.0.0.1}:59092:59092'
+  wiremock: # the payment provider; every answer comes from a test's stub (framework/deps/stubs.ts)
+    image: wiremock/wiremock:3.13.1
+    command: ['--disable-banner']
+    ports:
+      - '${STACK_BIND:-127.0.0.1}:58080:8080'
+  toxiproxy: # between the app and the provider, for latency and outage faults
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ['-host=0.0.0.0', '-config=/config/toxiproxy.json']
+    volumes:
+      - ./deps/toxiproxy.json:/config/toxiproxy.json:ro
+    ports:
+      - '${STACK_BIND:-127.0.0.1}:58474:8474'
+      - '${STACK_BIND:-127.0.0.1}:58081:18080'
+    depends_on: [wiremock]

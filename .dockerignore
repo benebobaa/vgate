@@ -1,0 +1,23 @@
+# Allowlist: the image carries the framework and its reference service, never a real service's tests. CI copies the
+# service under judgement in at run time.
+**
+
+!package.json
+!pnpm-lock.yaml
+!.nvmrc
+!.prettierrc.json
+!.prettierignore
+!Taskfile.yml
+!tsconfig.json
+!playwright.config.ts
+!eslint.config.js
+!framework/
+!cli/
+!ci/
+!.claude/skills/
+!services/example/
+
+.claude/skills/*-workspace/
+.claude/skills/*/evals/
+services/*/generated/
+**/.DS_Store

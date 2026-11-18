@@ -1,0 +1,57 @@
+# Publishes a release: push a tag `v<version>` that equals package.json's version. Builds every platform, uploads to
+# Cloudflare R2 (served at https://vgate.benelabs.tech; latest.json and install.sh move last), and attaches the same
+# files to a GitHub release. Needs, in the `release` environment: secrets CLOUDFLARE_API_TOKEN (R2 edit on the bucket)
+# and CLOUDFLARE_ACCOUNT_ID. Give the environment required reviewers to keep a human on every publish. See
+# docs/releasing.md.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: corepack enable pnpm && pnpm install --frozen-lockfile
+      - name: The tag names package.json's version
+        run: |
+          version=$(jq -r .version package.json)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
+            exit 1
+          fi
+      - run: pnpm task selftest
+      - run: bun cli/build.ts --all
+      - run: npm install --global wrangler@4.72.0
+      - name: Publish to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec tsx scripts/release.ts --publish --bucket vgate-releases
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/release/"$GITHUB_REF_NAME"/* \
+            --title "vgate ${GITHUB_REF_NAME#v}" \
+            --notes "Install: \`curl -fsSL https://vgate.benelabs.tech/install.sh | VGATE_VERSION=${GITHUB_REF_NAME#v} sh\`"

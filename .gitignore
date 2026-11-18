@@ -1,0 +1,18 @@
+node_modules/
+reports/
+dist/
+services/*/generated/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+.claude/skills/*-workspace/
+.task/
+.schemathesis/
+# vgate links a project to its runtime with these (generated; removed when run from this checkout)
+services/node_modules
+services/tsconfig.json
+services/package.json
+.remember/
+.hypothesis/

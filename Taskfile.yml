@@ -1,0 +1,198 @@
+# Entry point for QA and developers: `pnpm task --list` (or `task --list` with go-task installed globally).
+# SERVICE and TEST_ENV select <servicesDir>/<SERVICE>/service.yaml and its environment.
+#
+# This file is part of the vgate runtime: it always runs from the runtime's directory (ROOT_DIR), with the runtime's
+# tools. The project it judges is VGATE_PROJECT (set by `vgate`; this checkout when unset), whose services live in
+# VGATE_SERVICES_DIR and whose evidence goes to VGATE_REPORTS. Run by hand in this checkout, all three default to it.
+version: '3'
+
+vars:
+  SERVICE: '{{.SERVICE | default "example"}}'
+  TEST_ENV: '{{.TEST_ENV | default "local"}}'
+  PROJECT: '{{.VGATE_PROJECT | default .ROOT_DIR}}'
+  SERVICES_DIR: '{{.VGATE_SERVICES_DIR | default "services"}}'
+  REPORTS: '{{.VGATE_REPORTS | default (printf "%s/reports" .PROJECT)}}'
+  SVC_DIR: '{{.PROJECT}}/{{.SERVICES_DIR}}/{{.SERVICE}}'
+  BIN: '{{.ROOT_DIR}}/node_modules/.bin'
+  # The project is a separate repository (not this checkout): only its services are checked, with this runtime's
+  # configs, and none of its own.
+  FOREIGN: '{{if eq .PROJECT .ROOT_DIR}}{{else}}true{{end}}'
+
+env:
+  SERVICE: '{{.SERVICE}}'
+  TEST_ENV: '{{.TEST_ENV}}'
+  # VGATE_PROJECT, VGATE_SERVICES_DIR, VGATE_REPORTS, VGATE_RUNTIME and VGATE_STACK_LIB come from vgate's environment
+  # and reach every command as they are; redefining them here would shadow the values the vars above read.
+
+tasks:
+  default:
+    silent: true
+    cmds:
+      - task --list
+
+  install:
+    desc: Install the toolchain (Node deps; Schemathesis runs through uvx, k6 must be installed)
+    cmds:
+      - pnpm install --frozen-lockfile
+
+  up:
+    desc: Start the service's local stack, wait until it is healthy and seed the test users of a fresh database
+    cmds:
+      - bash "{{.SVC_DIR}}/stack.sh" up
+
+  down:
+    desc: Stop the service's local stack (data kept)
+    cmds:
+      - bash "{{.SVC_DIR}}/stack.sh" down
+
+  status:
+    desc: Show whether the stack is up and which backend commit the running app was built from
+    cmds:
+      - bash "{{.SVC_DIR}}/stack.sh" status
+
+  reset:
+    desc: DESTRUCTIVE - wipe the service's local test data and re-seed the bootstrap users
+    prompt: This deletes the local {{.SERVICE}} test data. Continue?
+    cmds:
+      - bash "{{.SVC_DIR}}/stack.sh" reset
+
+  spec:types:
+    desc: Generate TypeScript types from every service's vendored contract (tsc checks the tests of all services)
+    sources:
+      - '{{.PROJECT}}/{{.SERVICES_DIR}}/*/openapi.yaml'
+    generates:
+      - '{{.PROJECT}}/{{.SERVICES_DIR}}/*/generated/openapi.ts'
+    cmds:
+      - for spec in "{{.PROJECT}}/{{.SERVICES_DIR}}"/*/openapi.yaml; do [ -f "$spec" ] || continue; "{{.BIN}}/openapi-typescript" "$spec" -o "$(dirname "$spec")/generated/openapi.ts" --silent; done
+
+  selftest:
+    desc: The framework's own tests (contract validation, rules, client, auth) and the CLI's; no stack needed
+    cmds:
+      - '"{{.BIN}}/tsx" --test --test-reporter=spec ''framework/**/*.test.ts'' ''cli/**/*.test.ts'''
+
+  cli:build:
+    desc: 'Build the standalone vgate binary into dist/ (needs Bun; arguments after --, e.g. task cli:build -- --target bun-linux-x64)'
+    cmds:
+      - bun cli/build.ts {{.CLI_ARGS}}
+
+  typecheck:
+    desc: Type-check the framework and the tests against the contract types
+    deps:
+      - spec:types
+    cmds:
+      # A separate project's tests are checked through <servicesDir>/tsconfig.json, which vgate generates from this
+      # runtime's tsconfig.json; this checkout checks the framework, the CLI and its services in one program.
+      - '{{if .FOREIGN}}"{{.BIN}}/tsc" -p "{{.PROJECT}}/{{.SERVICES_DIR}}/tsconfig.json"{{else}}"{{.BIN}}/tsc" -p tsconfig.json{{end}}'
+      - if [ -f "{{.SVC_DIR}}/perf/tsconfig.json" ]; then "{{.BIN}}/tsc" -p "{{.SVC_DIR}}/perf"; fi
+
+  lint:
+    desc: ESLint (typed rules, Playwright rules) and Prettier
+    cmds:
+      # A separate project: its services' TypeScript only, with this runtime's rules and formatting, never its own.
+      - |
+        {{if .FOREIGN}}
+        cd "{{.PROJECT}}"
+        status=0
+        "{{.BIN}}/eslint" --config "{{.ROOT_DIR}}/eslint.config.js" "{{.SERVICES_DIR}}" || status=1
+        find "{{.SERVICES_DIR}}" -name '*.ts' -not -path '*/node_modules/*' -not -path '*/generated/*' -print0 |
+          xargs -0 -r "{{.BIN}}/prettier" --config "{{.ROOT_DIR}}/.prettierrc.json" --no-editorconfig --check || status=1
+        exit $status
+        {{else}}
+        status=0
+        "{{.BIN}}/eslint" . || status=1
+        "{{.BIN}}/prettier" --check . || status=1
+        exit $status
+        {{end}}
+
+  test:
+    desc: 'Run the API tests, then the dependency-fault tests alone, then check the known-failures registry (Playwright args after --, e.g. task test -- --grep CRT-)'
+    cmds:
+      - |
+        export RUN_ID="${RUN_ID:-$(date +%s | tail -c 7)}"
+        rm -rf "{{.REPORTS}}/allure-results"
+        # The registry check reads these: a report left by an earlier run must not stand in for this one.
+        rm -f "{{.REPORTS}}/junit/playwright-api.xml" "{{.REPORTS}}/junit/playwright-faults.xml"
+        status=0
+        PW_SUITE=api "{{.BIN}}/playwright" test --project api {{.CLI_ARGS}} || status=1
+        PW_SUITE=faults "{{.BIN}}/playwright" test --project faults --no-deps --pass-with-no-tests {{.CLI_ARGS}} || status=1
+        "{{.BIN}}/tsx" framework/cli/known-failures.ts {{if .CLI_ARGS}}--partial{{end}} || status=1
+        exit $status
+
+  contract:
+    desc: Schemathesis on the read-only operations (part of the gate)
+    cmds:
+      - '"{{.BIN}}/tsx" framework/cli/schemathesis.ts --mode read-only'
+
+  fuzz:
+    desc: Schemathesis on every operation (writes random data; disposable environments only)
+    cmds:
+      - '"{{.BIN}}/tsx" framework/cli/schemathesis.ts --mode full'
+
+  coverage:
+    desc: Coverage gate - documented responses x observed responses, inventory scenarios x tests, provider answers x stubs
+    cmds:
+      - |
+        status=0
+        "{{.BIN}}/tsx" framework/cli/coverage-report.ts --strict || status=1
+        "{{.BIN}}/tsx" framework/deps/coverage.ts --strict || status=1
+        exit $status
+
+  perf:
+    desc: k6 smoke (latency and error thresholds; outside the gate)
+    cmds:
+      - '"{{.BIN}}/tsx" framework/cli/perf.ts {{.CLI_ARGS}}'
+
+  report:
+    desc: Build the Allure report from Playwright and Schemathesis results
+    cmds:
+      - '"{{.BIN}}/allure" generate "{{.REPORTS}}/allure-results" -o "{{.REPORTS}}/allure-report" --clean'
+
+  report:open:
+    desc: Open the Allure report
+    cmds:
+      - '"{{.BIN}}/allure" open "{{.REPORTS}}/allure-report"'
+
+  token:
+    desc: 'Print an access token for a seeded user (task token -- writer)'
+    silent: true
+    cmds:
+      - '"{{.BIN}}/tsx" framework/cli/token.ts {{.CLI_ARGS}}'
+
+  inventory:skeleton:
+    desc: Print the inventory skeleton derived from the vendored contract
+    silent: true
+    cmds:
+      - '"{{.BIN}}/tsx" framework/cli/inventory-skeleton.ts'
+
+  gate:
+    desc: 'The regression gate: selftest, typecheck, lint, tests, contract, coverage (runs every step, fails if any failed)'
+    cmds:
+      - |
+        status=0
+        task selftest || status=1
+        task typecheck || status=1
+        task lint || status=1
+        task test || status=1
+        task contract || status=1
+        task coverage || status=1
+        task report >/dev/null 2>&1 || true
+        if [ $status -eq 0 ]; then echo "GATE PASSED ({{.SERVICE}}, {{.TEST_ENV}})"; else echo "GATE FAILED ({{.SERVICE}}, {{.TEST_ENV}}): see {{.REPORTS}}" >&2; fi
+        exit $status
+
+  image:build:
+    desc: 'Build the vgate CI image (ci/Dockerfile) as vgate:<version>; build args after --, e.g. -- --build-arg WITH_JAVA=true'
+    vars:
+      VERSION:
+        sh: node -p "require('./package.json').version"
+    cmds:
+      - docker build -f ci/Dockerfile -t vgate:{{.VERSION}} -t vgate:dev {{.CLI_ARGS}} .
+
+  release:build:
+    desc: 'Build every release platform into dist/release/v<version>/ (tar.gz per platform, SHA256SUMS, manifest; needs Bun; VGATE_MINISIGN_KEY signs)'
+    cmds:
+      - bun cli/build.ts --all
+
+  release:dry-run:
+    desc: 'List every object a release upload would write to R2; touches no network and needs no credentials (docs/releasing.md)'
+    cmds:
+      - pnpm exec tsx scripts/release.ts {{.CLI_ARGS}}

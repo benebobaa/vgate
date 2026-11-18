@@ -1,0 +1,50 @@
+# example-orders: the framework's reference for a service with dependencies (README.md). The app runs on the host,
+# its dependencies in compose.yaml: `pnpm vgate up --service example-orders`.
+name: example-orders
+
+spec: openapi.yaml
+
+rules:
+  datetimeOffset: Z # README rule 8
+  strictResponseProperties: true
+  headers:
+    always:
+      X-Request-Id: '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/' # README rule 8
+    withBody:
+      Content-Type: application/json # README rule 8
+    onStatus:
+      '401':
+        WWW-Authenticate: ApiKey # README rule 1
+
+schemathesis:
+  readOnlyMethods: [GET]
+  users: [clerk]
+  maxExamples: 25
+
+environments:
+  local:
+    disposable: true # every dependency is a local container; `vgate reset` empties them
+    baseUrl: http://localhost:${EXAMPLE_ORDERS_PORT:-8091} # the app runs on the host; its containers at STACK_HOST
+    healthPath: /health
+    auth: { header: X-Api-Key, scheme: '' } # README rule 1
+    db: { url: 'postgres://orders:orders@${STACK_HOST:-localhost}:55432/orders' }
+    compose: { file: compose.yaml, project: example-orders }
+    users:
+      clerk: { token: '${EXAMPLE_ORDERS_CLERK_KEY:-clerk-key}', role: clerk }
+    dependencies:
+      payments: # the third-party payment provider, stubbed and held to its own contract
+        kind: http-stub
+        adminUrl: http://${STACK_HOST:-localhost}:58080
+        contract: deps/payments.openapi.yaml
+        proxy: payments # toxiproxy sits between the app and the stub (deps/toxiproxy.json)
+      events:
+        kind: kafka
+        brokers: ['${STACK_HOST:-localhost}:59092']
+        topics:
+          orders.created: { schema: deps/events/orders.created.schema.json }
+      cache:
+        kind: redis
+        url: redis://${STACK_HOST:-localhost}:56379
+      proxies:
+        kind: toxiproxy
+        url: http://${STACK_HOST:-localhost}:58474

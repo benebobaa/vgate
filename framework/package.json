@@ -1,0 +1,7 @@
+{
+  "name": "@vgate/framework",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The framework tests import as @vgate/framework/<module>.ts; linked into node_modules by the runtime's package.json",
+  "type": "module"
+}

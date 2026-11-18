@@ -1,0 +1,198 @@
+# vgate on GitHub Actions: copied into a project's .github/workflows/ by `vgate init --ci github` (docs/ci.md).
+#
+#   plan       reads the pinned vgate version from vgate.yaml and the project's services
+#   gate       per service: doctor --fix, up, gate, down; reports as an artifact, the verdict in the job summary
+#   guard      pull requests only: compares each service's expectations with the merge base
+#   approval   only when the guard says needs-human: a deployment to the protected environment `vgate-expectations`,
+#              which waits for one of its required reviewers
+#   verdict    the check to require in branch protection: green when every gate passed and the guard said auto, or
+#              said needs-human and a reviewer approved this run
+#
+# Why an environment and not CODEOWNERS alone: the guard decides on content (an assertion removed from a test file an
+# agent may freely edit, a contract change that is breaking), which a path rule cannot express. CODEOWNERS still
+# protects the judge's own files (this workflow, vgate.yaml, known-failures.yaml), because a pull request runs its own
+# copy of this workflow: see ci/github/CODEOWNERS.example. Approval is per run, so every new push needs a new one.
+name: vgate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vgate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Where vgate.yaml sits, relative to the repository root.
+  VGATE_PROJECT_DIR: .
+  VGATE_BASE_URL: https://vgate.benelabs.tech
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pin.outputs.version }}
+      services: ${{ steps.services.outputs.services }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: pin
+        name: Read the pinned vgate version
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: |
+          version=$(sed -n "s/^version:[[:space:]]*['\"]\{0,1\}\([0-9][0-9A-Za-z.-]*\).*/\1/p" vgate.yaml | head -1)
+          if [ -z "$version" ]; then echo "::error file=vgate.yaml::no 'version: x.y.z' in vgate.yaml"; exit 1; fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+      - name: Install vgate ${{ steps.pin.outputs.version }}
+        run: |
+          curl -fsSL "$VGATE_BASE_URL/install.sh" | VGATE_VERSION='${{ steps.pin.outputs.version }}' VGATE_INSTALL_DIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - id: services
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: echo "services=$(vgate services --json | jq -c '.data.services')" >>"$GITHUB_OUTPUT"
+
+  gate:
+    needs: plan
+    if: needs.plan.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.plan.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install vgate ${{ needs.plan.outputs.version }}
+        run: |
+          curl -fsSL "$VGATE_BASE_URL/install.sh" | VGATE_VERSION='${{ needs.plan.outputs.version }}' VGATE_INSTALL_DIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/vgate
+          key: vgate-${{ needs.plan.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Doctor
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: vgate doctor --service '${{ matrix.service }}' --fix
+      - name: Start the stack
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: vgate up --service '${{ matrix.service }}'
+      - name: Gate
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: vgate gate --service '${{ matrix.service }}'
+      - name: Verdict summary
+        if: always()
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: |
+          verdict=reports/verdict.json
+          if [ ! -f "$verdict" ]; then echo "No verdict: the gate did not run" >>"$GITHUB_STEP_SUMMARY"; exit 0; fi
+          jq -r '"### vgate \(.service): \(.verdict | ascii_upcase)\n",
+                 "| step | status |", "| --- | --- |", (.steps[] | "| \(.name) | \(.status) |"), "",
+                 (if (.tests.failures // []) | length > 0 then "**Failed tests**\n" else empty end),
+                 ((.tests.failures // [])[:30][] | "- `\(.id // "-")` \(.file):\(.line // "") \(.message)")' \
+            "$verdict" >>"$GITHUB_STEP_SUMMARY"
+      - name: Stop the stack
+        if: always()
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: vgate down --service '${{ matrix.service }}' || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vgate-reports-${{ matrix.service }}
+          path: ${{ env.VGATE_PROJECT_DIR }}/reports/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  guard:
+    needs: plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      decision: ${{ steps.guard.outputs.decision }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The guard reads the base's files from git: it needs the history down to the merge base.
+          fetch-depth: 0
+      - name: Install vgate ${{ needs.plan.outputs.version }}
+        run: |
+          curl -fsSL "$VGATE_BASE_URL/install.sh" | VGATE_VERSION='${{ needs.plan.outputs.version }}' VGATE_INSTALL_DIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - id: guard
+        name: Guard the expectations
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        env:
+          SERVICES: ${{ needs.plan.outputs.services }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          base=$(git merge-base "origin/$BASE_REF" HEAD)
+          decision=auto
+          mkdir -p reports/guard
+          # The services of the base too: deleting a service's service.yaml must not take it out of the guard (and,
+          # with it, out of every check).
+          dir=$(vgate services --json | jq -re '.data.servicesDir')
+          at_base=$(git ls-tree -r --name-only "$base" -- "$dir" | sed -n "s|^$dir/\([^/]*\)/service\.yaml\$|\1|p")
+          for service in $( (jq -r '.[]' <<<"$SERVICES"; echo "$at_base") | sort -u); do
+            set +e
+            vgate guard --service "$service" --base "$base"
+            code=$?
+            set -e
+            cp reports/guard.json "reports/guard/$service.json" 2>/dev/null || true
+            case $code in
+              0) ;;
+              1) decision=needs-human
+                 jq -r '"### \(.service): needs a human\n", (.findings[] | "- **\(.rule)** `\(.file)`: \(.detail)")' \
+                   "reports/guard/$service.json" >>"$GITHUB_STEP_SUMMARY" ;;
+              *) echo "::error::vgate guard failed for $service (exit $code)"; exit "$code" ;;
+            esac
+          done
+          echo "decision=$decision" >>"$GITHUB_OUTPUT"
+          echo "Guard decision: $decision" >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vgate-guard
+          path: ${{ env.VGATE_PROJECT_DIR }}/reports/guard/
+          if-no-files-found: ignore
+
+  approval:
+    needs: guard
+    if: needs.guard.outputs.decision == 'needs-human'
+    runs-on: ubuntu-latest
+    # Settings > Environments > vgate-expectations: required reviewers (humans or a team, not the bot that opens the
+    # pull requests) and "Prevent self-review". The job waits here until one of them approves this run.
+    environment: vgate-expectations
+    steps:
+      - run: echo "A reviewer approved the weakened expectations of this run (see the guard job's summary)."
+
+  verdict:
+    needs: [plan, gate, guard, approval]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Combine
+        env:
+          PLAN: ${{ needs.plan.result }}
+          GATE: ${{ needs.gate.result }}
+          GUARD: ${{ needs.guard.result }}
+          DECISION: ${{ needs.guard.outputs.decision }}
+          APPROVAL: ${{ needs.approval.result }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "plan=$PLAN gate=$GATE guard=$GUARD decision=${DECISION:--} approval=$APPROVAL"
+          [ "$PLAN" = success ] || { echo "::error::plan failed"; exit 1; }
+          # skipped: a project with no services yet.
+          case "$GATE" in success | skipped) ;; *) echo "::error::the gate did not pass"; exit 1 ;; esac
+          if [ "$EVENT" = pull_request ]; then
+            [ "$GUARD" = success ] || { echo "::error::the guard did not run to a decision"; exit 1; }
+            if [ "$DECISION" = needs-human ] && [ "$APPROVAL" != success ]; then
+              echo "::error::the guard needs a human approval of this run (environment vgate-expectations)"; exit 1
+            fi
+          fi
+          echo "vgate: verified"

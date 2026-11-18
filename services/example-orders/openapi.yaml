@@ -1,0 +1,150 @@
+# The framework's reference for a service with many dependencies (services/example-orders/server.ts): Postgres,
+# Redis, Kafka and a third-party payment provider. See README.md for the rules the tests cite.
+openapi: 3.1.0
+info:
+  title: Orders API (framework example with dependencies)
+  version: 1.0.0
+security:
+  - apiKey: []
+paths:
+  /health:
+    get:
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: The service is up and reaches its database and cache
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /orders:
+    post:
+      operationId: createOrder
+      description: Charges the customer through the payment provider, then stores the order and publishes orders.created.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: A repeat with the same key and body returns the first result (README rule 3)
+          schema: { type: string, pattern: '^[A-Za-z0-9._-]{8,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderInput'
+      responses:
+        '201':
+          description: Paid and created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          description: The payment provider declined the charge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Declined'
+        '409':
+          description: The Idempotency-Key was used for a different request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: The payment provider failed or could not be reached
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '504':
+          description: The payment provider did not answer in time
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /orders/{orderId}:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getOrder
+      responses:
+        '200':
+          description: The order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No order with that id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  responses:
+    BadRequest:
+      description: The request breaks the contract (the Idempotency-Key header or a body field)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: No API key, or an unknown one
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [UP] }
+    Currency:
+      type: string
+      enum: [IDR, USD]
+    OrderInput:
+      type: object
+      additionalProperties: false
+      required: [customerId, amount, currency]
+      properties:
+        customerId: { type: string, pattern: '^[a-z0-9._-]{1,64}$' }
+        amount: { type: integer, minimum: 1, maximum: 100000000, description: In the currency's minor unit }
+        currency: { $ref: '#/components/schemas/Currency' }
+    Order:
+      type: object
+      required: [id, customerId, amount, currency, status, chargeId, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        customerId: { type: string }
+        amount: { type: integer }
+        currency: { $ref: '#/components/schemas/Currency' }
+        status: { type: string, enum: [paid] }
+        chargeId: { type: string, description: The payment provider's charge id }
+        createdAt: { type: string, format: date-time }
+    Declined:
+      type: object
+      required: [error, message, reason]
+      properties:
+        error: { type: string, enum: [payment_declined] }
+        message: { type: string }
+        reason: { type: string, description: The provider's decline code }
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum: [bad_request, unauthorized, not_found, idempotency_conflict, payment_unavailable, payment_timeout]
+        message: { type: string }

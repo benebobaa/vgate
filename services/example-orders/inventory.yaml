@@ -1,0 +1,159 @@
+# Test plan of example-orders: the framework's reference for a service with dependencies (Postgres, Redis, Kafka, a
+# stubbed third-party provider, toxiproxy faults).
+service: example-orders
+contract: openapi.yaml
+backend: { repo: ., commit: none } # the service lives in this repo (server.ts)
+
+sources:
+  - openapi.yaml
+  - README.md
+  - deps/payments.openapi.yaml
+  - deps/events/orders.created.schema.json
+
+personas:
+  clerk: { kind: seeded, role: clerk }
+  anonymous: { kind: none, state: no X-Api-Key }
+
+dependencies:
+  payments:
+    {
+      kind: http-stub,
+      contract: deps/payments.openapi.yaml,
+      isolation: every stub matches $.customer,
+      a run-unique customer id,
+    }
+  events: { kind: kafka, topics: [orders.created], isolation: events are found by their customerId }
+  cache: { kind: redis, keys: ['idempotency:<key> (24h)', 'order:<id> (300s)'] }
+  proxies: { kind: toxiproxy, proxies: [payments], tests: tests/faults }
+
+conventions:
+  rules:
+    - rule: every response carries a UUID X-Request-Id, a JSON body where there is one, UTC datetimes
+      sources: [README.md rule 8]
+      checkedBy: framework client on every call (service.yaml rules)
+    - rule: every stubbed provider answer is one its contract documents; every charge request conforms to it
+      sources: [deps/payments.openapi.yaml]
+      checkedBy: framework/deps/stubs.ts on every stub and every calls()
+    - rule: every orders.created event conforms to its schema
+      sources: [deps/events/orders.created.schema.json]
+      checkedBy: framework/deps/kafka.ts on every event a test reads
+
+operations:
+  - id: health
+    operation: GET /health
+    area: HLT
+    permission: null
+    responses: { '200': [] }
+    scenarios:
+      - id: HLT-200
+        title: answers UP without a key
+        as: anonymous
+        expect: { status: 200 }
+        sources: [openapi.yaml health (security none)]
+
+  - id: createOrder
+    operation: POST /orders
+    area: ORD
+    permission: clerk
+    request: OrderInput + Idempotency-Key header
+    checkOrder:
+      [key (401), Idempotency-Key header (400), body (400), idempotency (409 / repeat), charge (402, 503, 504)]
+    responses: { '201': [], '400': [], '401': [], '402': [], '409': [], '503': [], '504': [] }
+    scenarios:
+      - id: ORD-201
+        title: pays, then stores, publishes once and remembers the order
+        as: clerk
+        expect:
+          status: 201
+          downstream: [one POST /charges with amount, currency, customer, reference = Idempotency-Key]
+          state: [one orders row, one orders.created event keyed by the order id, idempotency:<key> for 24h]
+        sources: [README.md rules 3, 4, 6]
+      - id: ORD-201-REPEAT
+        title: a repeat with the same key and body answers the first order and charges once
+        as: clerk
+        expect: { status: 201, downstream: [one charge], state: [one row, one event] }
+        sources: [README.md rule 3]
+      - id: ORD-409
+        title: the same key with a different body is a conflict and charges nothing more
+        as: clerk
+        expect: { status: 409, response: [error idempotency_conflict] }
+        sources: [README.md rule 3]
+      - id: ORD-402
+        title: a declined charge answers 402 with the provider's reason, and nothing is kept
+        as: clerk
+        expect: { status: 402, state: [no row, no event, no idempotency entry] }
+        sources: [README.md rules 4, 5, deps/payments.openapi.yaml 402]
+      - id: ORD-402-RETRY
+        title: after a decline the same key can be retried and succeed
+        as: clerk
+        expect: { status: 201 }
+        sources: [README.md rule 3]
+      - id: ORD-503
+        title: the provider's 500, 503 and 400 answer 503, and nothing is kept
+        as: clerk
+        expect: { status: 503, state: [no row, no event, no idempotency entry] }
+        sources: [README.md rules 4, 5, deps/payments.openapi.yaml 400, 500, 503]
+      - id: ORD-503-DOWN
+        title: an unreachable provider answers 503, and nothing is kept
+        as: clerk
+        fault: toxiproxy payments down
+        expect: { status: 503, state: [no row] }
+        sources: [README.md rules 4, 5]
+      - id: ORD-504
+        title: a provider slower than 2 seconds answers 504, and nothing is kept
+        as: clerk
+        fault: toxiproxy payments latency 3s
+        expect: { status: 504, state: [no row, no event, no idempotency entry] }
+        sources: [README.md rules 4, 5]
+      - id: ORD-400
+        title: refuses a body that breaks OrderInput (table of cases) and charges nothing
+        as: clerk
+        expect: { status: 400, downstream: [no charge] }
+        sources: [openapi.yaml OrderInput, README.md rule 2]
+      - id: ORD-400-KEY
+        title: refuses a missing or short Idempotency-Key before the body
+        as: clerk
+        expect: { status: 400, downstream: [no charge] }
+        sources: [openapi.yaml createOrder Idempotency-Key, README.md rule 2]
+      - id: ORD-400-CONTENT-TYPE
+        title: refuses a JSON body not sent as application/json
+        as: clerk
+        expect: { status: 400 }
+        sources: [README.md rule 2]
+      - id: ORD-401
+        title: refuses a call without a key or with an unknown one, before the body
+        as: anonymous
+        expect: { status: 401, headers: [WWW-Authenticate ApiKey] }
+        sources: [README.md rule 1]
+      - id: PAY-CONTRACT
+        title: a stub the provider's contract does not document is refused
+        as: null
+        expect: { framework: StubViolation for an undocumented status and for a body that breaks the Decline schema }
+        sources: [deps/payments.openapi.yaml]
+
+  - id: getOrder
+    operation: GET /orders/{orderId}
+    area: GET
+    permission: clerk
+    responses: { '200': [], '401': [], '404': [] }
+    scenarios:
+      - id: GET-200
+        title: answers the order and caches it for 300 seconds
+        as: clerk
+        expect: { status: 200, state: ['order:<id> holds the order, TTL at most 300s'] }
+        sources: [README.md rule 7]
+      - id: GET-200-CACHED
+        title: a second read is served from the cache, not the database
+        as: clerk
+        expect: { status: 200 }
+        sources: [README.md rule 7]
+      - id: GET-404
+        title: answers 404 for an unknown id and for one that is not a UUID
+        as: clerk
+        expect: { status: 404, response: [error not_found] }
+        sources: [README.md rule 7]
+      - id: GET-401
+        title: refuses a call without a key
+        as: anonymous
+        expect: { status: 401 }
+        sources: [README.md rule 1]

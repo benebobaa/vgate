@@ -1,0 +1,133 @@
+# The regression gate as a GitLab CI/CD component (for a shared CI templates project; docs/ci.md). Two jobs per service:
+#
+#   vgate:guard:<service>  merge requests only. Compares the expectations with the target branch; changes that weaken
+#                          or move them (breaking contract, removed scenarios, new known failures, machinery) need an
+#                          eligible approver's approval after the latest push.
+#   vgate:gate:<service>   starts the service's stack and runs the whole gate; the verdict is reports/verdict.json.
+#
+# The judge is the pinned image: both jobs run the image's vgate, and the gate runs the image's framework with only the
+# service's directory copied in from the checkout. A merge request can change the tests under judgement, not the
+# judge; the guard sends changes to the judge's own files to a human.
+spec:
+  inputs:
+    service:
+      description: The service under judgement (its directory name under services/).
+    environment:
+      description: The service.yaml environment to run against.
+      default: local
+    image:
+      description: The pinned vgate image, by version or digest (never a moving tag such as latest).
+    tests_dir:
+      description: The service's directory in the checkout, copied into the judge's workspace.
+      default: ''
+    approvers:
+      description: Who may approve what the guard flags. Comma-separated usernames and `group:<full/path>` entries.
+    stage:
+      description: The stage both jobs run in.
+      default: test
+    services:
+      description: >-
+        CI services the gate's stack needs. The default is a Docker-in-Docker daemon for compose stacks; a service
+        whose stack needs no Docker passes [].
+      type: array
+      default:
+        - name: docker:29.0.0-dind
+          alias: docker
+    stack_host:
+      description: >-
+        Where the stack's published ports answer, exported as STACK_HOST for service.yaml (`${STACK_HOST:-localhost}`).
+        `docker` with the default DinD service; `localhost` on a Kubernetes executor or without Docker.
+      default: docker
+---
+.vgate:$[[ inputs.service ]]:
+  image:
+    name: $[[ inputs.image ]]
+    entrypoint: ['']
+  stage: $[[ inputs.stage ]]
+  variables:
+    SERVICE: $[[ inputs.service ]]
+    TEST_ENV: $[[ inputs.environment ]]
+    VGATE_TESTS_DIR: $[[ inputs.tests_dir ]]
+    VGATE_APPROVERS: $[[ inputs.approvers ]]
+  interruptible: true
+
+vgate:guard:$[[ inputs.service ]]:
+  extends: .vgate:$[[ inputs.service ]]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  variables:
+    # The guard compares the target branch with the merge request: it needs the history between them.
+    GIT_DEPTH: '0'
+  script:
+    - |
+      set +e
+      mkdir -p reports
+      vgate guard --root "$CI_PROJECT_DIR" --service "$SERVICE" --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --json \
+        > reports/guard-result.json
+      status=$?
+      set -e
+      echo "Guard result: reports/guard-result.json (details: reports/guard.json)"
+      jq -r '.summary' reports/guard-result.json || cat reports/guard-result.json
+      case $status in
+        0) echo "No human needed: a green gate merges this change." ;;
+        1) bash /opt/vgate/ci/gitlab/approval-check.sh reports/guard-result.json ;;
+        *) echo "The guard could not judge this change (exit $status)." >&2; cat reports/guard-result.json; exit "$status" ;;
+      esac
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - reports/guard.json
+      - reports/guard-result.json
+
+vgate:gate:$[[ inputs.service ]]:
+  extends: .vgate:$[[ inputs.service ]]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  services: $[[ inputs.services ]]
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_CERT_PATH: /certs/client
+    DOCKER_TLS_VERIFY: '1'
+    STACK_HOST: $[[ inputs.stack_host ]]
+  # Every command runs in the script: on the Docker executor after_script starts a fresh container that would not see
+  # the judge's workspace. The stack dies with the job and its DinD service.
+  script:
+    - |
+      set +e
+      src="$CI_PROJECT_DIR/${VGATE_TESTS_DIR:-services/$SERVICE}"
+      [ -f "$src/service.yaml" ] || { echo "No service.yaml in $src (input tests_dir)" >&2; exit 2; }
+      rm -rf "/opt/vgate/services/$SERVICE"
+      cp -R "$src" "/opt/vgate/services/$SERVICE"
+      rm -rf "/opt/vgate/services/$SERVICE/generated"
+      cd /opt/vgate
+      vgate doctor --service "$SERVICE" --env "$TEST_ENV" --fix
+      status=$?
+      if [ $status -eq 0 ]; then
+        vgate up --service "$SERVICE" --env "$TEST_ENV"
+        status=$?
+      fi
+      if [ $status -eq 0 ]; then
+        vgate gate --service "$SERVICE" --env "$TEST_ENV" --json > reports-gate-result.json
+        status=$?
+        jq -r '.summary' reports-gate-result.json || cat reports-gate-result.json
+        jq -r '(.data.tests.failures // [])[:30][] | "FAIL [\(.id // "-")] \(.file):\(.line // "-")  \(.message)"' \
+          reports-gate-result.json 2>/dev/null
+        jq -r '(.data.coverage.gaps // [])[:30][] | "GAP  \(.)"' reports-gate-result.json 2>/dev/null
+        mkdir -p reports && mv reports-gate-result.json reports/gate-result.json
+      fi
+      rm -rf "$CI_PROJECT_DIR/reports"
+      [ -d reports ] && cp -R reports "$CI_PROJECT_DIR/reports"
+      echo "Verdict: reports/verdict.json (job artifacts)"
+      exit $status
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - reports/
+    reports:
+      junit:
+        - reports/junit/*.xml
+        - reports/schemathesis/*/junit.xml

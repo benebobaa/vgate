@@ -1,0 +1,56 @@
+{
+  "name": "vgate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A deterministic verification gate for merge requests written by AI agents: contract-checked API tests, an expectation guard, and an agent-first CLI",
+  "homepage": "https://vgate.benelabs.tech",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/benebobaa/vgate.git"
+  },
+  "type": "module",
+  "packageManager": "pnpm@10.17.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "task": "task",
+    "vgate": "tsx cli/main.ts",
+    "test": "task test",
+    "gate": "task gate",
+    "typecheck": "task typecheck",
+    "lint": "task lint"
+  },
+  "dependencies": {
+    "@vgate/framework": "link:framework"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@go-task/cli": "^3.54.0",
+    "@platformatic/kafka": "^2.16.0",
+    "@playwright/test": "^1.64.1",
+    "@types/k6": "^2.3.1",
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "allure-commandline": "^2.46.1",
+    "allure-playwright": "^3.14.0",
+    "eslint": "^10.13.0",
+    "eslint-plugin-playwright": "^2.12.1",
+    "openapi-typescript": "^7.13.0",
+    "pg": "^8.23.1",
+    "prettier": "^3.9.10",
+    "redis": "^6.3.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.1",
+    "yaml": "^2.9.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@go-task/cli",
+      "esbuild"
+    ]
+  }
+}

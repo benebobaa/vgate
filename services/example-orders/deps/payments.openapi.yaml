@@ -1,0 +1,78 @@
+# The payment provider's contract, vendored like a service's own: the stubs of the tests may only answer what it
+# documents, and what example-orders sends it is held to its request schema. (A fictional provider for the example.)
+openapi: 3.1.0
+info:
+  title: Payments provider
+  version: '2026-01-01'
+paths:
+  /charges:
+    post:
+      operationId: createCharge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChargeRequest'
+      responses:
+        '201':
+          description: The charge succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Charge'
+        '400':
+          description: The request is malformed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderError'
+        '402':
+          description: The charge was declined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Decline'
+        '500':
+          description: The provider failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderError'
+        '503':
+          description: The provider is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderError'
+components:
+  schemas:
+    ChargeRequest:
+      type: object
+      additionalProperties: false
+      required: [amount, currency, customer, reference]
+      properties:
+        amount: { type: integer, minimum: 1 }
+        currency: { type: string, enum: [IDR, USD] }
+        customer: { type: string, minLength: 1 }
+        reference: { type: string, minLength: 1, description: The caller's idempotency reference }
+    Charge:
+      type: object
+      required: [id, status, amount, currency]
+      properties:
+        id: { type: string, pattern: '^ch_[A-Za-z0-9._-]+$' }
+        status: { type: string, enum: [succeeded] }
+        amount: { type: integer }
+        currency: { type: string, enum: [IDR, USD] }
+    Decline:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, enum: [card_declined, insufficient_funds, expired_card] }
+        message: { type: string }
+    ProviderError:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, enum: [invalid_request, internal_error, unavailable] }
+        message: { type: string }

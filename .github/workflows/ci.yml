@@ -1,0 +1,101 @@
+# vgate's own CI: the framework's self-tests and static checks, the full gate on both reference services, the release
+# build, and a secret scan. (Projects that use vgate get a different workflow: ci/github/vgate.yml.)
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: selftest, typecheck, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable pnpm && pnpm install --frozen-lockfile
+      - run: pnpm task selftest
+      - run: pnpm task typecheck
+      - run: pnpm task lint
+      - name: shellcheck the installer and the stack scripts
+        run: shellcheck -x -P SCRIPTDIR scripts/install.sh framework/stack/lib.sh services/*/stack.sh ci/gitlab/approval-check.sh
+
+  gate:
+    name: gate ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # example needs nothing; example-orders starts PostgreSQL, Redis, Kafka, WireMock and Toxiproxy in Docker.
+        service: [example, example-orders]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable pnpm && pnpm install --frozen-lockfile
+      - name: uv (Schemathesis runs through uvx)
+        run: pipx install uv
+      - run: pnpm vgate doctor --service ${{ matrix.service }} --fix
+      - run: pnpm vgate up --service ${{ matrix.service }}
+      - run: pnpm vgate gate --service ${{ matrix.service }}
+      - name: Verdict
+        if: always()
+        run: |
+          if [ -f reports/verdict.json ]; then
+            jq -r '"**\(.service)**: \(.verdict) - \(.tests.total) tests, \(.tests.failed) failed"' reports/verdict.json >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - if: always()
+        run: pnpm vgate down --service ${{ matrix.service }}
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-${{ matrix.service }}
+          path: reports/
+          retention-days: 14
+
+  build:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: corepack enable pnpm && pnpm install --frozen-lockfile
+      - run: bun cli/build.ts --all
+      - name: The linux-x64 binary runs and carries its skills
+        run: |
+          dir=$(mktemp -d)
+          tar -xzf dist/release/v*/vgate-*-linux-x64.tar.gz -C "$dir"
+          "$dir/vgate" version
+          "$dir/vgate" skills list --dir "$dir/skills" --json | jq -e '.data.skills | length >= 2'
+      - run: pnpm exec tsx scripts/release.ts --dry-run
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

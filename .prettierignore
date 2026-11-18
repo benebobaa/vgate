@@ -1,0 +1,14 @@
+node_modules
+reports
+dist
+pnpm-lock.yaml
+services/*/generated
+services/*/openapi.yaml
+.claude
+.task
+.schemathesis
+# vgate links a project to its runtime with these (generated; removed when run from this checkout)
+services/node_modules
+services/tsconfig.json
+.remember
+services/package.json
