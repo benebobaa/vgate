@@ -74,7 +74,7 @@ tokens) in the environment, any S3 client works, e.g. the AWS CLI, keeping the s
 ```bash
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=auto
 R2="--endpoint-url https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
-v=0.2.0
+v=0.2.1
 aws s3 cp dist/release/v$v/ s3://vgate-releases/v$v/ --recursive --exclude manifest.json \
   --cache-control 'public, max-age=31536000, immutable' $R2
 aws s3 cp dist/release/v$v/manifest.json s3://vgate-releases/v$v/manifest.json \

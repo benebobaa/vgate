@@ -101,7 +101,7 @@ monorepos, regulated teams and adoption in shadow mode: [docs/pr-verification.md
 ## A project
 
 ```
-vgate.yaml                 version: 0.2.0, servicesDir: regression
+vgate.yaml                 version: 0.2.1, servicesDir: regression
 regression/<svc>/
   service.yaml             rules, auth, dependencies, environments
   openapi.yaml             the vendored contract: approved behaviour, changed only by a sync
