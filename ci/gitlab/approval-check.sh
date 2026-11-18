@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
-# Decides whether a merge request the guard marked "needs a human" has that human's approval.
+# Decides whether a merge request vgate marked as needing a human has that human's approval.
 #
-#   approval-check.sh <guard result json>
+#   approval-check.sh <vgate decide --json output | a decision.json | a guard result json>
 #
 # Passes (exit 0) only when an eligible approver's latest approval of the merge request is newer than its latest push.
 # Eligible: the users and group members in VGATE_APPROVERS, never the merge request's author. Fails closed: any API
 # error, unreadable timestamp or missing variable is "not approved".
 #
 # Needs: CI_API_V4_URL, CI_PROJECT_ID, CI_MERGE_REQUEST_IID (GitLab sets them), VGATE_API_TOKEN (a masked project or
-# group access token with read_api: the job token cannot read approvals), VGATE_APPROVERS (comma-separated usernames
+# group access token with scope api (read_api is enough for this script; the note and auto-merge need api): the job
+# token cannot read approvals), VGATE_APPROVERS (comma-separated usernames
 # and `group:<full/path>` entries), and curl and jq.
 set -euo pipefail
 
-guard_result=${1:?usage: approval-check.sh <guard result json>}
+guard_result=${1:?usage: approval-check.sh <vgate decide --json output | decision.json | guard result json>}
 : "${CI_API_V4_URL:?}" "${CI_PROJECT_ID:?}" "${CI_MERGE_REQUEST_IID:?}"
 
 findings() {
-  echo "The guard found changes that weaken or move the expectations:"
+  echo "Why a human must look:"
+  # vgate decide --json (.data.reasons), a decision.json (.reasons) or vgate guard --json (.data.findings).
   jq -r '
+    def text: if type == "string" then . else (.message // .detail // .reason // tojson) end;
     .summary // empty,
+    ((.reasons // .data.reasons // []) | .[] | "  - " + text),
     (.data.findings // [] | .[] |
       "  - " + ((.rule // .kind // "finding") | tostring) + ": " + (if .file then .file + ": " else "" end) +
       ((.detail // .message // .) | if type == "string" then . else tojson end))
@@ -34,7 +38,7 @@ refuse() {
 }
 
 VGATE_APPROVERS_SHOWN=${VGATE_APPROVERS:-none configured}
-[ -n "${VGATE_API_TOKEN:-}" ] || refuse "VGATE_API_TOKEN is not set (a masked token with read_api; see docs/ci.md)"
+[ -n "${VGATE_API_TOKEN:-}" ] || refuse "VGATE_API_TOKEN is not set (a masked token with scope api; see docs/ci.md)"
 [ -n "${VGATE_APPROVERS:-}" ] || refuse "VGATE_APPROVERS is empty: nobody is eligible to approve"
 
 api() { # <path> -> JSON on stdout; fails on any HTTP error

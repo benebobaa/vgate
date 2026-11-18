@@ -1,27 +1,33 @@
-# The regression gate as a GitLab CI/CD component (for a shared CI templates project; docs/ci.md). Two jobs per service:
+# vgate as GitLab CI/CD components (publish this directory's files in your components project; docs/ci.md):
 #
-#   vgate:guard:<service>  merge requests only. Compares the expectations with the target branch; changes that weaken
-#                          or move them (breaking contract, removed scenarios, new known failures, machinery) need an
-#                          eligible approver's approval after the latest push.
-#   vgate:gate:<service>   starts the service's stack and runs the whole gate; the verdict is reports/verdict.json.
+#   regression-gate  (this file) include once per service. Two jobs:
+#     vgate:gate:<service>   merge requests and the default branch: the service's stack and the whole gate
+#     vgate:guard:<service>  merge requests: compares the expectations with the merge request's base
+#   pr-decision      (pr-decision.yml) include once. vgate:decide reads every service's evidence and decides
+#                    merge | needs-approval | blocked, with one upserted merge-request note (docs/pr-verification.md)
 #
-# The judge is the pinned image: both jobs run the image's vgate, and the gate runs the image's framework with only the
-# service's directory copied in from the checkout. A merge request can change the tests under judgement, not the
-# judge; the guard sends changes to the judge's own files to a human.
+# On a merge request each job first asks `vgate affected` whether its service is touched; if not it exits at once
+# and leaves no evidence, which is right: vgate decide expects evidence only from the services it finds affected, and
+# blocks on any it expected but did not get. So a service missing from your includes fails closed, it is never skipped.
+#
+# The judge is the pinned image: its vgate carries the framework and runs it against the checkout (--root), so a merge
+# request can change the tests under judgement, not the judge. Evidence is vgate's own JSON output, never a file from
+# the checkout: every job deletes the reports directory first, keeps its scratch files outside the checkout (untracked
+# files there would count as part of the change), and passes on only what vgate printed.
 spec:
   inputs:
     service:
-      description: The service under judgement (its directory name under services/).
+      description: The service under judgement (its directory name under the project's servicesDir).
     environment:
       description: The service.yaml environment to run against.
       default: local
     image:
       description: The pinned vgate image, by version or digest (never a moving tag such as latest).
-    tests_dir:
-      description: The service's directory in the checkout, copied into the judge's workspace.
-      default: ''
-    approvers:
-      description: Who may approve what the guard flags. Comma-separated usernames and `group:<full/path>` entries.
+    reports_dir:
+      description: >-
+        vgate.yaml's reportsDir, relative to the checkout: deleted before each job and uploaded as the full reports.
+        Evidence never comes from it, so a wrong value loses reports, never lets a merge request through.
+      default: reports
     stage:
       description: The stage both jobs run in.
       default: test
@@ -47,38 +53,57 @@ spec:
   variables:
     SERVICE: $[[ inputs.service ]]
     TEST_ENV: $[[ inputs.environment ]]
-    VGATE_TESTS_DIR: $[[ inputs.tests_dir ]]
-    VGATE_APPROVERS: $[[ inputs.approvers ]]
+    VGATE_REPORTS_DIR: $[[ inputs.reports_dir ]]
+    # affected and guard read the base's files from git: the history down to the merge base.
+    GIT_DEPTH: '0'
   interruptible: true
+  before_script:
+    - |
+      # Scratch files live outside the checkout: an untracked file there would count as part of the change.
+      VGATE_TMP=$(mktemp -d)
+      export VGATE_TMP
+      # On a merge request, a service the change does not touch has nothing to prove.
+      if [ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" ]; then
+        vgate affected --root "$CI_PROJECT_DIR" --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --json > "$VGATE_TMP/affected.json" \
+          || { echo "vgate affected failed" >&2; cat "$VGATE_TMP/affected.json"; exit 2; }
+        VGATE_AFFECTED=$(jq -r --arg s "$SERVICE" '[.data.services[].name] | index($s) != null' "$VGATE_TMP/affected.json")
+        VGATE_DELETED=$(jq -r --arg s "$SERVICE" '(.data.deleted // []) | index($s) != null' "$VGATE_TMP/affected.json")
+        export VGATE_AFFECTED VGATE_DELETED
+      else
+        export VGATE_AFFECTED=true VGATE_DELETED=false
+      fi
 
 vgate:guard:$[[ inputs.service ]]:
   extends: .vgate:$[[ inputs.service ]]
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
-  variables:
-    # The guard compares the target branch with the merge request: it needs the history between them.
-    GIT_DEPTH: '0'
   script:
     - |
+      if [ "$VGATE_AFFECTED" != true ] && [ "$VGATE_DELETED" != true ]; then
+        echo "$SERVICE is not affected by this change: nothing to guard."; exit 0
+      fi
+      # A merge request can commit a reports/guard.json or a vgate-evidence/: only the guard's own answer counts.
+      rm -rf "$VGATE_REPORTS_DIR" vgate-evidence
       set +e
-      mkdir -p reports
       vgate guard --root "$CI_PROJECT_DIR" --service "$SERVICE" --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --json \
-        > reports/guard-result.json
+        > "$VGATE_TMP/guard.json"
       status=$?
       set -e
-      echo "Guard result: reports/guard-result.json (details: reports/guard.json)"
-      jq -r '.summary' reports/guard-result.json || cat reports/guard-result.json
+      jq -r '.summary' "$VGATE_TMP/guard.json" || cat "$VGATE_TMP/guard.json"
+      # 0 auto, 1 needs-human: both are answers, and vgate:decide weighs them (and asks the human). Else no answer.
       case $status in
-        0) echo "No human needed: a green gate merges this change." ;;
-        1) bash /opt/vgate/ci/gitlab/approval-check.sh reports/guard-result.json ;;
-        *) echo "The guard could not judge this change (exit $status)." >&2; cat reports/guard-result.json; exit "$status" ;;
+        0 | 1) ;;
+        *) echo "The guard could not judge this change (exit $status)." >&2; exit "$status" ;;
       esac
+      mkdir -p "vgate-evidence/$SERVICE"
+      jq -e --arg s "$SERVICE" '.data | select(.schema == "vgate.guard/1" and .service == $s)' "$VGATE_TMP/guard.json" \
+        > "vgate-evidence/$SERVICE/guard.json" \
+        || { rm -f "vgate-evidence/$SERVICE/guard.json"; echo "No usable guard report: vgate:decide counts the guard as not run."; }
   artifacts:
     when: always
     expire_in: 14 days
     paths:
-      - reports/guard.json
-      - reports/guard-result.json
+      - vgate-evidence/
 
 vgate:gate:$[[ inputs.service ]]:
   extends: .vgate:$[[ inputs.service ]]
@@ -93,41 +118,45 @@ vgate:gate:$[[ inputs.service ]]:
     DOCKER_TLS_VERIFY: '1'
     STACK_HOST: $[[ inputs.stack_host ]]
   # Every command runs in the script: on the Docker executor after_script starts a fresh container that would not see
-  # the judge's workspace. The stack dies with the job and its DinD service.
+  # the stack. The stack dies with the job and its DinD service anyway; `down` is for tidiness.
   script:
     - |
+      if [ "$VGATE_AFFECTED" != true ]; then echo "$SERVICE is not affected by this change: nothing to gate."; exit 0; fi
+      services_dir=$(vgate services --root "$CI_PROJECT_DIR" --json | jq -r '.data.servicesDir // empty')
+      [ -n "$services_dir" ] && [ -f "$CI_PROJECT_DIR/$services_dir/$SERVICE/service.yaml" ] \
+        || { echo "No service.yaml for $SERVICE under the project's servicesDir (${services_dir:-unknown})" >&2; exit 2; }
+      # A merge request can commit a reports/verdict.json or a vgate-evidence/: only this run's verdict counts.
+      rm -rf "$VGATE_REPORTS_DIR" vgate-evidence
       set +e
-      src="$CI_PROJECT_DIR/${VGATE_TESTS_DIR:-services/$SERVICE}"
-      [ -f "$src/service.yaml" ] || { echo "No service.yaml in $src (input tests_dir)" >&2; exit 2; }
-      rm -rf "/opt/vgate/services/$SERVICE"
-      cp -R "$src" "/opt/vgate/services/$SERVICE"
-      rm -rf "/opt/vgate/services/$SERVICE/generated"
-      cd /opt/vgate
-      vgate doctor --service "$SERVICE" --env "$TEST_ENV" --fix
+      vgate doctor --root "$CI_PROJECT_DIR" --service "$SERVICE" --env "$TEST_ENV" --fix
       status=$?
+      started=false
       if [ $status -eq 0 ]; then
-        vgate up --service "$SERVICE" --env "$TEST_ENV"
+        started=true
+        vgate up --root "$CI_PROJECT_DIR" --service "$SERVICE" --env "$TEST_ENV"
         status=$?
       fi
       if [ $status -eq 0 ]; then
-        vgate gate --service "$SERVICE" --env "$TEST_ENV" --json > reports-gate-result.json
+        vgate gate --root "$CI_PROJECT_DIR" --service "$SERVICE" --env "$TEST_ENV" --json > "$VGATE_TMP/gate.json"
         status=$?
-        jq -r '.summary' reports-gate-result.json || cat reports-gate-result.json
+        jq -r '.summary' "$VGATE_TMP/gate.json" || cat "$VGATE_TMP/gate.json"
         jq -r '(.data.tests.failures // [])[:30][] | "FAIL [\(.id // "-")] \(.file):\(.line // "-")  \(.message)"' \
-          reports-gate-result.json 2>/dev/null
-        jq -r '(.data.coverage.gaps // [])[:30][] | "GAP  \(.)"' reports-gate-result.json 2>/dev/null
-        mkdir -p reports && mv reports-gate-result.json reports/gate-result.json
+          "$VGATE_TMP/gate.json" 2>/dev/null
       fi
-      rm -rf "$CI_PROJECT_DIR/reports"
-      [ -d reports ] && cp -R reports "$CI_PROJECT_DIR/reports"
-      echo "Verdict: reports/verdict.json (job artifacts)"
+      [ "$started" = true ] && vgate down --root "$CI_PROJECT_DIR" --service "$SERVICE" --env "$TEST_ENV" >/dev/null 2>&1
+      # Only the verdict vgate printed travels to vgate:decide; a missing verdict is a missing proof, and decide blocks.
+      mkdir -p "vgate-evidence/$SERVICE"
+      jq -e --arg s "$SERVICE" '.data | select(.schema == "vgate.verdict/1" and .service == $s)' "$VGATE_TMP/gate.json" \
+        > "vgate-evidence/$SERVICE/verdict.json" 2>/dev/null \
+        || { rm -f "vgate-evidence/$SERVICE/verdict.json"; echo "No verdict for $SERVICE: the gate did not finish."; }
       exit $status
   artifacts:
     when: always
     expire_in: 14 days
     paths:
-      - reports/
+      - $[[ inputs.reports_dir ]]/
+      - vgate-evidence/
     reports:
       junit:
-        - reports/junit/*.xml
-        - reports/schemathesis/*/junit.xml
+        - $[[ inputs.reports_dir ]]/junit/*.xml
+        - $[[ inputs.reports_dir ]]/schemathesis/*/junit.xml

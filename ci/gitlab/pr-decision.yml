@@ -1,0 +1,117 @@
+# vgate:decide as a GitLab CI/CD component: include it ONCE, next to one regression-gate include per service.
+# It runs in the .post stage, after every gate and guard job (failed ones too), reads their evidence and decides:
+#
+#   merge           every affected service's gate passed, every guard said auto, and the risk tier is within
+#                   vgate.yaml's policy.autoMerge: the job passes; with `automerge: true` it also sets the merge request
+#                   to merge when the pipeline succeeds
+#   needs-approval  a guard flagged weakened expectations, or the change is riskier than policy.autoMerge allows: the
+#                   job passes only when an eligible approver approved after the latest push (approval-check.sh);
+#                   GitLab starts no pipeline on approval, so the approver re-runs this job
+#   blocked         a gate failed, evidence is missing, or a guard could not judge: the job fails
+#
+# The decision is posted as one merge-request note, updated in place on every pipeline (marker
+# `<!-- vgate:decision -->`). Make the pipeline required (Settings > Merge requests > "Pipelines must succeed").
+#
+# The decision is what vgate decide prints, never a file from the checkout: GitLab extracts the earlier jobs'
+# artifacts into the checkout, so the job first moves the evidence out (untracked files there would count as part of
+# the change) and deletes the reports directory a merge request could have committed.
+spec:
+  inputs:
+    image:
+      description: The pinned vgate image, the same as in the regression-gate includes.
+    approvers:
+      description: Who may approve a needs-approval decision. Comma-separated usernames and `group:<full/path>` entries.
+    automerge:
+      description: Set merge requests decided `merge` to merge when the pipeline succeeds.
+      type: boolean
+      default: false
+    reports_dir:
+      description: vgate.yaml's reportsDir, relative to the checkout (the same as in the regression-gate includes).
+      default: reports
+---
+vgate:decide:
+  image:
+    name: $[[ inputs.image ]]
+    entrypoint: ['']
+  stage: .post
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: always
+  variables:
+    GIT_DEPTH: '0'
+    VGATE_APPROVERS: $[[ inputs.approvers ]]
+    VGATE_AUTOMERGE: $[[ inputs.automerge ]]
+    VGATE_REPORTS_DIR: $[[ inputs.reports_dir ]]
+  # No needs and no dependencies: a .post job downloads the artifacts of every earlier job, which is every service's
+  # vgate-evidence/<service>/ directory.
+  script:
+    - |
+      set +e
+      work=$(mktemp -d)
+      mkdir -p "$work/evidence"
+      # Evidence comes only from this pipeline's artifacts: a merge request that commits vgate-evidence/ is refused.
+      if git -C "$CI_PROJECT_DIR" ls-files --error-unmatch vgate-evidence >/dev/null 2>&1; then
+        echo "vgate-evidence/ is committed in this merge request; evidence must come from the pipeline. Blocked." >&2
+        exit 1
+      fi
+      if [ -d vgate-evidence ]; then cp -R vgate-evidence/. "$work/evidence/"; fi
+      rm -rf vgate-evidence "$VGATE_REPORTS_DIR"
+      vgate decide --root "$CI_PROJECT_DIR" --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --evidence "$work/evidence" \
+        --details-url "$CI_PIPELINE_URL" --json > "$work/decide.json"
+      code=$?
+      set -e
+      decision=$(jq -r '.data.decision // empty' "$work/decide.json" 2>/dev/null || true)
+      # merge is exit 0 and nothing else is: an answer that disagrees with its exit code is no answer.
+      if [ -z "$decision" ] || { [ "$decision" = merge ] && [ "$code" != 0 ]; }; then
+        echo "vgate decide gave no usable decision (exit $code):" >&2; cat "$work/decide.json" >&2
+        decision=blocked
+      fi
+      echo "vgate decision: $decision"
+      # decide wrote the note to the reports directory deleted just before it ran: it is this run's, or it is absent.
+      note="$VGATE_REPORTS_DIR/decision.md"
+      [ -f "$note" ] && cat "$note"
+
+      # One note per merge request, updated in place. Needs VGATE_API_TOKEN (scope api).
+      if [ -n "${VGATE_API_TOKEN:-}" ] && [ -f "$note" ]; then
+        api="$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+        id=$(curl -fsS -H "PRIVATE-TOKEN: $VGATE_API_TOKEN" "$api?per_page=100&sort=desc&order_by=updated_at" \
+          | jq -r '[.[] | select(.system == false) | select(.body | startswith("<!-- vgate:decision -->")) | .id] | first // empty')
+        if [ -n "$id" ]; then
+          curl -fsS -X PUT -H "PRIVATE-TOKEN: $VGATE_API_TOKEN" --data-urlencode "body@$note" "$api/$id" >/dev/null \
+            || echo "Could not update the note (the decision stands)."
+        else
+          curl -fsS -X POST -H "PRIVATE-TOKEN: $VGATE_API_TOKEN" --data-urlencode "body@$note" "$api" >/dev/null \
+            || echo "Could not post the note (the decision stands)."
+        fi
+      else
+        echo "No note: set VGATE_API_TOKEN (a masked token with scope api) to get the decision on the merge request."
+      fi
+
+      case "$decision" in
+        merge)
+          if [ "$VGATE_AUTOMERGE" = true ]; then
+            mr="$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/merge"
+            # sha pins the merge to the commit that was judged: the source branch head (in a merged-results pipeline
+            # CI_COMMIT_SHA is GitLab's temporary merge commit). A push after this run moves the head and voids it.
+            head="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-$CI_COMMIT_SHA}"
+            # auto_merge (GitLab 17+) and its predecessor merge_when_pipeline_succeeds; the server ignores the other.
+            curl -fsS -X PUT -H "PRIVATE-TOKEN: ${VGATE_API_TOKEN:?automerge needs VGATE_API_TOKEN}" \
+              --data "auto_merge=true&merge_when_pipeline_succeeds=true&sha=$head" "$mr" >/dev/null \
+              && echo "Set to merge when the pipeline succeeds." \
+              || echo "Could not set auto-merge (the decision stands; merge by hand)."
+          fi
+          ;;
+        needs-approval)
+          bash /opt/vgate/ci/gitlab/approval-check.sh "$work/decide.json"
+          ;;
+        *)
+          echo "Blocked: see the reasons above and the jobs' reports." >&2
+          exit 1
+          ;;
+      esac
+  artifacts:
+    when: always
+    expire_in: 90 days
+    paths:
+      - $[[ inputs.reports_dir ]]/decision.json
+      - $[[ inputs.reports_dir ]]/decision.md

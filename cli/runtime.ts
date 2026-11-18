@@ -170,7 +170,7 @@ export function ensureRuntime(runtime: Runtime, log: (line: string) => void = ()
   }
   if (!runtimeState(runtime).installed) {
     log(`Installing the runtime's dependencies (pnpm install) in ${runtime.root}`);
-    const run = capture('pnpm', ['install', '--frozen-lockfile'], runtime.root, 900_000);
+    const run = capture('pnpm', ['install', '--frozen-lockfile'], runtime.root, 900_000, toolEnv());
     if (run.code !== 0) {
       return {
         ok: false,
@@ -278,9 +278,26 @@ export function linkProject(project: ProjectConfig, runtime: Runtime): Prepared 
   return { ok: true, actions };
 }
 
+/**
+ * The project may declare another package manager (`"packageManager": "bun@..."`, yarn, npm). vgate's own tools are
+ * the runtime's, run with pnpm, so neither corepack nor pnpm may refuse them because of the project's choice: without
+ * this, `pnpm` run anywhere under such a project answers "This project is configured to use bun" and the user would
+ * have to add an .npmrc to their repository just for vgate.
+ */
+export const PACKAGE_MANAGER_ENV: Record<string, string> = {
+  COREPACK_ENABLE_STRICT: '0',
+  npm_config_package_manager_strict: 'false',
+};
+
+/** process.env with PACKAGE_MANAGER_ENV, for every program vgate starts. */
+export function toolEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...base, ...PACKAGE_MANAGER_ENV };
+}
+
 /** The environment every step and stack script gets: where the project, its services and its reports are. */
 export function stepEnv(project: ProjectConfig, runtime: Runtime): Record<string, string> {
   return {
+    ...PACKAGE_MANAGER_ENV,
     VGATE_PROJECT: project.root,
     VGATE_RUNTIME: runtime.root,
     VGATE_SERVICES_DIR: project.servicesDirName,

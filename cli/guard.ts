@@ -7,11 +7,12 @@
  * Each rule is a pure function over base and head text, so it is tested without git; `guard` only gathers the files.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { OpenApiContract, type DocumentedPair } from '../framework/http/openapi.ts';
 import { readProject } from '../framework/project.ts';
+import { treeState, type TreeState } from './commit.ts';
 import { CLI, EXIT, UsageError, type Result } from './output.ts';
 
 export const GUARD_FILE = 'reports/guard.json';
@@ -447,6 +448,16 @@ export function configRule(file: string, base: string | undefined, head: string 
     else if (now !== value) find(`header rule ${key} changed ${value} -> ${now}`);
   }
 
+  // `paths:` decides which pull requests gate the service at all (vgate affected): a lost glob, or a list where there
+  // was none (none means every change), may let a later change skip this service's gate.
+  const pathsBefore = at(before, 'paths');
+  const pathsAfter = at(after, 'paths');
+  if (Array.isArray(pathsAfter)) {
+    const now = new Set(pathsAfter.map(scalar));
+    if (!Array.isArray(pathsBefore)) find(`paths narrowed from every change to ${stable(pathsAfter)}`);
+    for (const glob of list(pathsBefore).map(scalar)) if (!now.has(glob)) find(`paths lost ${glob}`);
+  }
+
   const baseChecks = new Set(list(at(before, 'schemathesis', 'excludeChecks')).map((c) => scalar(at(c, 'check'))));
   for (const check of list(at(after, 'schemathesis', 'excludeChecks'))) {
     const name = scalar(at(check, 'check'));
@@ -647,8 +658,13 @@ export function machineryRule(changed: string[], servicesDir?: string): RuleOutc
 // ---------------------------------------------------------------------------------------------------------------
 // Gathering the files
 
-function git(cwd: string, args: string[]): { code: number | null; out: string; err: string } {
-  const run = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+export function git(cwd: string, args: string[]): { code: number | null; out: string; err: string } {
+  // Paths as they are: git would otherwise print `apps/ü.go` as `"apps/\303\274.go"`, which no glob or prefix matches.
+  const run = spawnSync('git', ['-c', 'core.quotePath=false', ...args], {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
   return { code: run.status, out: run.stdout ?? '', err: run.stderr ?? '' };
 }
 
@@ -716,6 +732,8 @@ export interface GuardReport {
   schema: 'vgate.guard/1';
   service: string;
   base: string;
+  /** The commit and uncommitted state the expectations were read from (the head side of the comparison). */
+  head?: TreeState;
   decision: 'auto' | 'needs-human';
   findings: Finding[];
   info: Finding[];
@@ -725,6 +743,9 @@ export function guard(root: string, options: { service: string; base: string | u
   if (!options.base)
     throw new UsageError(`Pass --base <git ref>, e.g. ${CLI} guard --service ${options.service} --base origin/main`);
   const realRoot = realpathSync(root);
+  // An earlier report (or one committed with the change) must not outlive a guard that stops before judging: CI would
+  // otherwise carry it to vgate decide as this run's answer.
+  rmSync(join(readProject(realRoot).reportsDir, 'guard.json'), { force: true });
   const top = git(realRoot, ['rev-parse', '--show-toplevel']);
   if (top.code !== 0) {
     return {
@@ -795,6 +816,7 @@ export function guard(root: string, options: { service: string; base: string | u
     schema: 'vgate.guard/1',
     service: options.service,
     base: options.base,
+    head: treeState(project),
     decision,
     findings,
     info,

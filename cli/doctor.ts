@@ -3,12 +3,13 @@
  * that repairs it, so the caller can fix the environment without knowing the toolchain.
  */
 import { existsSync, readFileSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { loadService, type ServiceConfig } from '../framework/config.ts';
 import { PROJECT_FILE, type ProjectConfig } from '../framework/project.ts';
 import { CLI, EXIT, type Result } from './output.ts';
 import { capture, listServices } from './project.ts';
-import { ensureRuntime, linkProject, runtimeState, stepEnv, type Runtime } from './runtime.ts';
+import { ensureRuntime, linkProject, runtimeState, stepEnv, toolEnv, type Runtime } from './runtime.ts';
 import { checkPin, VERSION } from './version.ts';
 
 export type Status = 'ok' | 'warn' | 'fail';
@@ -38,7 +39,7 @@ export function atLeast(found: number[], min: number[]): boolean {
   return true;
 }
 
-interface ToolSpec {
+export interface ToolSpec {
   id: string;
   command: string;
   args: string[];
@@ -49,8 +50,10 @@ interface ToolSpec {
   fix: string;
 }
 
-function checkTool(spec: ToolSpec): Check {
-  const run = capture(spec.command, spec.args, undefined, 15_000);
+export function checkTool(spec: ToolSpec): Check {
+  // Asked from a neutral directory: a version check run inside the project would read the project's package manager
+  // (corepack refuses pnpm in a bun or yarn project), which says nothing about the tool vgate will use.
+  const run = capture(spec.command, spec.args, tmpdir(), 15_000, toolEnv());
   if (run.missing || run.code === null) {
     return {
       id: spec.id,

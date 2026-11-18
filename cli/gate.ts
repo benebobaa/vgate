@@ -9,6 +9,7 @@ import { join, relative } from 'node:path';
 import { loadService, type ServiceConfig } from '../framework/config.ts';
 import type { ProjectConfig } from '../framework/project.ts';
 import { checkRegistry, describeEntry, loadRegistry, registryPath, today } from '../framework/known-failures.ts';
+import { treeState, type TreeState } from './commit.ts';
 import { stackUp } from './doctor.ts';
 import { mergeSummaries, parseJunit, testcaseNames, type TestSummary } from './junit.ts';
 import { CLI, EXIT, UsageError, tail, type Result } from './output.ts';
@@ -74,6 +75,8 @@ export interface Verdict {
   build?: string;
   /** sha256 of the files that hold the expectations, so a verdict names what it was computed against. */
   expectations: Record<string, string>;
+  /** The commit and uncommitted state the gate ran on, taken before its first step; `sha` null outside git. */
+  commit?: TreeState;
   steps: StepResult[];
   /** `tests.knownFailures` are the failures the registry tolerated; `tests.failed` are the ones that count. */
   tests?: TestSummary;
@@ -259,6 +262,8 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
     );
   }
 
+  // The code under judgement is the tree as it stands now, before any step runs (they only write vgate's output).
+  const commit = treeState(project);
   const startedAt = new Date();
   const started = startedAt.getTime();
   const logDir = join(reports, 'gate');
@@ -318,6 +323,7 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
     durationMs: Date.now() - started,
     build: existsSync(buildFile) ? readFileSync(buildFile, 'utf8').trim() : undefined,
     expectations: expectations(root, svc),
+    commit,
     steps: results,
     tests,
     registry,
