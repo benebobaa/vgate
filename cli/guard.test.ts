@@ -223,6 +223,52 @@ describe('configRule', () => {
     );
   });
 
+  it('flags a key dropped from config.required, not one added', () => {
+    const withConfig = (keys: string[]) => stringify({ ...base, config: { required: keys } });
+    assert.deepEqual(
+      details(configRule('s', withConfig(['DATABASE_URL', 'PAYMENTS_URL']), withConfig(['DATABASE_URL']))),
+      ['config.required lost PAYMENTS_URL'],
+    );
+    assert.deepEqual(details(configRule('s', withConfig(['DATABASE_URL']), stringify(base))), [
+      'config.required lost DATABASE_URL',
+    ]);
+    assert.deepEqual(details(configRule('s', withConfig(['DATABASE_URL']), withConfig(['DATABASE_URL', 'X']))), []);
+  });
+
+  it('flags an environment that stops being sealed, and any change to how migrations are checked', () => {
+    const migrate = { dir: 'db/migrations', command: 'up', smoke: 'GET /' };
+    const env = (sealed: boolean | undefined, m: unknown) =>
+      stringify({
+        ...base,
+        environment: {
+          ...(sealed === undefined ? {} : { sealed }),
+          app: { image: 'a:1', port: 80 },
+          dependencies: { db: { kind: 'postgres', ...(m === undefined ? {} : { migrate: m }) } },
+        },
+      });
+    const same = env(undefined, migrate);
+    assert.deepEqual(details(configRule('s', same, env(true, { ...migrate }))), []);
+    assert.deepEqual(details(configRule('s', same, env(false, migrate))), [
+      'environment.sealed turned off: outbound calls no longer fail the gate',
+    ]);
+    const lost = 'environment.dependencies.db.migrate removed (was {command:"up",dir:"db/migrations",smoke:"GET /"})';
+    assert.deepEqual(details(configRule('s', same, stringify(base))), [
+      'environment removed: the service no longer runs sealed',
+      lost,
+    ]);
+    assert.deepEqual(details(configRule('s', same, env(undefined, undefined))), [lost]);
+    assert.deepEqual(
+      details(configRule('s', same, env(undefined, { dir: 'db/other', command: 'true', smoke: 'GET /' }))),
+      [
+        'environment.dependencies.db.migrate.dir changed "db/migrations" -> "db/other"',
+        'environment.dependencies.db.migrate.command changed "up" -> "true"',
+      ],
+    );
+    assert.deepEqual(details(configRule('s', same, env(undefined, { ...migrate, smoke: 'nothing' }))), [
+      'environment.dependencies.db.migrate.smoke changed "GET /" -> "nothing"',
+    ]);
+  });
+
   it('flags every loosening', () => {
     assert.deepEqual(
       rule((c) => c.coverage.exclude.push({ status: '503', reason: 'y' })),

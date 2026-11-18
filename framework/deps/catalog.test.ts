@@ -43,7 +43,7 @@ describe('catalog kinds', () => {
     assert.equal(kind.exports(ctx.external, ctx).url, 'mysql://shop:p%40ss%2Fword@127.0.0.1:53306/orders');
     assert.equal(kind.exports(ctx.internal, ctx).url, 'mysql://shop:p%40ss%2Fword@dep:3306/orders');
     assert.throws(() => kind.environment!(context('mysql', { user: 'root' }).ctx), /administrator/);
-    assert.deepEqual(kind.mounts!(context('mysql', { seed: '/abs/seed.sql' }).ctx), {
+    assert.deepEqual(kind.mounts!(context('mysql', { init: '/abs/seed.sql' }).ctx), {
       '/abs/seed.sql': '/docker-entrypoint-initdb.d/seed.sql',
     });
   });
@@ -88,7 +88,7 @@ describe('catalog kinds', () => {
 
   it('keycloak: the issuer is the app-side address from either side, and a seed turns on the realm import', () => {
     const kind = kindOf('keycloak')!;
-    const { ctx } = context('keycloak', { realm: 'shop', seed: '/abs/realm.json' });
+    const { ctx } = context('keycloak', { realm: 'shop', realmFile: '/abs/realm.json' });
     const outside = kind.exports(ctx.external, ctx);
     assert.equal(outside.issuer, 'http://dep:8080/realms/shop');
     assert.equal(kind.exports(ctx.internal, ctx).issuer, outside.issuer);

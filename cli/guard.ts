@@ -458,6 +458,37 @@ export function configRule(file: string, base: string | undefined, head: string 
     for (const glob of list(pathsBefore).map(scalar)) if (!now.has(glob)) find(`paths lost ${glob}`);
   }
 
+  // `config.required` is what `vgate config-check` holds every deploy environment to: a key dropped from it is a
+  // setting whose absence nothing reports any more, while the code may still need it.
+  const requiredAfter = new Set(list(at(after, 'config', 'required')).map(scalar));
+  for (const key of list(at(before, 'config', 'required')).map(scalar))
+    if (!requiredAfter.has(key)) find(`config.required lost ${key}`);
+
+  const shown = (value: unknown) => (value === undefined ? 'unset' : stable(value));
+  // `environment:` decides whether the run is sealed (an outbound call fails the gate) and how `vgate migrations`
+  // checks the schema: turning either off, or changing how migrations are found, applied or smoke-tested, goes to a
+  // human. The guard cannot tell a better migrate command from one that applies nothing.
+  const envBefore = at(before, 'environment');
+  const envAfter = at(after, 'environment');
+  if (isObject(envBefore)) {
+    if (!isObject(envAfter)) find('environment removed: the service no longer runs sealed');
+    else if (at(envBefore, 'sealed') !== false && at(envAfter, 'sealed') === false)
+      find('environment.sealed turned off: outbound calls no longer fail the gate');
+    const depsBefore = at(envBefore, 'dependencies');
+    for (const [name, dep] of isObject(depsBefore) ? Object.entries(depsBefore) : []) {
+      const was = at(dep, 'migrate');
+      if (was === undefined) continue;
+      const now = at(envAfter, 'dependencies', name, 'migrate');
+      if (now === undefined) find(`environment.dependencies.${name}.migrate removed (was ${stable(was)})`);
+      else
+        for (const key of new Set([...Object.keys(isObject(was) ? was : {}), ...Object.keys(isObject(now) ? now : {})]))
+          if (stable(at(was, key)) !== stable(at(now, key)))
+            find(
+              `environment.dependencies.${name}.migrate.${key} changed ${shown(at(was, key))} -> ${shown(at(now, key))}`,
+            );
+    }
+  }
+
   const baseChecks = new Set(list(at(before, 'schemathesis', 'excludeChecks')).map((c) => scalar(at(c, 'check'))));
   for (const check of list(at(after, 'schemathesis', 'excludeChecks'))) {
     const name = scalar(at(check, 'check'));
@@ -480,7 +511,6 @@ export function configRule(file: string, base: string | undefined, head: string 
     if (!Array.isArray(usersBefore)) find(`schemathesis.users narrowed from every user to ${stable(usersAfter)}`);
     for (const user of list(usersBefore).map(scalar)) if (!now.has(user)) find(`schemathesis.users lost ${user}`);
   }
-  const shown = (value: unknown) => (value === undefined ? 'unset' : stable(value));
   for (const key of ['readOnlyPaths', 'readOnlyMethods']) {
     const was = at(before, 'schemathesis', key);
     const now = at(after, 'schemathesis', key);

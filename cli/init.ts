@@ -123,9 +123,9 @@ function stackScript(service: string): string {
   return `#!/usr/bin/env bash
 # Local stack of ${service}: how vgate starts, stops and resets the service under test.
 #   ${CLI} up|down|status|reset --service ${service}
-# up() must leave the service answering at its health URL; fill it in for this backend, e.g. with
-#   docker compose -f "$STACK_ROOT/compose.yaml" up -d --wait
-# Building blocks (app_start, app_wait, wait_until, http_ok, app_status): the stack library vgate names below.
+# up() must start this checkout's service and leave it answering at its health URL. Prefer declaring an
+# \`environment:\` in service.yaml instead (vgate then starts a sealed copy per run and this file can go).
+# Building blocks (app_up, app_start, app_wait, wait_until, http_ok, app_status): the stack library vgate names below.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -136,8 +136,10 @@ stack_init ${service}
 HEALTH="\${${upper(service)}_URL:-http://localhost:8080}/health"
 
 up() {
-  if http_ok "$HEALTH"; then echo "${service} UP at $HEALTH"; return; fi
-  echo "${service} is DOWN at $HEALTH: start it, or teach up() in $HERE/stack.sh to start it" >&2
+  # Start it with app_up, which reuses only the app this project started from this build and refuses (exit 3) when
+  # something else answers on the port - another checkout's app must never be tested in this code's place:
+  #   app_up "$HEALTH" 8080 60 "$STACK_ROOT" <the command that starts the app>
+  echo "${service}: up() starts nothing yet; teach it in $HERE/stack.sh (see the comment above)" >&2
   return 1
 }
 

@@ -27,7 +27,9 @@ export const kafka: DependencyKind = {
     KAFKA_NODE_ID: '1',
     KAFKA_PROCESS_ROLES: 'broker,controller',
     KAFKA_LISTENERS: 'PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:19092',
-    KAFKA_ADVERTISED_LISTENERS: `PLAINTEXT://${ctx.name}:9092,EXTERNAL://${ctx.external.host}:${ctx.external.ports.external}`,
+    // Clients reconnect to the advertised address: inside it is how the app reaches the broker (the edge's proxy
+    // when faults are on, so a cut or a delay also hits every reconnect), outside the host port the edge publishes.
+    KAFKA_ADVERTISED_LISTENERS: `PLAINTEXT://${ctx.internal.host}:${ctx.internal.ports.main},EXTERNAL://${ctx.external.host}:${ctx.external.ports.external}`,
     KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT',
     KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER',
     KAFKA_CONTROLLER_QUORUM_VOTERS: '1@localhost:9093',
@@ -57,8 +59,9 @@ export const kafka: DependencyKind = {
       '1',
     ]),
   exports: (endpoint, ctx) => {
-    // Inside, the app dials the internal listener; from the host, the tests dial the external one.
-    const port = endpoint.host === ctx.name ? endpoint.ports.main : endpoint.ports.external;
+    // Inside (directly or through the edge's proxy when faults are on), the app dials the internal listener; from
+    // the host, the tests dial the external one. Decided by which endpoint this is, never by its host name.
+    const port = endpoint === ctx.external ? endpoint.ports.external : endpoint.ports.main;
     return { brokers: `${endpoint.host}:${port}`, host: endpoint.host, port: String(port) };
   },
 };

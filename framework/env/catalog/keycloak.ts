@@ -1,6 +1,6 @@
 /**
  * Keycloak in development mode, as the identity provider of the service under test. Options: adminUser and
- * adminPassword (default `admin`); `seed: realm.json` is imported on start (a realm export with its clients and users);
+ * adminPassword (default `admin`); `realmFile: realm.json` is imported on start (a realm export with its clients and users);
  * realm (the realm's name, for the `issuer` export).
  *
  * The issuer is fixed to the address the app uses inside the environment, so a token the tests fetch from the host
@@ -10,13 +10,14 @@ import { basename } from 'node:path';
 import { option } from './options.ts';
 import type { DependencyKind, KindContext } from './types.ts';
 
-const seedPath = (ctx: KindContext) => (typeof ctx.options.seed === 'string' ? ctx.options.seed : undefined);
+const realmPath = (ctx: KindContext) => (typeof ctx.options.realmFile === 'string' ? ctx.options.realmFile : undefined);
 
 export const keycloak: DependencyKind = {
   kind: 'keycloak',
   defaultImage: 'quay.io/keycloak/keycloak:26.4.7',
   ports: { main: 8080, management: 9000 },
-  command: (ctx) => ['start-dev', ...(seedPath(ctx) ? ['--import-realm'] : [])],
+  pathOptions: ['realmFile'],
+  command: (ctx) => ['start-dev', ...(realmPath(ctx) ? ['--import-realm'] : [])],
   environment: (ctx) => ({
     KC_BOOTSTRAP_ADMIN_USERNAME: option(ctx, 'adminUser', 'admin'),
     KC_BOOTSTRAP_ADMIN_PASSWORD: option(ctx, 'adminPassword', 'admin'),
@@ -26,7 +27,7 @@ export const keycloak: DependencyKind = {
     KC_HOSTNAME_BACKCHANNEL_DYNAMIC: 'true',
   }),
   mounts: (ctx) => {
-    const seed = seedPath(ctx);
+    const seed = realmPath(ctx);
     return seed ? { [seed]: `/opt/keycloak/data/import/${basename(seed)}` } : {};
   },
   health: { http: { port: 'management', path: '/health/ready' } },

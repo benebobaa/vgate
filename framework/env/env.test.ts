@@ -93,7 +93,22 @@ describe('plan', () => {
     ]);
     assert.deepEqual(compose.services.app.networks, ['sealed']);
     assert.deepEqual(compose.services.app.dns, ['10.77.3.53']);
+    // No search domain anywhere: the DNS log shows exactly the names asked for.
+    for (const [name, service] of Object.entries(compose.services))
+      if (name !== 'dns') assert.deepEqual((service as { dns_search?: string[] }).dns_search, ['.'], name);
     assert.equal(p.sealed, true);
+  });
+
+  it('keeps the edge API off the sealed network: the app cannot create a proxy to the outside', () => {
+    const compose = plan(input()).compose as {
+      networks: Record<string, { ipam?: { config: Array<{ subnet: string }> } }>;
+      services: { edge: { command: string[]; networks: Record<string, { ipv4_address?: string }> } };
+    };
+    // The edge network has a gateway; the API listens on the edge's address there, which the sealed side cannot route to.
+    assert.deepEqual(compose.networks.edge.ipam?.config, [{ subnet: '10.141.3.0/24' }]);
+    assert.equal(compose.services.edge.networks.edge.ipv4_address, '10.141.3.2');
+    assert.ok(compose.services.edge.command.includes('-host=10.141.3.2'), compose.services.edge.command.join(' '));
+    assert.ok(!compose.services.edge.command.some((arg) => arg.includes('0.0.0.0')));
   });
 
   it("resolves the app's placeholders from inside and the tests' from the host", () => {
@@ -147,15 +162,17 @@ describe('parseOutbound', () => {
     '[INFO] 10.77.3.4:41234 - 2211 "A IN example.com. udp 29 false 512" NXDOMAIN qr,aa,rd 29 0.0001s',
     '[INFO] 10.77.3.4:41235 - 2212 "AAAA IN example.com. udp 29 false 512" NXDOMAIN qr,aa,rd 29 0.0001s',
     '[INFO] 10.77.3.5:41236 - 2213 "A IN telemetry.vendor.io. udp 29 false 512" NXDOMAIN',
-    '[INFO] 10.77.3.4:41237 - 2214 "A IN db.home.lan. udp 29 false 512" NXDOMAIN',
+    '[INFO] 10.77.3.4:41237 - 2214 "A IN db. udp 29 false 512" NXDOMAIN',
+    '[INFO] 10.77.3.4:41238 - 2215 "A IN payments.example.net. udp 29 false 512" NXDOMAIN',
     'CoreDNS-1.12.1',
   ].join('\n');
 
-  it('names who asked for what, once each, and ignores own names with a search domain', () => {
+  it('names who asked for what, once each; an outside name that starts like a dependency is outbound too', () => {
     const out = parseOutbound(log, { '10.77.3.4': 'app', '10.77.3.5': 'payments' }, ['app', 'db', 'payments']);
     assert.deepEqual(out, [
       { from: 'app', host: 'example.com', port: null, blocked: true },
       { from: 'payments', host: 'telemetry.vendor.io', port: null, blocked: true },
+      { from: 'app', host: 'payments.example.net', port: null, blocked: true },
     ]);
   });
 });

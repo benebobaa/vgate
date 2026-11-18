@@ -83,6 +83,16 @@ operations:
         as: clerk
         expect: { status: 402, state: [no row, no event, no idempotency entry] }
         sources: [README.md rules 4, 5, deps/payments.openapi.yaml 402]
+      - id: ORD-201-MAIL
+        title: a created order sends one confirmation mail to the customer; a repeat sends none
+        as: clerk
+        expect: { status: 201, mail: [one to <customerId>@customers.example, subject Order <id> confirmed] }
+        sources: [README.md rules 3, 9]
+      - id: ORD-402-MAIL
+        title: an order whose payment is declined sends no mail
+        as: clerk
+        expect: { status: 402, mail: [none] }
+        sources: [README.md rules 5, 9]
       - id: ORD-402-RETRY
         title: after a decline the same key can be retried and succeed
         as: clerk

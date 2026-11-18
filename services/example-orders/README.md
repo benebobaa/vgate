@@ -48,3 +48,6 @@ provider's contract and the event schema in `deps/`.
 7. `GET /orders/{orderId}` answers the order, or 404 `not_found` for an unknown id or one that is not a UUID. It reads
    through Redis: the first read caches the order at `order:<id>` for 300 seconds.
 8. Every response carries an `X-Request-Id` (UUID); every body is JSON; every datetime is UTC (`Z`).
+9. A created order (rule 6) sends one confirmation mail, after answering, to `<customerId>@customers.example` from
+   `orders@shop.example` with the subject `Order <id> confirmed`. A repeat (rule 3) and an order whose payment does
+   not succeed (rule 5) send none.

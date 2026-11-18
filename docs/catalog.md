@@ -34,7 +34,7 @@ environment:
       AMQP_URL: '{broker.url}'
   dependencies:
     mail: { kind: mailpit }
-    orders: { kind: mysql, database: shop, seed: seed/orders.sql }
+    orders: { kind: mysql, database: shop, init: seed/orders.sql }
     files: { kind: s3, buckets: [invoices] }
     broker: { kind: rabbitmq }
 
@@ -66,14 +66,14 @@ test('[REG-201] registering sends the verification mail', async ({ api, inbox })
 ### mysql
 
 Options: `database`, `user`, `password` (default `app` each; `root` is refused as the application user),
-`rootPassword` (default `root`), `seed: file.sql` (run by the image on first start, before it accepts TCP, so a
+`rootPassword` (default `root`), `init: file.sql` (run by the image on first start, before it accepts TCP, so a
 healthy server already holds the seed). Exports: `url` (`mysql://user:password@host:port/database`, credentials
 URL-encoded), `host`, `port`, `user`, `password`, `database`. Helper `MySqlDb`: `rows(sql, params)`, `one(...)` (throws
 unless exactly one row), `count(...)`; parameterised queries only; dates come back as the stored text.
 
 ### mongodb
 
-Options: `database` (default `app`), `user`, `password` (default `app`; the server's root user), `seed: file.js` (a
+Options: `database` (default `app`), `user`, `password` (default `app`; the server's root user), `init: file.js` (a
 mongosh script, run on first start). Exports: `url` (`mongodb://user:password@host:port/database?authSource=admin`),
 `host`, `port`, `user`, `password`, `database`. Helper `MongoDocs`: `find`, `findOne`, `count`,
 `expectDocument(collection, filter, { timeoutMs })` for writes made after the answer.
@@ -119,7 +119,7 @@ into them.
 
 ### keycloak
 
-Development mode. Options: `adminUser`, `adminPassword` (default `admin`), `seed: realm.json` (a realm export with
+Development mode. Options: `adminUser`, `adminPassword` (default `admin`), `realmFile: realm.json` (a realm export with
 its clients and users, imported on start), `realm` (its name). Exports: `url`, `host`, `port`, `realm`, `tokenUrl`,
 `issuer`, `adminUser`, `adminPassword`. The issuer is fixed to the address the app uses inside the environment, so a
 token the tests fetch from the host carries the `iss` the app expects. Tests log in through the existing `password`

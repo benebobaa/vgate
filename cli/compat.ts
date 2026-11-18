@@ -11,7 +11,7 @@
  * A deployed contract that cannot be read (no matching tag, an unreachable URL) is `unknown`, never `compatible`.
  */
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, posix, relative } from 'node:path';
 import { parse } from 'yaml';
 import type { ContractSource, DeployEnvironment, ProjectConfig } from '../framework/project.ts';
 import { contractRule, git } from './guard.ts';
@@ -48,6 +48,18 @@ function gitTop(root: string): string | undefined {
   return run.code === 0 ? realpathSync(run.out.trim()) : undefined;
 }
 
+/** The contract file a service.yaml names (`spec:`), openapi.yaml by default. */
+function specNameOf(serviceYaml: string | undefined): string {
+  if (serviceYaml === undefined) return 'openapi.yaml';
+  try {
+    const raw = parse(serviceYaml) as Record<string, unknown> | null;
+    if (raw && typeof raw.spec === 'string' && raw.spec !== '') return raw.spec;
+  } catch {
+    // An unparseable service.yaml names nothing: the default stays.
+  }
+  return 'openapi.yaml';
+}
+
 /** Reads service.yaml as text (no environment interpolation: nothing here depends on secrets). */
 export function serviceSources(project: ProjectConfig, name: string): ServiceSources | { error: string } {
   const top = gitTop(project.root);
@@ -55,12 +67,7 @@ export function serviceSources(project: ProjectConfig, name: string): ServiceSou
   const dir = join(realpathSync(project.servicesDir), name);
   const serviceYamlFile = join(dir, 'service.yaml');
   const serviceYaml = existsSync(serviceYamlFile) ? readFileSync(serviceYamlFile, 'utf8') : undefined;
-  let specName = 'openapi.yaml';
-  if (serviceYaml !== undefined) {
-    const raw = parse(serviceYaml) as Record<string, unknown> | null;
-    if (raw && typeof raw.spec === 'string' && raw.spec !== '') specName = raw.spec;
-  }
-  const specFile = join(dir, specName);
+  const specFile = join(dir, specNameOf(serviceYaml));
   const rel = (path: string) => relative(top, path).split('\\').join('/');
   return {
     name,
@@ -76,7 +83,8 @@ export function serviceSources(project: ProjectConfig, name: string): ServiceSou
 export function resolveDeployedRef(top: string, ref: string): { sha: string; label: string } | { error: string } {
   if (ref.startsWith('tag:')) {
     const glob = ref.slice('tag:'.length);
-    const tags = git(top, ['tag', '--list', glob, '--sort=-v:refname']);
+    // A pre-release sorts before its release (v2.0.0-rc.1 < v2.0.0), not after it as git's plain version order has it.
+    const tags = git(top, ['-c', 'versionsort.suffix=-', 'tag', '--list', glob, '--sort=-v:refname']);
     const newest = tags.out.split('\n').find(Boolean);
     if (tags.code !== 0 || !newest)
       return {
@@ -101,15 +109,23 @@ export async function deployedContract(
   if ('ref' in source) {
     const ref = resolveDeployedRef(sources.top, source.ref);
     if ('error' in ref) return ref;
-    const spec = git(sources.top, ['show', `${ref.sha}:${sources.specPath}`]);
-    if (spec.code !== 0) {
-      // A valid commit without the file: the service was not part of that release.
-      const tree = git(sources.top, ['cat-file', '-e', `${ref.sha}:${sources.specPath}`]);
-      if (tree.code !== 0) return { absent: `${ref.label} has no ${sources.specPath}` };
-      return { error: `git show ${ref.label}:${sources.specPath} failed: ${spec.err.trim()}` };
-    }
+    // The deployed version's own contract file: a change that renames it (`spec:`) is still compared with it.
     const serviceYaml = git(sources.top, ['show', `${ref.sha}:${sources.serviceYamlPath}`]);
-    return { text: spec.out, serviceYaml: serviceYaml.code === 0 ? serviceYaml.out : undefined, label: ref.label };
+    const deployedYaml = serviceYaml.code === 0 ? serviceYaml.out : undefined;
+    const specPath =
+      deployedYaml === undefined
+        ? sources.specPath
+        : posix.join(posix.dirname(sources.serviceYamlPath), specNameOf(deployedYaml));
+    const spec = git(sources.top, ['show', `${ref.sha}:${specPath}`]);
+    if (spec.code !== 0) {
+      // A valid commit without the service: it was not part of that release.
+      const tree = git(sources.top, ['cat-file', '-e', `${ref.sha}:${specPath}`]);
+      if (tree.code !== 0 && deployedYaml === undefined) return { absent: `${ref.label} has no ${specPath}` };
+      if (tree.code !== 0)
+        return { error: `${ref.label} has ${sources.serviceYamlPath} but no contract at ${specPath}` };
+      return { error: `git show ${ref.label}:${specPath} failed: ${spec.err.trim()}` };
+    }
+    return { text: spec.out, serviceYaml: deployedYaml, label: ref.label };
   }
   let response: Response;
   try {

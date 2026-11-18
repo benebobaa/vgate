@@ -1,6 +1,6 @@
 /**
  * MongoDB, single node. Options: database (default `app`), user and password (default `app`; created as the root user
- * of the server); `seed: file.js` (mongosh script) runs during the first start, against `database`.
+ * of the server); `init: file.js` (mongosh script) runs during the first start, against `database`.
  */
 import { basename } from 'node:path';
 import { option } from './options.ts';
@@ -12,12 +12,13 @@ export const mongoCredentials = (ctx: KindContext) => ({
   password: option(ctx, 'password', 'app'),
 });
 
-const seedPath = (ctx: KindContext) => (typeof ctx.options.seed === 'string' ? ctx.options.seed : undefined);
+const initPath = (ctx: KindContext) => (typeof ctx.options.init === 'string' ? ctx.options.init : undefined);
 
 export const mongodb: DependencyKind = {
   kind: 'mongodb',
   defaultImage: 'mongo:8.0.38',
   ports: { main: 27017 },
+  pathOptions: ['init'],
   environment: (ctx) => {
     const c = mongoCredentials(ctx);
     return {
@@ -27,7 +28,7 @@ export const mongodb: DependencyKind = {
     };
   },
   mounts: (ctx) => {
-    const seed = seedPath(ctx);
+    const seed = initPath(ctx);
     return seed ? { [seed]: `/docker-entrypoint-initdb.d/${basename(seed)}` } : {};
   },
   // Through the container's own address, not 127.0.0.1: while the init scripts run, the image's temporary server

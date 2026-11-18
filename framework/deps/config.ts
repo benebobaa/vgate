@@ -7,8 +7,10 @@
  *     events:   { kind: kafka, brokers: [localhost:59092], topics: { orders.created: { schema: deps/events/x.json } } }
  *     cache:    { kind: redis, url: redis://localhost:56379 }
  *     proxies:  { kind: toxiproxy, url: http://localhost:58474 }
+ *     mail:     { kind: mailpit, apiUrl: '{mail.apiUrl}' }     # and the catalog's other kinds (catalog-config.ts)
  */
 import { resolve } from 'node:path';
+import { CATALOG_DEPENDENCY_KINDS, parseCatalogDependency, type CatalogDependency } from './catalog-config.ts';
 
 /** A third party or sibling service replaced by a WireMock stub that may only answer what its contract documents. */
 export interface HttpStubDependency {
@@ -39,9 +41,10 @@ export interface ToxiproxyDependency {
   url: string;
 }
 
-export type DependencyConfig = HttpStubDependency | KafkaDependency | RedisDependency | ToxiproxyDependency;
+export type DependencyConfig =
+  HttpStubDependency | KafkaDependency | RedisDependency | ToxiproxyDependency | CatalogDependency;
 
-export const DEPENDENCY_KINDS = ['http-stub', 'kafka', 'redis', 'toxiproxy'] as const;
+export const DEPENDENCY_KINDS = ['http-stub', 'kafka', 'redis', 'toxiproxy', ...CATALOG_DEPENDENCY_KINDS] as const;
 
 type Raw = Record<string, unknown>;
 
@@ -101,8 +104,15 @@ export function parseDependencies(
       case 'toxiproxy':
         out[name] = { kind, url: text(value, 'url', at).replace(/\/$/, '') };
         break;
-      default:
+      default: {
+        // The catalog's kinds (mail, object stores, AWS, MySQL, MongoDB, RabbitMQ): framework/deps/catalog-config.ts.
+        const extra = parseCatalogDependency(kind, value, at);
+        if (extra) {
+          out[name] = extra;
+          break;
+        }
         throw new Error(`${at}.kind must be one of ${DEPENDENCY_KINDS.join(', ')} (got ${JSON.stringify(kind)})`);
+      }
     }
   }
 

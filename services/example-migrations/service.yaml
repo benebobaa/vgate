@@ -1,0 +1,58 @@
+# example-migrations: the framework's reference for `vgate migrations` (README.md, docs/deploy-safety.md). A catalogue
+# of items in PostgreSQL whose schema lives in db/migrations, applied by a plain-SQL runner (psql) so the example needs
+# no migration tool; goose, golang-migrate, flyway and others plug in the same way through `migrate.command`.
+name: example-migrations
+
+spec: openapi.yaml
+
+rules:
+  strictResponseProperties: true
+  headers:
+    withBody:
+      Content-Type: application/json
+
+schemathesis:
+  readOnlyMethods: [GET]
+  users: [anyone]
+  maxExamples: 10
+
+environment:
+  app:
+    build: { context: services/example-migrations/app } # relative to the project root
+    port: 8092
+    health: /health
+    env:
+      ITEMS_PORT: '8092'
+      ITEMS_DB_URL: '{db.url}'
+  dependencies:
+    db:
+      kind: postgres
+      options: { database: items, user: items, password: items }
+      seed: seed.sql # runs after the migrations that exist at the base
+      migrate:
+        dir: services/example-migrations/db/migrations # relative to the project root
+        # Applies every *.up.sql not yet recorded in schema_migrations, each in one transaction, in name order.
+        command: |
+          set -e
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -qc 'CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY)'
+          for f in $(ls /migrations/*.up.sql | sort); do
+            v=$(basename "$f" .up.sql)
+            if [ -z "$(psql "$DATABASE_URL" -tAc "SELECT 1 FROM schema_migrations WHERE version = '$v'")" ]; then
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -1 -f "$f" -c "INSERT INTO schema_migrations VALUES ('$v')"
+            fi
+          done
+        # Undoes the latest applied migration with its *.down.sql.
+        down: |
+          set -e
+          v=$(psql "$DATABASE_URL" -tAc 'SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1')
+          [ -n "$v" ]
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -1 -f "/migrations/$v.down.sql" -c "DELETE FROM schema_migrations WHERE version = '$v'"
+
+environments:
+  local:
+    disposable: true # a sealed environment of this run's own
+    baseUrl: '{app.url}'
+    healthPath: /health
+    db: { url: '{db.url}' }
+    users:
+      anyone: {} # the API has no authentication

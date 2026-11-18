@@ -15,6 +15,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { parse } from 'yaml';
 import { parsePaths } from '../framework/config.ts';
+import { migrationDirsOf } from '../framework/env/migrate.ts';
 import { PROJECT_FILE, type ProjectConfig } from '../framework/project.ts';
 import { git } from './guard.ts';
 import { CLI, EXIT, UsageError, type Result } from './output.ts';
@@ -156,6 +157,24 @@ export function affectedServices(
   });
 }
 
+/**
+ * The migrations directories (top-relative) a service declares now or declared at the merge base: a change that
+ * moves `migrate.dir`, or drops `migrate:`, still touches the directory the deployed schema came from.
+ */
+export function serviceMigrationDirs(project: ProjectConfig, change: ChangeSet, name: string): string[] {
+  // Real paths, as changeSet measures `top`: /var vs /private/var would match nothing.
+  const file = join(realpathSync(project.servicesDir), name, 'service.yaml');
+  const root = realpathSync(project.root);
+  const rel = relative(change.top, file).split('\\').join('/');
+  const atBase = git(change.top, ['show', `${change.mergeBase}:${rel}`]);
+  return [
+    ...new Set([
+      ...migrationDirsOf(existsSync(file) ? readFileSync(file, 'utf8') : undefined, root, change.top),
+      ...migrationDirsOf(atBase.code === 0 ? atBase.out : undefined, root, change.top),
+    ]),
+  ];
+}
+
 export function computeAffected(project: ProjectConfig, change: ChangeSet): AffectedReport {
   const head = listServices(project.root);
   const atBase = servicesAt(change, project.servicesDirName, change.mergeBase);
@@ -163,9 +182,11 @@ export function computeAffected(project: ProjectConfig, change: ChangeSet): Affe
     base: change.base,
     mergeBase: change.mergeBase,
     changedFiles: change.files,
-    services: affectedServices(change.files, head, change.prefix, project.servicesDirName, (name) =>
-      servicePaths(project, name),
-    ),
+    // A service's own migrations affect it even when its `paths:` forget them.
+    services: affectedServices(change.files, head, change.prefix, project.servicesDirName, (name) => {
+      const globs = servicePaths(project, name);
+      return globs && [...globs, ...serviceMigrationDirs(project, change, name).map((dir) => `${dir}/**`)];
+    }),
     deleted: atBase.filter((name) => !head.includes(name)),
   };
 }

@@ -47,6 +47,11 @@ export interface DependencyKind {
   environment?(ctx: KindContext): Record<string, string>;
   /** Container command (overrides the image's). */
   command?(ctx: KindContext): string[];
+  /**
+   * Options that name files (a seed script, init scripts, a realm export). vgate resolves them against the service
+   * directory before any hook sees them, so hooks always get absolute paths. Default: none.
+   */
+  pathOptions?: string[];
   /** Files mounted read-only into the container: absolute host path -> container path. */
   mounts?(ctx: KindContext): Record<string, string>;
   health: HealthCheck;

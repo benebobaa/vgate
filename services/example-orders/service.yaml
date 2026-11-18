@@ -34,12 +34,15 @@ environment:
       ORDERS_REDIS_URL: '{cache.url}'
       ORDERS_KAFKA_BROKERS: '{events.brokers}'
       ORDERS_PAYMENTS_URL: '{payments.url}' # through the edge (faults: true), so the tests can slow or cut it
+      ORDERS_SMTP_HOST: '{mail.smtpHost}' # README rule 9
+      ORDERS_SMTP_PORT: '{mail.smtpPort}'
       ORDERS_CALL_HOME: '${EXAMPLE_ORDERS_CALL_HOME:-}' # empty; the outbound self-check sets it (docs/environments.md)
   dependencies:
     postgres: { kind: postgres, options: { database: orders, user: orders, password: orders } }
     cache: { kind: redis }
     events: { kind: kafka, topics: { orders.created: { partitions: 3 } } } # partitions: the consumer sees several
     payments: { kind: wiremock, faults: true } # the third-party payment provider
+    mail: { kind: mailpit } # where the confirmation mails go (README rule 9); keeps them for the tests
 
 environments:
   local:
@@ -67,3 +70,6 @@ environments:
       proxies:
         kind: toxiproxy
         url: '{edge.api}'
+      mail: # the inbox the tests read (README rule 9)
+        kind: mailpit
+        apiUrl: '{mail.apiUrl}'

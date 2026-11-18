@@ -4,6 +4,9 @@
 #
 #   source "$(dirname "$0")/../../framework/stack/lib.sh"
 #   stack_init <service>          # sets STACK_LOG_DIR, STACK_LOG, STACK_PID_FILE, STACK_BUILD_FILE
+#   app_up <url> <port> <seconds> <dir> <cmd...>
+#                                 # up, never adopting: reuses only the app this project started from this build;
+#                                 # refuses (exit 3) when something else holds the port
 #   app_start <dir> <cmd...>      # starts the app detached, records its pid and the commit it is built from
 #   app_wait <url> <seconds>      # waits until the health URL answers 2xx (tails the log on timeout)
 #   app_stop                      # stops what app_start started
@@ -60,6 +63,62 @@ app_start() { # <dir> <command...>
   build_id "${BUILD_REPO:-}" >"$STACK_BUILD_FILE"
   (cd "$dir" && exec nohup "$@") >"$STACK_LOG" 2>&1 </dev/null &
   echo $! >"$STACK_PID_FILE"
+}
+
+# The pid listening on a TCP port (empty when free or unknown).
+port_pid() { # <port>
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1
+}
+
+port_holder() { # <port>: "name (pid N)" of what listens there, empty when free
+  local pid
+  pid=$(port_pid "$1")
+  [ -n "$pid" ] || return 0
+  echo "$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ') (pid $pid)"
+}
+
+is_descendant() { # <pid> <ancestor pid>: the process is the ancestor or runs under it
+  local p=$1
+  for _ in $(seq 1 64); do
+    [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null || return 1
+    [ "$p" = "$2" ] && return 0
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
+# The app on the port is the one app_start started for this project, from the build checked out now.
+app_owned() { # <port>
+  [ -f "$STACK_PID_FILE" ] || return 1
+  local pid listener
+  pid=$(cat "$STACK_PID_FILE")
+  kill -0 "$pid" 2>/dev/null || return 1
+  listener=$(port_pid "$1")
+  if [ -n "$listener" ]; then is_descendant "$listener" "$pid" || return 1; fi
+  [ -f "$STACK_BUILD_FILE" ] && [ "$(cat "$STACK_BUILD_FILE")" = "$(build_id "${BUILD_REPO:-}")" ]
+}
+
+# Starts the app unless this project's app from this build already runs. Anything else answering on the port (another
+# checkout's app, a hand-started server) would be tested in this code's place, so it is refused, never adopted.
+app_up() { # <health url> <port> <seconds> <dir> <command...>
+  local url=$1 port=$2 seconds=$3 holder
+  shift 3
+  if app_owned "$port" && http_ok "$url"; then
+    echo "$STACK_NAME already UP at $url (pid $(cat "$STACK_PID_FILE"), build $(cat "$STACK_BUILD_FILE"))"
+    return 0
+  fi
+  # Ours, but stale (another build) or unhealthy: replace it.
+  if [ -f "$STACK_PID_FILE" ] && kill -0 "$(cat "$STACK_PID_FILE")" 2>/dev/null; then app_stop; sleep 1; fi
+  holder=$(port_holder "$port")
+  if [ -n "$holder" ] || http_ok "$url"; then
+    echo "Refusing to start $STACK_NAME: port $port is held by ${holder:-a process vgate cannot name}, which this" \
+      "project did not start (another checkout's app?). Stop it or free the port; vgate never tests an app it did" \
+      "not start." >&2
+    return 3
+  fi
+  app_start "$@"
+  app_wait "$url" "$seconds"
 }
 
 app_wait() { # <health url> <seconds>

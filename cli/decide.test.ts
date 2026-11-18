@@ -486,6 +486,7 @@ describe('renderMarkdown', () => {
       decision: 'blocked',
       reasons: ['notes: gate failed (failed: test)'],
       deploy: { configured: false, checks: [] },
+      migrations: [],
       base: 'main',
       mergeBase: 'abc',
       head: 'def',

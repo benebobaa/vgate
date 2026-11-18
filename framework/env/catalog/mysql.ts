@@ -1,5 +1,5 @@
 /**
- * MySQL. Options: database, user, password (default `app` each), rootPassword (default `root`); `seed: file.sql` runs
+ * MySQL. Options: database, user, password (default `app` each), rootPassword (default `root`); `init: file.sql` runs
  * during the server's first start (its init directory), before it accepts TCP connections.
  */
 import { basename } from 'node:path';
@@ -13,12 +13,13 @@ export const mysqlCredentials = (ctx: KindContext) => ({
   rootPassword: option(ctx, 'rootPassword', 'root'),
 });
 
-const seedPath = (ctx: KindContext) => (typeof ctx.options.seed === 'string' ? ctx.options.seed : undefined);
+const initPath = (ctx: KindContext) => (typeof ctx.options.init === 'string' ? ctx.options.init : undefined);
 
 export const mysql: DependencyKind = {
   kind: 'mysql',
   defaultImage: 'mysql:8.4.13',
   ports: { main: 3306 },
+  pathOptions: ['init'],
   environment: (ctx) => {
     const c = mysqlCredentials(ctx);
     if (c.user === 'root') throw new Error(`${ctx.name}: user root is the administrator; name an application user`);
@@ -30,7 +31,7 @@ export const mysql: DependencyKind = {
     };
   },
   mounts: (ctx) => {
-    const seed = seedPath(ctx);
+    const seed = initPath(ctx);
     // The image runs *.sql in this directory against MYSQL_DATABASE on its first start.
     return seed ? { [seed]: `/docker-entrypoint-initdb.d/${basename(seed)}` } : {};
   },

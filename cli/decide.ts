@@ -14,20 +14,26 @@
  * blocks, per `deploy.policy.breaking`); a required configuration key an environment lacks blocks, since deploying
  * would fail; a deployed contract or config source that cannot be read needs a human, never passes.
  *
+ * When a change adds to a service's migrations it needs that service's `vgate migrations` evidence: a migration that
+ * does not apply or undo, or that breaks the deployed code on the migrated schema, blocks; a risky one needs a human;
+ * no current evidence blocks (docs/deploy-safety.md).
+ *
  * It writes reports/decision.json (`vgate.decision/1`) and reports/decision.md, the pull-request comment: a person
  * who never reads code can see what was verified and why the change can or cannot merge.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+import { touchedMigrations } from '../framework/env/migrate.ts';
 import type { Policy, ProjectConfig } from '../framework/project.ts';
-import { changeSet, computeAffected } from './affected.ts';
+import { changeSet, computeAffected, serviceMigrationDirs } from './affected.ts';
 import { staleTree, treeState, type TreeState } from './commit.ts';
 import { compatFor, serviceSources, type CompatResult } from './compat.ts';
 import { configFor, describeMissing, type ConfigResult } from './config-check.ts';
 import type { Verdict } from './gate.ts';
 import { git, type Finding, type GuardReport } from './guard.ts';
 import type { KnownFailureHit, TestFailure } from './junit.ts';
+import type { MigrationsReport } from './migrations.ts';
 import { CLI, EXIT, UsageError, type Result } from './output.ts';
 import { assessRisk, tierAbove, type RiskReport } from './risk.ts';
 
@@ -61,7 +67,22 @@ export interface ServiceDecision {
 export interface DeploySafety {
   configured: boolean;
   breakingPolicy?: 'needs-approval' | 'block';
-  checks: Array<{ service: string; compat: CompatResult; config: ConfigResult }>;
+  checks: Array<{
+    service: string;
+    compat: CompatResult;
+    config: ConfigResult;
+    /** Config sources of the environment that the change itself edits (top-relative). */
+    configEdited?: string[];
+  }>;
+}
+
+/** A service whose migrations the change touches, judged from its `vgate migrations` evidence. */
+export interface MigrationCheck {
+  service: string;
+  state: 'safe' | 'needs-approval' | 'blocked' | 'missing';
+  /** The migration files the change touches (top-relative). */
+  touched: string[];
+  reasons: string[];
 }
 
 export interface Decision {
@@ -75,6 +96,7 @@ export interface Decision {
   risk: RiskReport;
   services: ServiceDecision[];
   deploy: DeploySafety;
+  migrations: MigrationCheck[];
   knownFailures: Array<KnownFailureHit & { service: string }>;
   changedFiles: number;
   detailsUrl?: string;
@@ -84,6 +106,7 @@ export interface Decision {
 
 interface Evidence {
   verdicts: Map<string, Verdict & { file: string }>;
+  migrations: Map<string, MigrationsReport & { file: string }>;
   guards: Map<string, Array<GuardReport & { file: string }>>;
   read: string[];
   ignored: string[];
@@ -94,7 +117,7 @@ function walk(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) return entry.name === 'node_modules' || entry.name === '.git' ? [] : walk(path);
-    return entry.name === 'verdict.json' || entry.name === 'guard.json' ? [path] : [];
+    return ['verdict.json', 'guard.json', 'migrations.json'].includes(entry.name) ? [path] : [];
   });
 }
 
@@ -104,7 +127,7 @@ function walk(dir: string): string[] {
  * gives itself, cannot hide a failure.
  */
 export function readEvidence(dir: string, cwd: string): Evidence {
-  const evidence: Evidence = { verdicts: new Map(), guards: new Map(), read: [], ignored: [] };
+  const evidence: Evidence = { verdicts: new Map(), guards: new Map(), migrations: new Map(), read: [], ignored: [] };
   for (const file of walk(dir).sort()) {
     const shown = relative(cwd, file) || file;
     let data: Record<string, unknown>;
@@ -133,9 +156,52 @@ export function readEvidence(dir: string, cwd: string): Evidence {
       const report = { ...(data as unknown as GuardReport), file };
       evidence.guards.set(report.service, [...(evidence.guards.get(report.service) ?? []), report]);
       evidence.read.push(shown);
+    } else if (data.schema === 'vgate.migrations/1') {
+      const report = { ...(data as unknown as MigrationsReport), file };
+      const previous = evidence.migrations.get(report.service);
+      // The worse verdict wins: an extra file that claims `safe` cannot hide a blocked or risky migration.
+      if (!previous || MIGRATION_WEIGHT[report.verdict] > MIGRATION_WEIGHT[previous.verdict])
+        evidence.migrations.set(report.service, report);
+      evidence.read.push(shown);
     } else evidence.ignored.push(`${shown} (unknown schema ${String(data.schema)})`);
   }
   return evidence;
+}
+
+const MIGRATION_WEIGHT: Record<string, number> = { 'not-configured': 0, safe: 1, 'needs-approval': 2, blocked: 3 };
+
+/**
+ * The migrations a change touches in an affected service, judged from that service's `vgate migrations` evidence.
+ * Evidence from another merge base or another tree (commit) says nothing about this change: it counts as missing.
+ */
+export function judgeMigrations(
+  service: string,
+  touched: string[],
+  report: (MigrationsReport & { file?: string }) | undefined,
+  mergeBase: string,
+  now: TreeState,
+): MigrationCheck {
+  const missing = (why: string): MigrationCheck => ({
+    service,
+    state: 'missing',
+    touched,
+    reasons: [
+      `${service}: the change touches ${touched.length} migration file${touched.length === 1 ? '' : 's'}, ${why}`,
+    ],
+  });
+  if (!report) return missing(`but they were not verified (run ${CLI} migrations --service ${service} --base <base>)`);
+  if (report.mergeBase !== mergeBase) return missing('and their verification ran against another base');
+  const otherTree = staleTree(report.commit, now);
+  if (otherTree) return missing(`and their verification is stale: ${otherTree}`);
+  if (report.verdict === 'blocked' || report.verdict === 'needs-approval')
+    return {
+      service,
+      state: report.verdict,
+      touched,
+      reasons: report.reasons.map((r) => `${service} migrations: ${r}`),
+    };
+  if (report.verdict !== 'safe') return missing(`but their verification says "${String(report.verdict)}"`);
+  return { service, state: 'safe', touched, reasons: [] };
 }
 
 const sha256 = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -231,6 +297,7 @@ export function decideFrom(input: {
   policy: Policy;
   services: ServiceDecision[];
   deploy?: DeploySafety;
+  migrations?: MigrationCheck[];
 }): { decision: DecisionKind; reasons: string[] } {
   const reasons: string[] = [];
   const affected = input.services.filter((s) => s.change === 'affected');
@@ -242,6 +309,8 @@ export function decideFrom(input: {
     // Deploying would fail: the code needs a setting the environment does not have.
     ...checks.filter((c) => c.config.state === 'missing').map((c) => describeMissing(c.service, c.config)),
     ...(block ? checks.filter((c) => c.compat.state === 'breaking').map((c) => breakingReason(c)) : []),
+    // A migration that does not apply, cannot be undone or breaks the running version; or one nobody verified.
+    ...(input.migrations ?? []).filter((m) => m.state === 'blocked' || m.state === 'missing').flatMap((m) => m.reasons),
   ];
   if (blocked.length > 0) return { decision: 'blocked', reasons: blocked };
   for (const c of checks) {
@@ -250,11 +319,17 @@ export function decideFrom(input: {
       reasons.push(
         `${c.service} → ${c.compat.environment}: compatibility with the deployed version was not checked (${c.compat.note})`,
       );
+    // The change wrote the declaration it is checked against: only a person can say the setting really exists there.
+    if (c.configEdited && c.configEdited.length > 0)
+      reasons.push(
+        `${c.service} → ${c.config.environment}: the change edits ${c.configEdited.join(', ')}, which declares what ${c.config.environment} provides: a person confirms the settings exist there`,
+      );
     if (c.config.state === 'unknown')
       reasons.push(
         `${c.service} → ${c.config.environment}: the environment's configuration was not checked (${c.config.notes[0] ?? 'unreadable'})`,
       );
   }
+  for (const m of input.migrations ?? []) if (m.state === 'needs-approval') reasons.push(...m.reasons);
   for (const s of input.services) {
     if (s.change === 'deleted') reasons.push(`${s.name}: the service was deleted, with all its expectations`);
     if (s.guard === 'needs-human')
@@ -355,6 +430,24 @@ function renderDeploy(deploy: DeploySafety | undefined): string[] {
   return lines;
 }
 
+/** The migrations of the change: what was checked, in words. Nothing when the change touches none. */
+function renderMigrations(checks: MigrationCheck[]): string[] {
+  if (checks.length === 0) return [];
+  const lines = ['**Database migrations**', ''];
+  for (const m of checks) {
+    const state = {
+      safe: '✅ apply, undo, and the deployed version keeps working on the new schema',
+      'needs-approval': '🟡 risky for the running version, or not fully verified: a person decides',
+      blocked: '❌ not safe to deploy',
+      missing: '⚪ not verified',
+    }[m.state];
+    lines.push(`- ${mdText(m.service)} (${m.touched.length} file${m.touched.length === 1 ? '' : 's'}): ${state}`);
+    for (const r of m.reasons.slice(0, 5)) lines.push(`  - ${mdText(r)}`);
+  }
+  lines.push('');
+  return lines;
+}
+
 export function renderMarkdown(d: Decision): string {
   const banner =
     d.decision === 'merge'
@@ -382,6 +475,7 @@ export function renderMarkdown(d: Decision): string {
     lines.push('');
   }
   lines.push(...renderDeploy(d.deploy));
+  lines.push(...renderMigrations(d.migrations ?? []));
   for (const s of d.services.filter((x) => x.failures.length > 0 || (x.gate !== 'pass' && x.gateDetail))) {
     lines.push(`**${mdText(s.name)}: what failed**`, '');
     if (s.gateDetail) lines.push(`- ${mdText(s.gateDetail)}`);
@@ -429,6 +523,8 @@ export async function deploySafety(
   project: ProjectConfig,
   services: string[],
   mergeBase: string,
+  /** The change's files (top-relative) and top level, to tell which config sources it edits. */
+  change?: { files: string[]; top: string },
 ): Promise<DeploySafety> {
   if (!project.deploy) return { configured: false, checks: [] };
   const checks: DeploySafety['checks'] = [];
@@ -439,7 +535,16 @@ export async function deploySafety(
         'error' in sources
           ? { environment: env.name, state: 'unknown', breaking: [], additive: [], note: sources.error }
           : await compatFor(sources, env);
-      checks.push({ service, compat, config: configFor(project, service, env, mergeBase) });
+      const configEdited = change
+        ? env.config
+            .map((source) =>
+              relative(change.top, join(realpathSync(project.root), source.file))
+                .split('\\')
+                .join('/'),
+            )
+            .filter((file) => change.files.includes(file))
+        : [];
+      checks.push({ service, compat, config: configFor(project, service, env, mergeBase), configEdited });
     }
   }
   return { configured: true, breakingPolicy: project.deploy.policy.breaking, checks };
@@ -496,13 +601,22 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     project,
     affected.services.map((s) => s.name),
     change.mergeBase,
+    change,
   );
+  const migrations: MigrationCheck[] = [];
+  for (const { name } of affected.services) {
+    // The directories of now and of the base: moving `migrate.dir` or dropping `migrate:` hides no migration.
+    const touched = touchedMigrations(change.files, serviceMigrationDirs(project, change, name));
+    if (touched.length > 0)
+      migrations.push(judgeMigrations(name, touched, evidence.migrations.get(name), change.mergeBase, now));
+  }
   const { decision, reasons } = decideFrom({
     affected: affected.services.map((s) => s.name),
     risk,
     policy: project.policy,
     services,
     deploy,
+    migrations,
   });
   const headSha = git(change.top, ['rev-parse', '--short', 'HEAD']).out.trim() || 'unknown';
   const dirty = git(change.top, ['status', '--porcelain']).out.trim() !== '';
@@ -517,6 +631,7 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     risk,
     services,
     deploy,
+    migrations,
     knownFailures: services.flatMap((s) => s.knownFailures.map((k) => ({ ...k, service: s.name }))),
     changedFiles: change.files.length,
     detailsUrl: options.detailsUrl,

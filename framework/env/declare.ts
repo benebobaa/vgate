@@ -13,8 +13,8 @@
  *       db: { kind: postgres, options: { database: orders }, seed: seed.sql }
  *       payments: { kind: wiremock, faults: true }
  *
- * Paths: `build.context` and `build.dockerfile` resolve against the project root (where vgate.yaml is), `seed` against
- * the service directory.
+ * Paths: `build.context` and `build.dockerfile` resolve against the project root (where vgate.yaml is); a kind's file
+ * options (`pathOptions`: postgres `seed`, mysql and mongodb `init`, keycloak `realmFile`) against the service directory.
  */
 import { isAbsolute, resolve } from 'node:path';
 import { catalogKinds, kindOf } from './catalog/index.ts';
@@ -111,8 +111,19 @@ export function parseEnvironment(
     const options: Record<string, unknown> = isRecord(value.options) ? { ...value.options } : {};
     for (const [key, item] of Object.entries(value))
       if (!['kind', 'image', 'options', 'faults'].includes(key)) options[key] = item;
-    if (typeof options.seed === 'string' && !isAbsolute(options.seed))
-      options.seed = resolve(dirs.service, options.seed);
+    // The kind names which options are files: those resolve against the service directory, the others stay as
+    // written. A file option the kind does not take is refused rather than mounted nowhere.
+    const pathOptions = kindOf(kind)?.pathOptions ?? [];
+    if (options.seed !== undefined && !pathOptions.includes('seed'))
+      throw new Error(
+        `${at}.seed: kind ${kind} takes ${pathOptions.length ? pathOptions.join(', ') : 'no file options'} instead`,
+      );
+    for (const key of pathOptions) {
+      const value = options[key];
+      if (value === undefined) continue;
+      if (typeof value !== 'string' || value === '') throw new Error(`${at}.${key} must be a file path`);
+      options[key] = isAbsolute(value) ? value : resolve(dirs.service, value);
+    }
     if (value.faults !== undefined && typeof value.faults !== 'boolean')
       throw new Error(`${at}.faults must be true or false`);
     dependencies[name] = {

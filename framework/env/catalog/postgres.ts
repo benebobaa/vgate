@@ -15,6 +15,7 @@ export const postgres: DependencyKind = {
   kind: 'postgres',
   defaultImage: 'postgres:17.6-alpine',
   ports: { main: 5432 },
+  pathOptions: ['seed'],
   environment: (ctx) => {
     const c = credentials(ctx);
     return { POSTGRES_DB: c.database, POSTGRES_USER: c.user, POSTGRES_PASSWORD: c.password };

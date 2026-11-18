@@ -7,14 +7,14 @@
  * placeholders. Its files (compose.yaml, edge.json, Corefile, the host app's log) live in <reports>/env/<service>/.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
-import { join } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { stringify } from 'yaml';
 import { kindOf } from './catalog/index.ts';
 import type { EnvironmentDecl } from './declare.ts';
-import { plan, type Plan } from './generate.ts';
+import { plan, type Plan, type PlannedMigration } from './generate.ts';
 import type { Values } from './placeholders.ts';
 
 export interface EnvState {
@@ -26,6 +26,8 @@ export interface EnvState {
   sealed: boolean;
   appInside: boolean;
   appPid?: number;
+  /** The built app's image (`vgate/<service>-app:<hash>`), kept across runs and reused while the code is unchanged. */
+  appImage?: string;
   /** Placeholder values from the tests' side. */
   external: Values;
   published: Plan['published'];
@@ -48,6 +50,8 @@ export interface EnvOptions {
   reportsDir: string;
   /** Streams Docker's output (stderr). */
   live?: boolean;
+  /** The project root: a dependency's `migrate.dir` resolves against it. Default: the reports dir's parent. */
+  projectRoot?: string;
 }
 
 export const statePath = (reportsDir: string, service: string) => join(reportsDir, 'env', `${service}.json`);
@@ -139,8 +143,9 @@ const randomSubnet = () => `10.${64 + Math.floor(Math.random() * 64)}.${Math.flo
  * (nothing half-started is left behind) and throws with the logs that explain it.
  */
 export async function envUp(options: EnvOptions): Promise<EnvState> {
-  const existing = readState(options.reportsDir, options.service);
-  if (existing) await envDown(options.reportsDir, options.service);
+  // Whatever this project left of the service (a state file, or containers of a crashed run) goes first: an
+  // environment is never adopted, always started by this run.
+  await envDown(options.reportsDir, options.service);
 
   const dir = envDir(options.reportsDir, options.service);
   rmSync(dir, { recursive: true, force: true });
@@ -150,6 +155,12 @@ export async function envUp(options: EnvOptions): Promise<EnvState> {
       .replace(/[^a-z0-9]/gi, '')
       .slice(0, 8)
       .toLowerCase() || randomBytes(3).toString('hex');
+
+  const labels = runLabels(options.reportsDir, options.service);
+  const build = options.decl.app.build;
+  const appImage = build
+    ? appImageName(options.service, contextHash(build.context, build.dockerfile, build.target), options.reportsDir)
+    : undefined;
 
   let lastError = '';
   // A random subnet or a just-freed port can be taken by another run between choosing and starting: try again.
@@ -165,6 +176,9 @@ export async function envUp(options: EnvOptions): Promise<EnvState> {
       hostPort: (key) => ports.get(key) ?? 0,
       subnet: randomSubnet(),
       envDir: dir,
+      appImage,
+      labels,
+      projectRoot: options.projectRoot ?? resolve(options.reportsDir, '..'),
     });
     const composeFile = join(dir, 'compose.yaml');
     writeFileSync(composeFile, stringify(planned.compose));
@@ -182,18 +196,22 @@ export async function envUp(options: EnvOptions): Promise<EnvState> {
       published: planned.published,
       addresses: {},
       startedAt: new Date().toISOString(),
+      ...(appImage ? { appImage } : {}),
     };
     // Written before starting, so `down` can always find what to remove.
     writeFileSync(statePath(options.reportsDir, options.service), JSON.stringify(state, null, 2));
 
     // Build first, alone: building while JVM-based dependencies start can starve a small Docker VM. Then the
     // dependencies, waited for and set up; the app last, so it never starts against a half-ready dependency.
-    if (planned.appInside && options.decl.app.build) {
+    // An image of exactly this build context exists already: reuse it instead of building again.
+    if (planned.appInside && build && !(appImage && (await imageExists(appImage)))) {
       const built = await compose(state, ['build', 'app'], options.live);
       if (built.code !== 0) {
         await envDown(options.reportsDir, options.service);
         throw new Error(`The app of ${options.service} did not build:\n${tailOf(built.out, 40)}`);
       }
+      // Older builds of this app are superseded: removing them now keeps one image per service on the machine.
+      if (appImage) await removeSupersededImages(appImage);
     }
     const infrastructure = ['dns', 'edge', ...Object.keys(options.decl.dependencies)];
     const started = await compose(state, ['up', '-d', '--remove-orphans', ...infrastructure], options.live);
@@ -210,10 +228,28 @@ export async function envUp(options: EnvOptions): Promise<EnvState> {
       if (planned.appInside) {
         const app = await compose(state, ['up', '-d', '--no-deps', 'app'], options.live);
         if (app.code !== 0) throw new Error(`The app of ${options.service} did not start:\n${tailOf(app.out, 30)}`);
-      } else state.appPid = startHostApp(planned, options, dir);
+      } else {
+        // A host app listens on a fixed port: something already there (another checkout's app) would answer the
+        // health check and be tested in this code's place. Refuse instead of adopting it.
+        const holder = await portHolder(options.decl.app.port);
+        if (holder)
+          throw new Error(
+            `port ${options.decl.app.port} is already held by ${holder}, which this run did not start (another ` +
+              `checkout's app?). Stop it or change environment.app.port; vgate never tests an app it did not start.`,
+          );
+        state.appPid = startHostApp(planned, options, dir);
+      }
       await until(planned.appInside ? 180 : 60, `${options.service} at ${planned.appHealthUrl}`, () =>
         httpOk(planned.appHealthUrl),
       );
+      if (!planned.appInside && state.appPid) {
+        const listener = await listenerPid(options.decl.app.port);
+        if (listener !== undefined && !isDescendant(listener, state.appPid))
+          throw new Error(
+            `the app answering on port ${options.decl.app.port} (pid ${listener}) is not the one this run started ` +
+              `(pid ${state.appPid})`,
+          );
+      }
       state.addresses = await addresses(state);
       writeFileSync(statePath(options.reportsDir, options.service), JSON.stringify(state, null, 2));
       return state;
@@ -251,14 +287,52 @@ async function waitAndSetUp(planned: Plan, state: EnvState, options: EnvOptions)
         const port = dep.hostPorts[health.tcp.port];
         await until(seconds, `${dep.name} (${dep.kind.kind})`, () => tcpOk(port));
       }
-      for (const command of dep.kind.setup?.(dep.ctx) ?? []) {
+      const setupCommands = dep.kind.setup?.(dep.ctx) ?? [];
+      const migration = planned.migrations.find((m) => m.dependency === dep.name);
+      // With migrations: readiness (the first setup command), the migrations, then the rest (the seed fills migrated
+      // tables). Without: every setup command, as before.
+      const { before, after } = splitSetup(setupCommands, migration !== undefined);
+      const setUp = async (command: string[]) =>
         // Setup commands may race the server's own start-up for a moment (a database still running its init scripts).
-        await until(seconds, `${dep.name} setup: ${command.join(' ')}`, async () => {
+        until(seconds, `${dep.name} setup: ${command.join(' ')}`, async () => {
           const ran = await compose(state, ['exec', '-T', dep.name, ...command], options.live);
           return ran.code === 0;
         });
+      for (const command of before) await setUp(command);
+      if (migration) {
+        const ran = await runMigration(state, migration, migration.config.command, options.live);
+        if (ran.code !== 0)
+          throw new Error(
+            `The migrations of ${dep.name} failed (${migration.config.command}):\n${tailOf(ran.out, 40)}`,
+          );
       }
+      for (const command of after) await setUp(command);
     }),
+  );
+}
+
+/**
+ * Where a dependency's migrations go among its setup commands: after the first (its readiness query), before the rest
+ * (the seed, which fills migrated tables). Without migrations every command runs as before. Pure; exported for tests.
+ */
+export function splitSetup(commands: string[][], migrating: boolean): { before: string[][]; after: string[][] } {
+  return migrating ? { before: commands.slice(0, 1), after: commands.slice(1) } : { before: commands, after: [] };
+}
+
+/**
+ * Runs `command` (the migrations, or their `down`) in a dependency's migrate tool service, with its migrations
+ * directory mounted read-only at /migrations. Exported for the migration checks (cli/migrations.ts).
+ */
+export function runMigration(
+  state: Pick<EnvState, 'project' | 'composeFile'>,
+  migration: Pick<PlannedMigration, 'service' | 'config'>,
+  command: string,
+  live = false,
+): Promise<{ code: number | null; out: string }> {
+  return compose(
+    state,
+    ['run', '--rm', '--no-deps', '-T', '-v', `${migration.config.dir}:/migrations:ro`, migration.service, command],
+    live,
   );
 }
 
@@ -295,10 +369,19 @@ async function addresses(state: EnvState): Promise<Record<string, string>> {
   return out;
 }
 
-/** Stops and removes everything the run created: containers, networks, volumes, the host app, its files. */
+/**
+ * Stops and removes everything the service's runs in this project created: containers, networks, volumes, the host
+ * app, the files. Without a state file (a crash, a deleted reports dir) it still finds the runs by their labels.
+ * Superseded app images go too; the current one stays for the next run to reuse.
+ */
 export async function envDown(reportsDir: string, service: string, live = false): Promise<boolean> {
   const state = readState(reportsDir, service);
-  if (!state) return false;
+  const orphans = (await labelledProjects(reportsDir, service)).filter((p) => p !== state?.project);
+  for (const project of orphans) await removeProject(project, live);
+  if (!state) {
+    rmSync(envDir(reportsDir, service), { recursive: true, force: true });
+    return orphans.length > 0;
+  }
   if (state.appPid) {
     try {
       process.kill(-state.appPid, 'SIGTERM');
@@ -311,9 +394,9 @@ export async function envDown(reportsDir: string, service: string, live = false)
     }
   }
   if (existsSync(state.composeFile))
-    await compose(state, ['down', '--volumes', '--remove-orphans', '--timeout', '5'], live);
-  else
-    spawnSync('docker', ['compose', '-p', state.project, 'down', '--volumes', '--remove-orphans'], { stdio: 'ignore' });
+    await compose(state, ['--profile', 'tools', 'down', '--volumes', '--remove-orphans', '--timeout', '5'], live);
+  else await removeProject(state.project, live);
+  if (state.appImage) await removeSupersededImages(state.appImage);
   rmSync(statePath(reportsDir, service), { force: true });
   rmSync(envDir(reportsDir, service), { recursive: true, force: true });
   return true;
@@ -350,8 +433,9 @@ export function parseOutbound(log: string, addresses: Record<string, string>, ow
     if (!match) continue;
     const [, ip, rawName] = match;
     const host = rawName.replace(/\.$/, '').toLowerCase();
-    // A name inside the environment with the host's search domain appended (redis.home.lan) is not outbound.
-    if (host.includes('.') && ownNames.includes(host.split('.')[0])) continue;
+    // Containers have no search domain (generate.ts NO_SEARCH): only a bare name of the environment is its own. A name
+    // that merely starts with one (s3.amazonaws.com next to a dependency `s3`) is outbound.
+    if (ownNames.includes(host)) continue;
     const from = addresses[ip] ?? ip;
     const key = `${from} ${host}`;
     if (seen.has(key)) continue;
@@ -368,6 +452,159 @@ export async function envOutbound(reportsDir: string, service: string): Promise<
   const logs = await compose(state, ['logs', '--no-color', '--no-log-prefix', 'dns']);
   const own = ['app', 'edge', 'dns', ...Object.values(state.addresses)];
   return parseOutbound(logs.out, state.addresses, own);
+}
+
+/** The labels every container and network of a run carries: which project (its reports dir) and which service. */
+export function runLabels(reportsDir: string, service: string): Record<string, string> {
+  return { 'dev.vgate.reports': resolve(reportsDir), 'dev.vgate.service': service };
+}
+
+/**
+ * `vgate/<service>-<project>-app:<hash>`: one stable name per project, service and build context, so builds are
+ * reused and superseded ones found. The project part (a hash of its reports directory) keeps two projects with a
+ * service of the same name from pruning each other's images.
+ */
+export function appImageName(service: string, hash: string, project: string): string {
+  const owner = createHash('sha256').update(resolve(project)).digest('hex').slice(0, 8);
+  return `vgate/${service.toLowerCase().replace(/[^a-z0-9_.-]/g, '-')}-${owner}-app:${hash}`;
+}
+
+/** .dockerignore lines as path tests: `name`, `dir/`, `*.log`, `**\/tmp` (enough for the common cases). */
+function ignoreRules(context: string): Array<(path: string) => boolean> {
+  const file = join(context, '.dockerignore');
+  const lines = existsSync(file) ? readFileSync(file, 'utf8').split('\n') : [];
+  return lines
+    .map((line) => line.trim().replace(/^\/+/, '').replace(/\/+$/, ''))
+    .filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith('!'))
+    .map((pattern) => {
+      const regex = new RegExp(
+        `^${pattern
+          .split('**/')
+          .map((part) =>
+            part
+              .split('*')
+              .map((piece) => piece.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+              .join('[^/]*'),
+          )
+          .join('(?:.*/)?')}(?:/.*)?$`,
+      );
+      return (path: string) => regex.test(path);
+    });
+}
+
+/**
+ * A hash of what `docker build` would see: every file of the context (minus .git, node_modules and .dockerignore's
+ * entries) with its content, plus the Dockerfile and target. Equal hashes mean an equal build. Exported for the tests.
+ */
+export function contextHash(context: string, dockerfile?: string, target?: string): string {
+  const hash = createHash('sha256');
+  const ignored = ignoreRules(context);
+  const walk = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true })
+      .flatMap((entry) => {
+        const path = join(dir, entry.name);
+        const rel = relative(context, path).split(sep).join('/');
+        if (entry.name === '.git' || entry.name === 'node_modules' || ignored.some((test) => test(rel))) return [];
+        if (entry.isDirectory()) return walk(path);
+        return entry.isFile() ? [rel] : [];
+      })
+      .sort();
+  for (const rel of walk(context)) {
+    hash.update(`${rel}\0`);
+    hash.update(readFileSync(join(context, rel)));
+    hash.update('\0');
+  }
+  if (dockerfile) {
+    const path = resolve(context, dockerfile);
+    hash.update(`dockerfile:${dockerfile}\0`);
+    if (existsSync(path)) hash.update(readFileSync(path));
+  }
+  hash.update(`target:${target ?? ''}`);
+  return hash.digest('hex').slice(0, 12);
+}
+
+/** The tags of `repository` to remove when `keep` is the current image: every other one. Pure; exported for tests. */
+export function supersededTags(listing: string, keep: string): string[] {
+  const [repository] = keep.split(':');
+  return listing
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((ref) => ref.startsWith(`${repository}:`) && ref !== keep && !ref.endsWith(':<none>'));
+}
+
+async function imageExists(ref: string): Promise<boolean> {
+  return (await run('docker', ['image', 'inspect', '--format', '{{.Id}}', ref])).code === 0;
+}
+
+async function removeSupersededImages(keep: string): Promise<void> {
+  const [repository] = keep.split(':');
+  const listed = await run('docker', ['images', repository, '--format', '{{.Repository}}:{{.Tag}}']);
+  const stale = supersededTags(listed.out, keep);
+  if (stale.length > 0) await run('docker', ['rmi', ...stale]);
+}
+
+/** Compose project names that carry this project's and service's labels (containers or networks). Pure parsing. */
+export function projectsFromListing(listing: string, service: string): string[] {
+  return [
+    ...new Set(
+      listing
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((name) => name.startsWith(`vgate-${service.toLowerCase()}-`)),
+    ),
+  ];
+}
+
+async function labelledProjects(reportsDir: string, service: string): Promise<string[]> {
+  const labels = runLabels(reportsDir, service);
+  const filters = Object.entries(labels).flatMap(([key, value]) => ['--filter', `label=${key}=${value}`]);
+  const format = ['--format', '{{.Label "com.docker.compose.project"}}'];
+  const containers = await run('docker', ['ps', '--all', ...filters, ...format]);
+  const networks = await run('docker', ['network', 'ls', ...filters, ...format]);
+  if (containers.code !== 0 && networks.code !== 0) return [];
+  return projectsFromListing(`${containers.out}\n${networks.out}`, service);
+}
+
+/** Removes a compose project by name: its containers, networks and volumes, with or without its compose file. */
+async function removeProject(project: string, live = false): Promise<void> {
+  await run(
+    'docker',
+    ['compose', '-p', project, '--profile', 'tools', 'down', '--volumes', '--remove-orphans', '--timeout', '5'],
+    live,
+  );
+}
+
+/** `name (pid N)` of whatever listens on 127.0.0.1:port, or undefined when the port is free. */
+async function portHolder(port: number): Promise<string | undefined> {
+  const free = await new Promise<boolean>((done) => {
+    const server = createServer();
+    server.once('error', () => done(false));
+    server.listen(port, () => server.close(() => done(true)));
+  });
+  if (free) return undefined;
+  const pid = await listenerPid(port);
+  if (pid === undefined) return `an unknown process`;
+  const name = spawnSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+  return `${name || 'a process'} (pid ${pid})`;
+}
+
+/** The pid listening on the TCP port (lsof); undefined when unknown. */
+async function listenerPid(port: number): Promise<number | undefined> {
+  const out = await run('lsof', ['-nP', '-t', `-iTCP:${port}`, '-sTCP:LISTEN']);
+  const pid = Number(out.out.split('\n')[0]);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** True when `pid` is `ancestor` or one of its descendants. */
+function isDescendant(pid: number, ancestor: number): boolean {
+  let current = pid;
+  for (let hops = 0; hops < 64 && current > 1; hops++) {
+    if (current === ancestor) return true;
+    const parent = Number(spawnSync('ps', ['-o', 'ppid=', '-p', String(current)], { encoding: 'utf8' }).stdout.trim());
+    if (!Number.isInteger(parent) || parent <= 0) return false;
+    current = parent;
+  }
+  return false;
 }
 
 function tailOf(text: string, lines: number): string {

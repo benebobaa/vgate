@@ -38,6 +38,8 @@ function optional(raw: Raw, field: string, at: string): string | undefined {
 
 function url(raw: Raw, field: string, at: string, schemes: string[]): string {
   const value = text(raw, field, at);
+  // `{name.export}` is filled in once this run's environment is up; until then it stays as written (config.ts).
+  if (/\{[a-z][\w-]*\.[\w-]+\}/i.test(value)) return value;
   let parsed: URL;
   try {
     parsed = new URL(value);

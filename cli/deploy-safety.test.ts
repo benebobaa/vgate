@@ -181,6 +181,21 @@ describe('compat: against the deployed version, not main', () => {
     assert.equal(result.state, 'compatible');
     assert.match(result.note ?? '', /not deployed to production yet/);
   });
+  it('compares with the contract the deployed version names, when the change renames it', async () => {
+    const root = project();
+    git(root, 'mv', 'regression/notes/openapi.yaml', 'regression/notes/api.yaml');
+    write(root, 'regression/notes/service.yaml', 'spec: api.yaml\n');
+    const result = await compatFor(serviceSources(readProject(root), 'notes') as never, production(root));
+    assert.equal(result.state, 'breaking', result.note ?? '');
+    assert.match(result.source ?? '', /tag v1\.0\.0/);
+  });
+  it('takes a release over its pre-release tags as the deployed version', async () => {
+    const root = project();
+    git(root, 'tag', 'v1.1.0', 'main'); // main dropped body: v1.1.0 is what runs
+    git(root, 'tag', 'v1.1.0-rc.1', 'v1.0.0');
+    const result = await compatFor(serviceSources(readProject(root), 'notes') as never, production(root));
+    assert.equal(result.source, 'tag v1.1.0 (tag:v*)');
+  });
   it('reports "not configured" without a deploy block, and an unknown environment as a usage error', async () => {
     const root = project('version: 0.2.0\nservicesDir: regression\n');
     const result = await compat(readProject(root), { service: 'notes', environment: undefined });
@@ -433,5 +448,44 @@ describe('decide with deploy safety', () => {
     );
     assert.equal(d.deploy.checks[0].config.state, 'complete');
     assert.match(readFileSync(join(root, 'reports/decision.md'), 'utf8'), /Safe to deploy/);
+  });
+
+  it('asks a human when the change edits the file that says what an environment provides', async () => {
+    const root = project(`version: 0.2.0\nservicesDir: regression\npolicy: { autoMerge: high }\n${DEPLOY}`);
+    // The change needs PAYMENTS_URL and declares, in the same pull request, that production has it.
+    write(root, 'regression/notes/openapi.yaml', contract(['id', 'title', 'body']));
+    write(
+      root,
+      'regression/notes/service.yaml',
+      "spec: openapi.yaml\npaths: ['apps/notes/**']\nconfig:\n  required: [DATABASE_URL, PAYMENTS_URL]\n",
+    );
+    write(root, 'deploy/production.env.example', 'DATABASE_URL=\nPAYMENTS_URL=\n');
+    git(root, 'commit', '-qam', 'needs PAYMENTS_URL');
+    const head = treeState(readProject(root));
+    write(
+      root,
+      'evidence/notes/verdict.json',
+      JSON.stringify({
+        schema: 'vgate.verdict/1',
+        service: 'notes',
+        verdict: 'pass',
+        complete: true,
+        startedAt: '2026-11-18T00:00:00.000Z',
+        expectations: {},
+        commit: head,
+        steps: [],
+      }),
+    );
+    write(
+      root,
+      'evidence/notes/guard.json',
+      JSON.stringify({ schema: 'vgate.guard/1', service: 'notes', base: 'main', decision: 'auto', findings: [], head }),
+    );
+    const d = (await decide(readProject(root), { base: 'main', evidence: join(root, 'evidence') })).data as Decision;
+    assert.equal(d.deploy.checks[0].config.state, 'complete');
+    assert.equal(d.decision, 'needs-approval', d.reasons.join('; '));
+    assert.deepEqual(d.reasons, [
+      'notes → production: the change edits deploy/production.env.example, which declares what production provides: a person confirms the settings exist there',
+    ]);
   });
 });

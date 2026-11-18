@@ -165,15 +165,18 @@ async function declaredStack(project: ProjectConfig, svc: ServiceConfig, options
   const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
   try {
     if (action === 'down') {
+      // With what a killed `vgate migrations` left behind (its environment is labelled `<service>-mig`).
       const removed = await envDown(reports, service, options.live);
+      const leftover = await envDown(reports, `${service}-mig`, options.live);
       return {
         command: action,
         ok: true,
         exitCode: EXIT.ok,
-        summary: removed
-          ? `${service}: environment removed (containers, networks, volumes) in ${elapsed()}`
-          : `${service}: no environment of this project was running`,
-        data: { service, action, removed },
+        summary:
+          removed || leftover
+            ? `${service}: environment removed (containers, networks, volumes) in ${elapsed()}`
+            : `${service}: no environment of this project was running`,
+        data: { service, action, removed: removed || leftover },
         next: [],
       };
     }
@@ -198,7 +201,7 @@ async function declaredStack(project: ProjectConfig, svc: ServiceConfig, options
       };
     }
     // up and reset: a declared environment is disposable, so a reset is a fresh environment.
-    const state = await envUp({ service, decl, reportsDir: reports, live: options.live });
+    const state = await envUp({ service, decl, reportsDir: reports, live: options.live, projectRoot: project.root });
     return {
       command: action,
       ok: true,

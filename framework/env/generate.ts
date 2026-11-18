@@ -13,6 +13,7 @@
 import type { DependencyKind, Endpoint, KindContext } from './catalog/index.ts';
 import { kindOf } from './catalog/index.ts';
 import type { EnvironmentDecl } from './declare.ts';
+import { migrateConfigs, migrateService, type MigrateConfig } from './migrate.ts';
 import { resolvePlaceholders, type Values } from './placeholders.ts';
 
 export const EDGE_IMAGE = 'ghcr.io/shopify/toxiproxy:2.12.0';
@@ -30,7 +31,28 @@ export interface PlanInput {
   subnet: string;
   /** Absolute directory of this run's generated files (mounted into dns and edge). */
   envDir: string;
+  /**
+   * The name a built app image gets (`vgate/<service>-app:<hash of its build context>`): stable across runs, so an
+   * unchanged app is built once and reused, and a superseded build can be found and removed. Without it compose would
+   * name the image after the per-run project and leave one behind on every run.
+   */
+  appImage?: string;
+  /** Labels on every container and network of the run, so `down` finds them even when the state file is gone. */
+  labels?: Record<string, string>;
+  /** The project root (vgate.yaml's directory): a dependency's `migrate.dir` resolves against it. */
+  projectRoot?: string;
 }
+
+/** A dependency's migrations: run by `docker compose run` on its tool service, between readiness and the seed. */
+export interface PlannedMigration {
+  dependency: string;
+  /** The compose service that runs them (profile `tools`: `up` never starts it on its own). */
+  service: string;
+  config: MigrateConfig;
+}
+
+/** `migrate-<dependency>`: the tool service that applies a dependency's migrations. */
+export const migrateServiceName = (dependency: string) => `migrate-${dependency}`;
 
 export interface PlannedDependency {
   name: string;
@@ -57,6 +79,8 @@ export interface Plan {
   dependencies: PlannedDependency[];
   dnsIp: string;
   sealed: boolean;
+  /** Dependencies with `migrate:`, in declaration order. */
+  migrations: PlannedMigration[];
 }
 
 /** `vgate-<service>-<run id>`, lower-case and compose-safe. */
@@ -69,6 +93,24 @@ export function dnsAddress(subnet: string): string {
   if (!match) throw new Error(`environment subnet must be a.b.c.0/24, not ${subnet}`);
   return `${match[1]}.${match[2]}.${match[3]}.53`;
 }
+
+/**
+ * The edge network's subnet, paired with the sealed one (second octet + 64, so it never equals another run's sealed
+ * subnet), and the edge's fixed address on it: the edge API listens there only. The sealed network has no route to
+ * it, so the app cannot reach the API and create a proxy to an address outside (the edge network has a gateway).
+ */
+export function edgeAddress(subnet: string): { subnet: string; ip: string } {
+  const [a, b, c] = dnsAddress(subnet).split('.').map(Number);
+  const base = `${a}.${(b + 64) % 256}.${c}`;
+  return { subnet: `${base}.0/24`, ip: `${base}.2` };
+}
+
+/**
+ * No search domain in any container: the host's (`home.lan`, a CI runner's cloud domain) would turn a lookup of an
+ * outside name into one that looks like a name of the environment (`s3.home.lan`), and a failed lookup of `db` into
+ * one the watch must guess about. With none, every name the DNS log shows is exactly what was asked.
+ */
+export const NO_SEARCH = ['.'];
 
 export const COREFILE = `# Every name not answered inside the environment is logged and refused: the outbound watch.
 .:53 {
@@ -83,6 +125,7 @@ export function plan(input: PlanInput): Plan {
   const { decl, service, runId } = input;
   const project = projectName(service, runId);
   const dnsIp = dnsAddress(input.subnet);
+  const edgeNet = edgeAddress(input.subnet);
   const edgeConfig: Plan['edgeConfig'] = [];
   const published: Plan['published'] = [];
   let nextPublished = 20000;
@@ -105,6 +148,7 @@ export function plan(input: PlanInput): Plan {
   const external: Values = { edge: { api: `http://${LOOPBACK}:${apiHostPort}` } };
   const dependencies: PlannedDependency[] = [];
   const services: Record<string, Record<string, unknown>> = {};
+  const labelled = input.labels && Object.keys(input.labels).length > 0 ? { labels: input.labels } : {};
 
   for (const [name, dep] of Object.entries(decl.dependencies)) {
     const kind = kindOf(dep.kind);
@@ -120,7 +164,9 @@ export function plan(input: PlanInput): Plan {
     const externalEndpoint: Endpoint = { host: LOOPBACK, ports: hostPorts };
     let internalEndpoint: Endpoint = { host: name, ports: { ...kind.ports } };
     if (dep.faults) {
-      // The app reaches a faulted dependency through the edge, on a proxy named after it.
+      // The app reaches a faulted dependency through the edge, on a proxy named after it. Every port keeps its
+      // container number except the first, which becomes the edge's proxy port: kinds that tell clients where to
+      // reconnect (Kafka's advertised listener) read ctx.internal, so they advertise the proxy too.
       const first = portNames[0];
       const edgePort = nextFault++;
       edgeConfig.push({ name, listen: `0.0.0.0:${edgePort}`, upstream: `${name}:${kind.ports[first]}`, enabled: true });
@@ -141,7 +187,28 @@ export function plan(input: PlanInput): Plan {
         : {}),
       networks: ['sealed'],
       dns: [dnsIp],
+      dns_search: NO_SEARCH,
+      ...labelled,
     };
+  }
+
+  // `migrate:` on a dependency: a tool service on the sealed network, with the dependency's own image by default (a
+  // database image has its client), started only by `compose run` before the seed (lifecycle.ts).
+  const migrations: PlannedMigration[] = [];
+  for (const config of migrateConfigs(decl, input.projectRoot ?? '/')) {
+    const dep = dependencies.find((d) => d.name === config.dependency);
+    if (!dep) continue;
+    const service = migrateServiceName(config.dependency);
+    services[service] = {
+      ...migrateService(
+        config,
+        decl.dependencies[config.dependency].image ?? dep.kind.defaultImage,
+        dep.kind.exports(dep.ctx.internal, dep.ctx),
+        dnsIp,
+      ),
+      ...labelled,
+    };
+    migrations.push({ dependency: config.dependency, service, config });
   }
 
   const appInside = decl.app.command === undefined;
@@ -176,12 +243,15 @@ export function plan(input: PlanInput): Plan {
               ...(decl.app.build.dockerfile ? { dockerfile: decl.app.build.dockerfile } : {}),
               ...(decl.app.build.target ? { target: decl.app.build.target } : {}),
             },
+            ...(input.appImage ? { image: input.appImage } : {}),
           }
         : { image: decl.app.image }),
       environment: appEnv,
       networks: ['sealed'],
       dns: [dnsIp],
+      dns_search: NO_SEARCH,
       depends_on: Object.keys(decl.dependencies),
+      ...labelled,
     };
   }
 
@@ -190,14 +260,18 @@ export function plan(input: PlanInput): Plan {
     command: ['-conf', '/etc/coredns/Corefile'],
     volumes: [`${input.envDir}/Corefile:/etc/coredns/Corefile:ro`],
     networks: { sealed: { ipv4_address: dnsIp } },
+    ...labelled,
   };
   services.edge = {
     image: EDGE_IMAGE,
-    command: ['-host=0.0.0.0', '-config=/config/edge.json'],
+    // The API on the edge network's address only: the tests reach it through the published port, the app cannot.
+    command: [`-host=${edgeNet.ip}`, '-config=/config/edge.json'],
     volumes: [`${input.envDir}/edge.json:/config/edge.json:ro`],
-    networks: ['sealed', 'edge'],
+    networks: { sealed: {}, edge: { ipv4_address: edgeNet.ip } },
     ports: published.map((p) => `${LOOPBACK}:${p.hostPort}:${p.edgePort}`),
     dns: [dnsIp],
+    dns_search: NO_SEARCH,
+    ...labelled,
   };
 
   return {
@@ -206,8 +280,8 @@ export function plan(input: PlanInput): Plan {
       name: project,
       networks: {
         // internal: Docker gives the network no gateway, so nothing on it reaches anything off it.
-        sealed: { internal: true, ipam: { config: [{ subnet: input.subnet }] } },
-        edge: {},
+        sealed: { internal: true, ipam: { config: [{ subnet: input.subnet }] }, ...labelled },
+        edge: { ipam: { config: [{ subnet: edgeNet.subnet }] }, ...labelled },
       },
       services,
     },
@@ -221,5 +295,6 @@ export function plan(input: PlanInput): Plan {
     dependencies,
     dnsIp,
     sealed: decl.sealed && appInside,
+    migrations,
   };
 }
