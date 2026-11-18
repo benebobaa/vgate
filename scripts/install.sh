@@ -57,9 +57,11 @@ is_musl() {
 
 fetch() { # <url> <output file>
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 2 -o "$2" "$1" || fail "download failed: $1"
+    # A CI runner's network blips (connection reset, 5xx): retry every error a few times before giving up.
+    curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 20 -o "$2" "$1" ||
+      fail "download failed: $1"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$2" "$1" || fail "download failed: $1"
+    wget -q --tries=5 --waitretry=2 -O "$2" "$1" || fail "download failed: $1"
   else
     fail "neither curl nor wget is installed"
   fi
