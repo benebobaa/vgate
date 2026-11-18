@@ -87,6 +87,19 @@ jobs:
           tar -xzf dist/release/v*/vgate-*-linux-x64.tar.gz -C "$dir"
           "$dir/vgate" version
           "$dir/vgate" skills list --dir "$dir/skills" --json | jq -e '.data.skills | length >= 2'
+      - name: The binary works in a fresh project (no framework, no node_modules)
+        # What users get: `init` in an empty repository, then the gate steps that need no stack. The framework's own
+        # self-tests run here from the unpacked runtime, so a self-test that leans on this repository's services fails.
+        run: |
+          bin=$(mktemp -d)
+          tar -xzf dist/release/v*/vgate-*-linux-x64.tar.gz -C "$bin"
+          pipx install uv
+          project=$(mktemp -d)
+          cd "$project"
+          git init -q
+          "$bin/vgate" init --service api --ci github --json | jq -e '.ok'
+          "$bin/vgate" doctor --fix --service api --json | jq -e '.data.checks | map(select(.status == "fail")) | length == 0'
+          "$bin/vgate" gate --service api --steps selftest,typecheck,lint --json | jq -e '.data.verdict == "pass"'
       - run: pnpm exec tsx scripts/release.ts --dry-run
 
   secrets:
