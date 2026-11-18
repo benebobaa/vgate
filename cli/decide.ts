@@ -9,6 +9,11 @@
  *                   allows
  *   merge           none of the above: a green gate may merge without a human
  *
+ * With a `deploy:` block in vgate.yaml it also asks whether the change is safe to put next to what runs in each
+ * environment (docs/deploy-safety.md): a contract that breaks the clients of the deployed version needs a human (or
+ * blocks, per `deploy.policy.breaking`); a required configuration key an environment lacks blocks, since deploying
+ * would fail; a deployed contract or config source that cannot be read needs a human, never passes.
+ *
  * It writes reports/decision.json (`vgate.decision/1`) and reports/decision.md, the pull-request comment: a person
  * who never reads code can see what was verified and why the change can or cannot merge.
  */
@@ -18,6 +23,8 @@ import { join, relative, resolve } from 'node:path';
 import type { Policy, ProjectConfig } from '../framework/project.ts';
 import { changeSet, computeAffected } from './affected.ts';
 import { staleTree, treeState, type TreeState } from './commit.ts';
+import { compatFor, serviceSources, type CompatResult } from './compat.ts';
+import { configFor, describeMissing, type ConfigResult } from './config-check.ts';
 import type { Verdict } from './gate.ts';
 import { git, type Finding, type GuardReport } from './guard.ts';
 import type { KnownFailureHit, TestFailure } from './junit.ts';
@@ -46,6 +53,17 @@ export interface ServiceDecision {
   knownFailures: KnownFailureHit[];
 }
 
+/**
+ * Deploy safety per (affected service, environment). Computed by decide itself from the repository (git tags and
+ * refs, the config files) or the live contract URL, not read from evidence: nothing a CI job could leave behind
+ * stands in for it, and it needs no running stack.
+ */
+export interface DeploySafety {
+  configured: boolean;
+  breakingPolicy?: 'needs-approval' | 'block';
+  checks: Array<{ service: string; compat: CompatResult; config: ConfigResult }>;
+}
+
 export interface Decision {
   schema: 'vgate.decision/1';
   decision: DecisionKind;
@@ -56,6 +74,7 @@ export interface Decision {
   policy: Policy;
   risk: RiskReport;
   services: ServiceDecision[];
+  deploy: DeploySafety;
   knownFailures: Array<KnownFailureHit & { service: string }>;
   changedFiles: number;
   detailsUrl?: string;
@@ -211,14 +230,30 @@ export function decideFrom(input: {
   risk: RiskReport;
   policy: Policy;
   services: ServiceDecision[];
+  deploy?: DeploySafety;
 }): { decision: DecisionKind; reasons: string[] } {
   const reasons: string[] = [];
   const affected = input.services.filter((s) => s.change === 'affected');
   const notGreen = affected.filter((s) => s.gate !== 'pass');
-  if (notGreen.length > 0) {
-    for (const s of notGreen)
-      reasons.push(`${s.name}: gate ${s.gate === 'fail' ? 'failed' : 'evidence missing'} (${s.gateDetail})`);
-    return { decision: 'blocked', reasons };
+  const checks = input.deploy?.checks ?? [];
+  const block = input.deploy?.breakingPolicy === 'block';
+  const blocked = [
+    ...notGreen.map((s) => `${s.name}: gate ${s.gate === 'fail' ? 'failed' : 'evidence missing'} (${s.gateDetail})`),
+    // Deploying would fail: the code needs a setting the environment does not have.
+    ...checks.filter((c) => c.config.state === 'missing').map((c) => describeMissing(c.service, c.config)),
+    ...(block ? checks.filter((c) => c.compat.state === 'breaking').map((c) => breakingReason(c)) : []),
+  ];
+  if (blocked.length > 0) return { decision: 'blocked', reasons: blocked };
+  for (const c of checks) {
+    if (c.compat.state === 'breaking') reasons.push(breakingReason(c));
+    if (c.compat.state === 'unknown')
+      reasons.push(
+        `${c.service} → ${c.compat.environment}: compatibility with the deployed version was not checked (${c.compat.note})`,
+      );
+    if (c.config.state === 'unknown')
+      reasons.push(
+        `${c.service} → ${c.config.environment}: the environment's configuration was not checked (${c.config.notes[0] ?? 'unreadable'})`,
+      );
   }
   for (const s of input.services) {
     if (s.change === 'deleted') reasons.push(`${s.name}: the service was deleted, with all its expectations`);
@@ -247,6 +282,11 @@ export function decideFrom(input: {
       `${affected.length} affected service${affected.length === 1 ? '' : 's'} verified; no expectation weakened; risk ${input.risk.tier}`,
     ],
   };
+}
+
+function breakingReason(c: DeploySafety['checks'][number]): string {
+  const n = c.compat.breaking.length;
+  return `${c.service} → ${c.compat.environment}: breaks ${n} thing${n === 1 ? '' : 's'} that clients of the deployed version (${c.compat.source}) rely on: ${c.compat.breaking[0]}${n > 1 ? ' …' : ''}`;
 }
 
 const PLAIN: Record<string, string> = {
@@ -286,6 +326,35 @@ export function mdCode(value: unknown): string {
   return `${fence}${pad}${text}${pad}${fence}`;
 }
 
+/** "Safe to deploy": per affected service and environment, in words; one line when it is not configured. */
+function renderDeploy(deploy: DeploySafety | undefined): string[] {
+  if (!deploy || !deploy.configured)
+    return ['**Safe to deploy:** not checked (no `deploy:` in vgate.yaml, see docs/deploy-safety.md)', ''];
+  if (deploy.checks.length === 0) return ['**Safe to deploy:** no affected service to check', ''];
+  const lines = ['**Safe to deploy**', ''];
+  for (const { service, compat, config } of deploy.checks) {
+    const contract = {
+      compatible: `✅ compatible with what runs there${compat.source ? ` (${mdText(compat.source)})` : ''}`,
+      breaking: `❌ breaks clients of the deployed version (${mdText(compat.source ?? '?')})`,
+      unknown: `⚪ contract not checked: ${mdText(compat.note ?? 'unknown')}`,
+      'not-configured': '➖ contract: no source configured',
+    }[compat.state];
+    const settings = {
+      complete: `✅ all ${config.required.length} required settings present`,
+      missing: `❌ missing settings: ${config.missing.map((k) => mdCode(k)).join(', ')}`,
+      unknown: `⚪ settings not checked: ${mdText(config.notes[0] ?? 'unknown')}`,
+      'not-configured': '➖ settings: nothing declared',
+    }[config.state];
+    lines.push(`- ${mdText(service)} → ${mdText(compat.environment)}: ${contract}; ${settings}`);
+    for (const b of compat.breaking.slice(0, 5)) lines.push(`  - breaks: ${mdText(b)}`);
+    if (compat.breaking.length > 5) lines.push(`  - … and ${compat.breaking.length - 5} more`);
+    if (compat.note && compat.state === 'compatible') lines.push(`  - ${mdText(compat.note)}`);
+    for (const k of config.newlyRequired) lines.push(`  - ${mdCode(k)} is newly required by this change`);
+  }
+  lines.push('');
+  return lines;
+}
+
 export function renderMarkdown(d: Decision): string {
   const banner =
     d.decision === 'merge'
@@ -312,6 +381,7 @@ export function renderMarkdown(d: Decision): string {
     }
     lines.push('');
   }
+  lines.push(...renderDeploy(d.deploy));
   for (const s of d.services.filter((x) => x.failures.length > 0 || (x.gate !== 'pass' && x.gateDetail))) {
     lines.push(`**${mdText(s.name)}: what failed**`, '');
     if (s.gateDetail) lines.push(`- ${mdText(s.gateDetail)}`);
@@ -354,7 +424,28 @@ export function renderMarkdown(d: Decision): string {
   return lines.join('\n');
 }
 
-export function decide(project: ProjectConfig, options: DecideOptions): Result {
+/** Compatibility and configuration of every affected service in every environment of `deploy:`. */
+export async function deploySafety(
+  project: ProjectConfig,
+  services: string[],
+  mergeBase: string,
+): Promise<DeploySafety> {
+  if (!project.deploy) return { configured: false, checks: [] };
+  const checks: DeploySafety['checks'] = [];
+  for (const service of services) {
+    const sources = serviceSources(project, service);
+    for (const env of project.deploy.environments) {
+      const compat: CompatResult =
+        'error' in sources
+          ? { environment: env.name, state: 'unknown', breaking: [], additive: [], note: sources.error }
+          : await compatFor(sources, env);
+      checks.push({ service, compat, config: configFor(project, service, env, mergeBase) });
+    }
+  }
+  return { configured: true, breakingPolicy: project.deploy.policy.breaking, checks };
+}
+
+export async function decide(project: ProjectConfig, options: DecideOptions): Promise<Result> {
   if (!options.evidence)
     throw new UsageError(
       `Pass --evidence <dir>: where the gate and guard reports are, e.g. ${CLI} decide --base origin/main --evidence reports`,
@@ -401,11 +492,17 @@ export function decide(project: ProjectConfig, options: DecideOptions): Result {
     };
   });
 
+  const deploy = await deploySafety(
+    project,
+    affected.services.map((s) => s.name),
+    change.mergeBase,
+  );
   const { decision, reasons } = decideFrom({
     affected: affected.services.map((s) => s.name),
     risk,
     policy: project.policy,
     services,
+    deploy,
   });
   const headSha = git(change.top, ['rev-parse', '--short', 'HEAD']).out.trim() || 'unknown';
   const dirty = git(change.top, ['status', '--porcelain']).out.trim() !== '';
@@ -419,6 +516,7 @@ export function decide(project: ProjectConfig, options: DecideOptions): Result {
     policy: project.policy,
     risk,
     services,
+    deploy,
     knownFailures: services.flatMap((s) => s.knownFailures.map((k) => ({ ...k, service: s.name }))),
     changedFiles: change.files.length,
     detailsUrl: options.detailsUrl,

@@ -1,0 +1,12 @@
+{
+  "name": "example-orders-app",
+  "private": true,
+  "type": "module",
+  "description": "The example-orders system under test, as a container (Dockerfile); versions match the repository's lockfile",
+  "dependencies": {
+    "@platformatic/kafka": "2.16.0",
+    "pg": "8.23.1",
+    "redis": "6.3.1",
+    "tsx": "4.23.15"
+  }
+}

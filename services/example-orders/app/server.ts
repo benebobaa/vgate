@@ -3,7 +3,11 @@
  * third-party payment provider. It is the system under test of the framework's dependency example, written to follow
  * its README; it is not part of the framework.
  *
- *   ORDERS_PORT=8091 tsx services/example-orders/server.ts   (stack.sh sets every variable below)
+ * It runs as a container in the service's sealed environment (service.yaml `environment:`, app/Dockerfile), which
+ * sets every variable below.
+ *
+ * ORDERS_CALL_HOME, when set, makes the app call that URL at start-up: a deliberate outbound call, so the framework's
+ * self-check can show that a sealed environment refuses it and the gate names it (docs/environments.md).
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -19,6 +23,13 @@ const paymentTimeoutMs = Number(env('ORDERS_PAYMENT_TIMEOUT_MS', '2000')); // ru
 const IDEMPOTENCY_TTL = 86_400; // rule 3
 const ORDER_CACHE_TTL = 300; // rule 7
 const TOPIC = 'orders.created';
+
+const callHome = env('ORDERS_CALL_HOME', '');
+if (callHome !== '') {
+  fetch(callHome, { signal: AbortSignal.timeout(3000) })
+    .then(() => process.stdout.write(`called ${callHome}\n`))
+    .catch((error: Error) => process.stderr.write(`call home to ${callHome} failed: ${error.message}\n`));
+}
 
 const db = new pg.Pool({
   connectionString: env('ORDERS_DB_URL', 'postgres://orders:orders@localhost:55432/orders'),

@@ -53,6 +53,16 @@ tolerated, and a link to the full reports.
 A change that touches no service (documentation, a README) has nothing to prove: its decision depends on its risk
 tier alone.
 
+### Safe to deploy
+
+With a `deploy:` block in `vgate.yaml`, the decision also asks whether the change is safe to put next to what runs in
+each environment: does its contract still serve the clients of the version deployed there (`vgate compat`), and does
+each environment provide every setting the code requires (`vgate config-check`)? A change that breaks the deployed
+contract needs an approval (or is blocked, with `deploy.policy.breaking: block`); a required setting an environment
+lacks blocks the change, because deploying it would fail; a deployed contract or config file that cannot be read needs
+an approval, never passes. Without `deploy:`, the comment says deploy safety was not checked.
+[deploy-safety.md](deploy-safety.md) has the configuration.
+
 ## Policy and risk
 
 Both live in `vgate.yaml`, which is itself a judge's file: changing it is a `needs-approval` change.

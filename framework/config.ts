@@ -2,6 +2,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse } from 'yaml';
 import { parseDependencies, type DependencyConfig } from './deps/config.ts';
+import { parseEnvironment, type EnvironmentDecl } from './env/declare.ts';
+import { readState } from './env/lifecycle.ts';
+import { hasPlaceholders, resolveDeep } from './env/placeholders.ts';
 import { project, readProject } from './project.ts';
 
 /** Absolute path of the project under test (framework/project.ts): its vgate.yaml's directory. */
@@ -148,6 +151,11 @@ export interface EnvironmentConfig {
   dependencies?: Record<string, DependencyConfig>;
   /** Signed webhooks the tests send to the service, by provider name (docs/webhooks.md). */
   webhooks?: Record<string, WebhookConfig>;
+  /**
+   * Set when the service declares an `environment` (docs/environments.md): whether this run's environment is up, so
+   * its `{name.key}` placeholders above are resolved. Down, they stay as written and nothing answers at baseUrl.
+   */
+  declared?: { up: boolean; project?: string; runId?: string };
 }
 
 /** How a provider signs its webhooks: HMAC over a payload template, written into a header template. */
@@ -203,6 +211,8 @@ export interface ServiceConfig {
   coverage: { exclude: CoverageExclusion[] };
   schemathesis: SchemathesisConfig;
   env: EnvironmentConfig;
+  /** The sealed environment a run starts for itself (`environment:`); absent when the service uses its stack.sh. */
+  environment?: EnvironmentDecl;
 }
 
 /** `paths:` of a service.yaml: a list of non-empty globs, or absent. Shared with `vgate affected`. */
@@ -268,7 +278,23 @@ export function loadService(
     );
 
   const top = record(interpolate({ ...raw, environments: undefined }, `${name} service.yaml`));
-  const env = record(interpolate(rawEnv, `${name} environment ${envName}`));
+  const project = readProject(root);
+  const environment = parseEnvironment(top.environment, { service: dir, project: project.root }, `${name} environment`);
+  let env = record(interpolate(rawEnv, `${name} environment ${envName}`));
+  let declared: EnvironmentConfig['declared'];
+  let composeOfRun: EnvironmentConfig['compose'];
+  if (environment && hasPlaceholders(env)) {
+    // `{name.key}` values exist once this run's environment is up (vgate up writes them); down, they stay as written.
+    const state = readState(project.reportsDir, name);
+    declared = { up: state !== undefined, project: state?.project, runId: state?.runId };
+    if (state) {
+      env = record(resolveDeep(env, state.external, `${name} environments.${envName}`));
+      composeOfRun = { file: state.composeFile, project: state.project };
+    }
+  } else if (environment) {
+    const state = readState(project.reportsDir, name);
+    declared = { up: state !== undefined, project: state?.project, runId: state?.runId };
+  }
   const backend = top.backend === undefined ? undefined : record(top.backend);
   const compose = env.compose === undefined ? undefined : record(env.compose);
   const keycloak = env.keycloak === undefined ? undefined : record(env.keycloak);
@@ -308,7 +334,8 @@ export function loadService(
       db: env.db === undefined ? undefined : (record(env.db) as unknown as EnvironmentConfig['db']),
       compose: compose
         ? { file: resolve(dir, required(text(compose.file), 'compose.file')), project: text(compose.project) }
-        : undefined,
+        : composeOfRun,
+      declared,
       users,
       webhooks: env.webhooks === undefined ? undefined : (record(env.webhooks) as EnvironmentConfig['webhooks']),
       disposable: env.disposable === true,
@@ -319,5 +346,6 @@ export function loadService(
         `${name} service.yaml environments.${envName}.dependencies`,
       ),
     },
+    environment,
   };
 }

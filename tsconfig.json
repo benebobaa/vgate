@@ -20,6 +20,7 @@
     "cli",
     "scripts",
     "services/*/*.ts",
+    "services/*/app/*.ts",
     "services/*/support",
     "services/*/tests",
     "playwright.config.ts"

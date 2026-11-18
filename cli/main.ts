@@ -12,6 +12,8 @@ import { loadService } from '../framework/config.ts';
 import { inventorySkeleton } from '../framework/inventory.ts';
 import { PROJECT_FILE, type ProjectConfig } from '../framework/project.ts';
 import { affected } from './affected.ts';
+import { compat } from './compat.ts';
+import { configCheck } from './config-check.ts';
 import { decide, DECISION_FILE } from './decide.ts';
 import { doctor } from './doctor.ts';
 import { gate, STEPS, VERDICT_FILE } from './gate.ts';
@@ -90,6 +92,18 @@ const CATALOGUE = {
       name: 'decide',
       usage: `${CLI} decide --base <git ref> --evidence <dir> [--details-url <url>]`,
       about: `The pull request's verdict from the gate and guard reports under --evidence: merge (exit 0), needs-approval or blocked (exit 1). Missing or stale evidence never passes. Writes ${DECISION_FILE} and reports/decision.md (the PR comment).`,
+    },
+    {
+      name: 'compat',
+      usage: `${CLI} compat --service <name> [--environment <name>]`,
+      about:
+        "Does the service's contract still serve the clients of the version deployed in each environment of vgate.yaml's `deploy:` (a git ref such as tag:v*, or the live contract URL)? Exit 1 when it breaks something they rely on, 3 when the deployed contract cannot be read.",
+    },
+    {
+      name: 'config-check',
+      usage: `${CLI} config-check --service <name> [--environment <name>] [--base <git ref>]`,
+      about:
+        "Does each environment of `deploy:` provide every key in the service's `config.required`? Reads key names only (dotenv, Kubernetes ConfigMap/Secret/env, key lists), never values. Exit 1 when one is missing; --base marks the keys the change newly requires.",
     },
     {
       name: 'inventory',
@@ -271,6 +285,12 @@ async function run(argv: string[]): Promise<Result> {
       evidence: str(args.evidence),
       detailsUrl: str(args['details-url']),
     });
+  }
+  if (command === 'compat' || command === 'config-check') {
+    if (args.environment === true) throw new UsageError('--environment needs a name from deploy.environments');
+    if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');
+    const options = { service: serviceFlag, environment: str(args.environment) };
+    return command === 'compat' ? compat(project, options) : configCheck(project, { ...options, base: str(args.base) });
   }
   if (command === 'guard') {
     if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');
