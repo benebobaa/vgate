@@ -98,7 +98,10 @@ if (existsSync(installer)) {
 const signature = join(localVersionDir, 'SHA256SUMS.minisig');
 const publicKey = join(root, 'minisign.pub');
 if (!existsSync(signature)) {
-  problems.push('SHA256SUMS.minisig is missing: build with VGATE_MINISIGN_KEY=<secret key> (docs/releasing.md)');
+  // A dry run (CI's release build, which holds no key) only warns; publishing an unsigned release is refused.
+  const unsigned = 'SHA256SUMS.minisig is missing: build with VGATE_MINISIGN_KEY=<secret key> (docs/releasing.md)';
+  if (publish) problems.push(unsigned);
+  else process.stderr.write(`warning: ${unsigned}; --publish would refuse this release\n`);
 } else if (!existsSync(publicKey)) {
   problems.push('minisign.pub is missing at the repository root');
 } else {
