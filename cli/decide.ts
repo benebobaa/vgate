@@ -18,6 +18,10 @@
  * does not apply or undo, or that breaks the deployed code on the migrated schema, blocks; a risky one needs a human;
  * no current evidence blocks (docs/deploy-safety.md).
  *
+ * With `policy.mutationScore` in vgate.yaml, a change to a service's source code needs that service's `vgate mutate`
+ * evidence: tests that catch fewer planted bugs than the policy asks, a score that could not be measured, or no current
+ * evidence need a human (docs/mutation.md). Never a block: mutation measures the tests, not the code's correctness.
+ *
  * It writes reports/decision.json (`vgate.decision/1`) and reports/decision.md, the pull-request comment: a person
  * who never reads code can see what was verified and why the change can or cannot merge.
  */
@@ -34,6 +38,7 @@ import type { Verdict } from './gate.ts';
 import { git, type Finding, type GuardReport } from './guard.ts';
 import type { KnownFailureHit, TestFailure } from './junit.ts';
 import type { MigrationsReport } from './migrations.ts';
+import { mutationSources, servicePathsOf, type MutationReport } from './mutate.ts';
 import { CLI, EXIT, UsageError, type Result } from './output.ts';
 import { assessRisk, tierAbove, type RiskReport } from './risk.ts';
 
@@ -85,6 +90,30 @@ export interface MigrationCheck {
   reasons: string[];
 }
 
+/** How well the tests catch bugs in a service's changed code, from its `vgate mutate` evidence. */
+export interface MutationCheck {
+  service: string;
+  /**
+   * pass: at or above policy.mutationScore (or no policy: shown for information); below: under it; unmeasured: no
+   * mutant could be judged; missing: no current evidence. Only below, unmeasured and missing with a policy need a human.
+   */
+  state: 'pass' | 'below' | 'unmeasured' | 'missing';
+  score: number | null;
+  threshold?: number;
+  killed: number;
+  survived: number;
+  reasons: string[];
+  survivors: Array<{
+    file: string;
+    line: number;
+    original: string;
+    replacement: string;
+    before: string;
+    after: string;
+    hint?: string;
+  }>;
+}
+
 export interface Decision {
   schema: 'vgate.decision/1';
   decision: DecisionKind;
@@ -97,6 +126,8 @@ export interface Decision {
   services: ServiceDecision[];
   deploy: DeploySafety;
   migrations: MigrationCheck[];
+  /** Absent in decisions written before `vgate mutate` existed. */
+  mutation?: MutationCheck[];
   knownFailures: Array<KnownFailureHit & { service: string }>;
   changedFiles: number;
   detailsUrl?: string;
@@ -107,6 +138,7 @@ export interface Decision {
 interface Evidence {
   verdicts: Map<string, Verdict & { file: string }>;
   migrations: Map<string, MigrationsReport & { file: string }>;
+  mutation: Map<string, MutationReport & { file: string }>;
   guards: Map<string, Array<GuardReport & { file: string }>>;
   read: string[];
   ignored: string[];
@@ -117,7 +149,7 @@ function walk(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) return entry.name === 'node_modules' || entry.name === '.git' ? [] : walk(path);
-    return ['verdict.json', 'guard.json', 'migrations.json'].includes(entry.name) ? [path] : [];
+    return ['verdict.json', 'guard.json', 'migrations.json', 'mutation.json'].includes(entry.name) ? [path] : [];
   });
 }
 
@@ -127,7 +159,14 @@ function walk(dir: string): string[] {
  * gives itself, cannot hide a failure.
  */
 export function readEvidence(dir: string, cwd: string): Evidence {
-  const evidence: Evidence = { verdicts: new Map(), guards: new Map(), migrations: new Map(), read: [], ignored: [] };
+  const evidence: Evidence = {
+    verdicts: new Map(),
+    guards: new Map(),
+    migrations: new Map(),
+    mutation: new Map(),
+    read: [],
+    ignored: [],
+  };
   for (const file of walk(dir).sort()) {
     const shown = relative(cwd, file) || file;
     let data: Record<string, unknown>;
@@ -163,12 +202,81 @@ export function readEvidence(dir: string, cwd: string): Evidence {
       if (!previous || MIGRATION_WEIGHT[report.verdict] > MIGRATION_WEIGHT[previous.verdict])
         evidence.migrations.set(report.service, report);
       evidence.read.push(shown);
+    } else if (data.schema === 'vgate.mutation/1') {
+      const report = { ...(data as unknown as MutationReport), file };
+      const previous = evidence.mutation.get(report.service);
+      // The weaker result wins: an extra file that claims a high score cannot hide a low one.
+      if (!previous || mutationRank(report) < mutationRank(previous)) evidence.mutation.set(report.service, report);
+      evidence.read.push(shown);
     } else evidence.ignored.push(`${shown} (unknown schema ${String(data.schema)})`);
   }
   return evidence;
 }
 
 const MIGRATION_WEIGHT: Record<string, number> = { 'not-configured': 0, safe: 1, 'needs-approval': 2, blocked: 3 };
+
+/**
+ * Lower is weaker: unmeasured below any score; a score of null counts as -1. "Nothing to mutate" is the strongest
+ * claim: a file making it never hides a measured score.
+ */
+function mutationRank(report: Pick<MutationReport, 'verdict' | 'counts'>): number {
+  if (report.verdict === 'not-applicable') return Infinity;
+  if (report.verdict === 'unmeasured') return -2;
+  return report.counts?.score ?? -1;
+}
+
+/**
+ * The test strength of a service whose source code the change touches, from its `vgate mutate` evidence. Evidence from
+ * another merge base or another tree says nothing about this change: it counts as missing.
+ */
+export function judgeMutation(
+  service: string,
+  report: (MutationReport & { file?: string }) | undefined,
+  mergeBase: string,
+  now: TreeState,
+  threshold: number | undefined,
+): MutationCheck {
+  const base = { service, score: null, threshold, killed: 0, survived: 0, survivors: [] };
+  const missing = (why: string): MutationCheck => ({
+    ...base,
+    state: 'missing',
+    reasons: [`${service}: test strength not measured: ${why}`],
+  });
+  if (!report) return missing(`no mutation evidence (run ${CLI} mutate --service ${service} --base <base>)`);
+  if (report.mergeBase !== mergeBase) return missing('the evidence was measured against another base');
+  const otherTree = staleTree(report.commit, now);
+  if (otherTree) return missing(`the evidence is stale: ${otherTree}`);
+  const counts = report.counts ?? { killed: 0, survived: 0, score: null };
+  const survivors = (report.mutants ?? [])
+    .filter((m) => m.status === 'survived')
+    .map((m) => ({
+      file: m.file,
+      line: m.line,
+      original: m.original,
+      replacement: m.replacement,
+      before: m.before,
+      after: m.after,
+      hint: m.hint,
+    }));
+  const pct = (n: number) => `${Math.round(n * 100)}%`;
+  const judged = { ...base, score: counts.score, killed: counts.killed, survived: counts.survived, survivors };
+  if (report.verdict === 'not-applicable') return { ...judged, state: 'pass', reasons: [] };
+  if (counts.score === null)
+    return {
+      ...judged,
+      state: 'unmeasured',
+      reasons: [`${service}: no planted bug could be judged (${report.reasons?.[0] ?? 'see the report'})`],
+    };
+  if (threshold !== undefined && counts.score < threshold)
+    return {
+      ...judged,
+      state: 'below',
+      reasons: [
+        `${service}: the tests caught ${counts.killed} of ${counts.killed + counts.survived} bugs planted in the changed code (${pct(counts.score)}), below policy.mutationScore ${pct(threshold)}`,
+      ],
+    };
+  return { ...judged, state: 'pass', reasons: [] };
+}
 
 /**
  * The migrations a change touches in an affected service, judged from that service's `vgate migrations` evidence.
@@ -298,6 +406,7 @@ export function decideFrom(input: {
   services: ServiceDecision[];
   deploy?: DeploySafety;
   migrations?: MigrationCheck[];
+  mutation?: MutationCheck[];
 }): { decision: DecisionKind; reasons: string[] } {
   const reasons: string[] = [];
   const affected = input.services.filter((s) => s.change === 'affected');
@@ -330,6 +439,9 @@ export function decideFrom(input: {
       );
   }
   for (const m of input.migrations ?? []) if (m.state === 'needs-approval') reasons.push(...m.reasons);
+  // Weak or unmeasured tests need a person only where the project asks for a score (policy.mutationScore).
+  if (input.policy.mutationScore !== undefined)
+    for (const m of input.mutation ?? []) if (m.state !== 'pass') reasons.push(...m.reasons);
   for (const s of input.services) {
     if (s.change === 'deleted') reasons.push(`${s.name}: the service was deleted, with all its expectations`);
     if (s.guard === 'needs-human')
@@ -448,6 +560,34 @@ function renderMigrations(checks: MigrationCheck[]): string[] {
   return lines;
 }
 
+/** How well the tests catch bugs in the changed code; nothing when it was neither required nor measured. */
+function renderMutation(checks: MutationCheck[], threshold: number | undefined): string[] {
+  if (checks.length === 0) return [];
+  const pct = (n: number | null | undefined) => (n === null || n === undefined ? '-' : `${Math.round(n * 100)}%`);
+  const lines = [
+    `**Test strength** (bugs planted in the changed code that the tests caught${threshold !== undefined ? `; policy ${pct(threshold)}` : ''})`,
+    '',
+  ];
+  for (const m of checks) {
+    const state = {
+      pass: `✅ ${pct(m.score)} (${m.killed} of ${m.killed + m.survived})`,
+      below: `🟡 ${pct(m.score)} (${m.killed} of ${m.killed + m.survived}): below the policy`,
+      unmeasured: '⚪ not measured: no planted bug could be judged',
+      missing: '⚪ not measured',
+    }[m.state];
+    lines.push(`- ${mdText(m.service)}: ${state}`);
+    if (m.state === 'missing' || m.state === 'unmeasured') for (const r of m.reasons) lines.push(`  - ${mdText(r)}`);
+    // The change itself, not the whole line: `>=` → `>` at the place, and what scenario would have caught it.
+    for (const s of m.survivors.slice(0, 5))
+      lines.push(
+        `  - survived ${mdCode(`${s.file}:${s.line}`)}: ${mdCode(s.original)} → ${mdCode(s.replacement === '' ? '(removed)' : s.replacement)}${s.hint ? ` (${mdText(s.hint.replace(/^.*?: /, ''))})` : ''}`,
+      );
+    if (m.survivors.length > 5) lines.push(`  - … and ${m.survivors.length - 5} more survivors (see the details)`);
+  }
+  lines.push('');
+  return lines;
+}
+
 export function renderMarkdown(d: Decision): string {
   const banner =
     d.decision === 'merge'
@@ -476,6 +616,7 @@ export function renderMarkdown(d: Decision): string {
   }
   lines.push(...renderDeploy(d.deploy));
   lines.push(...renderMigrations(d.migrations ?? []));
+  lines.push(...renderMutation(d.mutation ?? [], d.policy.mutationScore));
   for (const s of d.services.filter((x) => x.failures.length > 0 || (x.gate !== 'pass' && x.gateDetail))) {
     lines.push(`**${mdText(s.name)}: what failed**`, '');
     if (s.gateDetail) lines.push(`- ${mdText(s.gateDetail)}`);
@@ -610,6 +751,20 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     if (touched.length > 0)
       migrations.push(judgeMigrations(name, touched, evidence.migrations.get(name), change.mergeBase, now));
   }
+  // Test strength: required with policy.mutationScore, shown whenever a service's changed source was measured.
+  const mutation: MutationCheck[] = [];
+  for (const { name } of affected.services) {
+    const report = evidence.mutation.get(name);
+    if (project.policy.mutationScore === undefined && !report) continue;
+    let sources: string[];
+    try {
+      sources = mutationSources(project, change, { name, paths: servicePathsOf(project, name) });
+    } catch {
+      sources = change.files; // an unreadable service.yaml: assume its code changed rather than skip the check
+    }
+    if (sources.length > 0)
+      mutation.push(judgeMutation(name, report, change.mergeBase, now, project.policy.mutationScore));
+  }
   const { decision, reasons } = decideFrom({
     affected: affected.services.map((s) => s.name),
     risk,
@@ -617,6 +772,7 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     services,
     deploy,
     migrations,
+    mutation,
   });
   const headSha = git(change.top, ['rev-parse', '--short', 'HEAD']).out.trim() || 'unknown';
   const dirty = git(change.top, ['status', '--porcelain']).out.trim() !== '';
@@ -632,6 +788,7 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     services,
     deploy,
     migrations,
+    mutation,
     knownFailures: services.flatMap((s) => s.knownFailures.map((k) => ({ ...k, service: s.name }))),
     changedFiles: change.files.length,
     detailsUrl: options.detailsUrl,

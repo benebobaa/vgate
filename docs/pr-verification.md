@@ -21,7 +21,11 @@ pull request
         ├─ needs-approval   one approval of the named reasons, then merge
         └─ blocked          the author (person or agent) fixes the change
 merge → deploy
+        ├─ smoke              vgate smoke, against the deployed environment       read-only, writes refused
+        └─ canary             vgate canary, while the new version takes traffic   breach -> rollback, once
 ```
+
+After the merge, `vgate smoke` and `vgate canary` verify the deployed version: [after-deploy.md](after-deploy.md).
 
 vgate does not replace the static checks and unit tests a team already runs: keep them as required checks next to
 vgate's `verdict`. It replaces the two human steps: reading the code to see whether it does what it should, and
@@ -182,5 +186,18 @@ spent per pull request, and the share of pull requests decided `merge`.
   every change to the expectations asks one.
 - The decision covers the services vgate knows. Code outside any service's `paths` (a frontend, a CLI, scripts) is
   judged only by its risk tier and your other checks.
-- A green gate means the scenarios passed. How strong the scenarios are shows in coverage today; a mutation score
-  (bugs planted to see whether the tests catch them) is planned.
+- A green gate means the scenarios passed. Coverage shows which documented responses they reach; how strong they are
+  shows in the mutation score (below), when the project measures it.
+
+## Test strength
+
+Coverage shows a line ran; it cannot show a test would notice the line going wrong. With `policy.mutationScore` in
+vgate.yaml, the gate job also runs `vgate mutate --service <s> --base <base>`. It plants small bugs in the lines the pull
+request changed, reruns the service's tests against each, and scores how many they catch. `decide` reads the
+evidence:
+
+- below the threshold, unmeasured or missing evidence → **needs-approval**, with each surviving bug and the scenario
+  that would catch it in the comment;
+- never blocked: it measures the tests, not the code.
+
+See [mutation.md](mutation.md).

@@ -7,6 +7,7 @@ import { signWebhook, type SignOptions } from '../webhooks/sign.ts';
 import type { OpenApiContract } from './openapi.ts';
 import { checkDatetimeOffsets, checkHeaders } from './rules.ts';
 import { isEventStream, isMarkerOnly, parseSse, SseParser, terminalOf, type SseEvent } from './sse.ts';
+import { guardWrite } from './write-guard.ts';
 
 // ---- Types derived from openapi-typescript's `paths` ------------------------------------------------------------
 
@@ -379,13 +380,21 @@ export class ApiClient<P = Record<string, unknown>> {
   }
 
   private async prepare(
+    method: string,
     template: string,
     options: CallOptions<unknown, object, object>,
     auth: AuthHeaders,
     extra: Record<string, string> = {},
   ): Promise<Prepared> {
+    // Before anything is sent, even a login: a shared environment is read, never written (write-guard.ts). Judged on
+    // what goes out: the filled-in path (no `..` past the operation) and any method-override header.
+    const path = expandPath(template, options.params);
+    guardWrite(this.svc.env, method, template, this.svc.schemathesis, {
+      path,
+      headers: { ...extra, ...options.headers },
+    });
     const query = queryString(options.invalidQuery ?? options.query);
-    const url = `${this.svc.env.baseUrl}${expandPath(template, options.params)}${query}`;
+    const url = `${this.svc.env.baseUrl}${path}${query}`;
     const origin = options.origin === null ? undefined : (options.origin ?? this.svc.env.origin);
     const headers: Record<string, string> = {
       ...(await auth()),
@@ -477,7 +486,9 @@ export class ApiClient<P = Record<string, unknown>> {
     options: CallOptions<unknown, object, object>,
     auth: AuthHeaders,
   ): Promise<StreamResult<O>> {
-    const { url, origin, headers, data } = await this.prepare(template, options, auth, { Accept: 'text/event-stream' });
+    const { url, origin, headers, data } = await this.prepare(method, template, options, auth, {
+      Accept: 'text/event-stream',
+    });
     const rules = this.streaming(method, template);
     const timeoutMs = options.eventTimeoutMs ?? rules.eventTimeoutMs;
     const controller = new AbortController();
@@ -598,7 +609,7 @@ export class ApiClient<P = Record<string, unknown>> {
     options: CallOptions<unknown, object, object>,
     auth: AuthHeaders,
   ): Promise<ApiResult<O>> {
-    const { url, origin, headers, data } = await this.prepare(template, options, auth);
+    const { url, origin, headers, data } = await this.prepare(method, template, options, auth);
 
     const started = Date.now();
     const response = await this.request.fetch(url, { method, headers, data, failOnStatusCode: false, maxRedirects: 0 });

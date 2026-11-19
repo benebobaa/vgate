@@ -1,4 +1,4 @@
-import type { KeycloakConfig } from '../config.ts';
+import type { EnvironmentConfig, KeycloakConfig } from '../config.ts';
 
 interface CachedToken {
   token: string;
@@ -101,7 +101,8 @@ export class Keycloak {
 
   private async adminToken(): Promise<string> {
     const admin = this.cfg.admin;
-    if (!admin) throw new Error('This environment has no keycloak.admin: users cannot be provisioned here');
+    if (!admin)
+      throw new Error('This environment has no keycloak.admin, or is not disposable: users cannot be provisioned here');
     if (this.adminCache && this.adminCache.exp - 30 > Date.now() / 1000) return this.adminCache.token;
     const token = await this.tokenRequest(
       `${this.cfg.url}/realms/${admin.realm ?? 'master'}/protocol/openid-connect/token`,
@@ -188,4 +189,9 @@ export class Keycloak {
     for (const id of [...this.created]) await this.deleteUser(id);
     for (const id of [...this.createdClients]) await this.deleteClient(id);
   }
+}
+
+/** An environment's Keycloak. Provisioning writes users into the realm: only where the environment is disposable. */
+export function keycloakOf(env: Pick<EnvironmentConfig, 'disposable'> & { keycloak: KeycloakConfig }): Keycloak {
+  return new Keycloak(env.disposable ? env.keycloak : { ...env.keycloak, admin: undefined });
 }

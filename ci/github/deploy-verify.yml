@@ -1,0 +1,160 @@
+# vgate after a deploy: copied into a project's .github/workflows/ by `vgate init --ci github` (docs/after-deploy.md).
+#
+#   deployment_status  a deployment reported success to an environment listed in the repository variable
+#                      VGATE_DEPLOY_ENVIRONMENTS (default: staging production): smoke the environment, then watch the
+#                      canary (when service.yaml configures one for it); on failure run the rollback command
+#                      (repository variable VGATE_ROLLBACK_COMMAND), once. Other environments are never verified: a
+#                      pull request's preview deployment (from a fork too) names a commit nobody reviewed, and this
+#                      workflow runs that commit's tests with the environment's credentials
+#   workflow_dispatch  the same, by hand, for one environment
+#   schedule           a probe: smoke only, every hour, of the environment named in VGATE_PROBE_ENVIRONMENT (off
+#                      while that variable is empty); never a rollback
+#
+# The GitHub environment and the service.yaml environment share one name (staging, production). Its credentials come
+# from one secret of that GitHub environment, VGATE_ENV: KEY=value lines (the ${VAR}s its service.yaml names). In an
+# environment that is not disposable, vgate refuses every request of the tests' clients that is not read-only before it
+# is sent (docs/after-deploy.md says which doors it guards).
+name: vgate after deploy
+
+on:
+  deployment_status:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: The environment to verify (service.yaml environment and GitHub environment)
+        required: true
+        default: staging
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vgate-after-deploy-${{ github.event.deployment.environment || inputs.environment || vars.VGATE_PROBE_ENVIRONMENT }}
+  cancel-in-progress: false
+
+env:
+  # Where vgate.yaml sits, relative to the repository root.
+  VGATE_PROJECT_DIR: .
+  VGATE_BASE_URL: https://vgate.benelabs.tech
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    # A deployment that did not succeed has nothing to verify; a probe with no environment named is off.
+    if: >-
+      (github.event_name == 'deployment_status' && github.event.deployment_status.state == 'success' &&
+      contains(format(' {0} ', vars.VGATE_DEPLOY_ENVIRONMENTS || 'staging production'),
+      format(' {0} ', github.event.deployment.environment))) ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && vars.VGATE_PROBE_ENVIRONMENT != '')
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.deployment.environment || inputs.environment || vars.VGATE_PROBE_ENVIRONMENT }}
+    env:
+      VGATE_ENVIRONMENT: ${{ github.event.deployment.environment || inputs.environment || vars.VGATE_PROBE_ENVIRONMENT }}
+      VGATE_EVENT: ${{ github.event_name }}
+      VGATE_CANARY_FOR: ${{ vars.VGATE_CANARY_FOR || '10m' }}
+      VGATE_CANARY_EVERY: ${{ vars.VGATE_CANARY_EVERY || '30s' }}
+      VGATE_ROLLBACK_COMMAND: ${{ vars.VGATE_ROLLBACK_COMMAND }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The commit that was deployed, not whatever main is now.
+          ref: ${{ github.event.deployment.sha || github.sha }}
+          # The tests run with the environment's credentials: they get no token to the repository besides.
+          persist-credentials: false
+      - name: Environment name
+        run: |
+          case "$VGATE_ENVIRONMENT" in
+            '' | *[!A-Za-z0-9._-]*) echo "::error::not an environment name: '$VGATE_ENVIRONMENT'"; exit 1 ;;
+          esac
+      - name: Credentials of the environment
+        env:
+          VGATE_ENV: ${{ secrets.VGATE_ENV }}
+        run: |
+          # KEY=value lines, one per variable; anything else is refused rather than written to the job's environment.
+          [ -z "$VGATE_ENV" ] && exit 0
+          printf '%s\n' "$VGATE_ENV" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in
+              [A-Za-z_]*=*) key=${line%%=*}; case "$key" in *[!A-Za-z0-9_]*) echo "::error::bad key in VGATE_ENV"; exit 1 ;; esac ;;
+              *) echo "::error::VGATE_ENV holds a line that is not KEY=value"; exit 1 ;;
+            esac
+            printf '%s\n' "$line" >>"$GITHUB_ENV"
+          done
+      - id: pin
+        name: Read the pinned vgate version
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: |
+          version=$(sed -n "s/^version:[[:space:]]*['\"]\{0,1\}\([0-9][0-9A-Za-z.-]*\).*/\1/p" vgate.yaml | head -1)
+          if [ -z "$version" ]; then echo "::error file=vgate.yaml::no 'version: x.y.z' in vgate.yaml"; exit 1; fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+      - name: Install vgate
+        env:
+          VGATE_VERSION: ${{ steps.pin.outputs.version }}
+        run: |
+          curl -fsSL "$VGATE_BASE_URL/install.sh" | VGATE_INSTALL_DIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/vgate
+          key: vgate-${{ steps.pin.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Tools
+        run: corepack enable pnpm
+      - name: Smoke, canary, rollback
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: |
+          status=0
+          rm -rf reports
+          vgate doctor --fix --env "$VGATE_ENVIRONMENT" >/dev/null || true
+          # No service read is a failure: a run that verified nothing never reads as a pass.
+          listed=$(vgate services --json | jq -r '.data.services[]') || listed=''
+          services=()
+          while IFS= read -r service; do [ -n "$service" ] && services+=("$service"); done <<<"$listed"
+          if [ ${#services[@]} -eq 0 ]; then echo "::error::vgate services listed no service: nothing was verified"; exit 1; fi
+          rollback=''
+          for service in "${services[@]}"; do
+            if vgate smoke --service "$service" --env "$VGATE_ENVIRONMENT" --json >"$RUNNER_TEMP/smoke-$service.json"; then :; else status=1 rollback=1; fi
+            jq -r --arg s "$service" '"- **\($s)** smoke: \(.summary)"' "$RUNNER_TEMP/smoke-$service.json" >>"$GITHUB_STEP_SUMMARY" || true
+            mkdir -p "reports/after-deploy/$service" && cp reports/smoke.json "reports/after-deploy/$service/" 2>/dev/null || true
+          done
+          # A canary is watched after a deploy only, never on a scheduled probe, and only where service.yaml names one.
+          if [ "$VGATE_EVENT" != schedule ] && [ $status -eq 0 ]; then
+            for service in "${services[@]}"; do
+              set +e
+              vgate canary --service "$service" --env "$VGATE_ENVIRONMENT" --for "$VGATE_CANARY_FOR" \
+                --every "$VGATE_CANARY_EVERY" ${VGATE_ROLLBACK_COMMAND:+--on-fail "$VGATE_ROLLBACK_COMMAND"} \
+                --json >"$RUNNER_TEMP/canary-$service.json"
+              code=$?
+              set -e
+              # Exit 2 with no canary configured for this service and environment: nothing to watch. Any other
+              # wrong call (a bad VGATE_CANARY_FOR, say) fails the run rather than skipping the watch.
+              if [ $code -eq 2 ] && jq -e '.summary | test("has no environments\\.[^ ]*\\.canary")' \
+                "$RUNNER_TEMP/canary-$service.json" >/dev/null 2>&1; then continue; fi
+              [ $code -ne 0 ] && status=1
+              jq -r --arg s "$service" '"- **\($s)** canary: \(.summary)"' "$RUNNER_TEMP/canary-$service.json" >>"$GITHUB_STEP_SUMMARY" || true
+              # The canary ran the rollback itself: do not run it a second time below.
+              [ $code -eq 1 ] && rolled=1
+            done
+          fi
+          # A failed smoke after a deploy rolls back too (once), when a rollback command is configured. A canary that
+          # could not read its metrics (exit 3) fails the run but never rolls back: it says nothing about the version.
+          if [ -n "$rollback" ] && [ "$VGATE_EVENT" != schedule ] && [ -n "$VGATE_ROLLBACK_COMMAND" ] && [ -z "${rolled:-}" ]; then
+            echo "- rollback: running \`VGATE_ROLLBACK_COMMAND\`" >>"$GITHUB_STEP_SUMMARY"
+            sh -c "$VGATE_ROLLBACK_COMMAND" || echo "::error::the rollback command failed"
+          fi
+          exit $status
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vgate-after-deploy-${{ github.run_id }}
+          path: ${{ env.VGATE_PROJECT_DIR }}/reports/
+          retention-days: 14
+          if-no-files-found: ignore

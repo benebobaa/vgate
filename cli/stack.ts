@@ -71,8 +71,9 @@ export async function stack(project: ProjectConfig, runtime: Runtime, options: S
 
   // A declared environment (service.yaml `environment:`) is started by vgate itself, sealed and per run.
   let declared: ServiceConfig | undefined;
+  let loaded: ServiceConfig | undefined;
   try {
-    const svc = loadService(service, options.env, root);
+    const svc = (loaded = loadService(service, options.env, root));
     if (svc.environment) declared = svc;
   } catch (error) {
     if (!existsSync(join(project.servicesDir, service, 'stack.sh'))) {
@@ -86,6 +87,12 @@ export async function stack(project: ProjectConfig, runtime: Runtime, options: S
       };
     }
   }
+  // A shared environment (staging, production) is never wiped, whatever its stack.sh would do with TEST_ENV.
+  if (action === 'reset' && loaded?.env.disposable !== true)
+    throw new UsageError(
+      `reset wipes data: environment ${options.env} of ${service} is not disposable` +
+        (loaded ? '' : ' (its service.yaml did not load)'),
+    );
   if (declared) return declaredStack(project, declared, options);
 
   const script = relative(root, join(project.servicesDir, service, 'stack.sh'));

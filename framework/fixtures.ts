@@ -1,12 +1,13 @@
 import { resolve } from 'node:path';
 import { test as base, expect } from '@playwright/test';
 import { Auth } from './auth/auth.ts';
-import { Keycloak } from './auth/keycloak.ts';
+import { keycloakOf, type Keycloak } from './auth/keycloak.ts';
 import { loadService, reportsDir, type ServiceConfig } from './config.ts';
 import { newRunId, uniqueFactory } from './data/unique.ts';
 import { Db } from './db/postgres.ts';
 import { ComposeFaults } from './faults/compose.ts';
 import { ApiClient, CallRecorder } from './http/client.ts';
+import { guardRequest, unguarded } from './http/write-guard.ts';
 import { loadContract, type OpenApiContract } from './http/openapi.ts';
 import { annotationFor, loadRegistry, lookup, today, type KnownFailure } from './known-failures.ts';
 
@@ -67,7 +68,7 @@ export function createTest<P>() {
     kc: [
       async ({ svc }, use) => {
         if (!svc.env.keycloak) throw new Error(`Environment ${svc.env.name} of ${svc.name} has no keycloak configured`);
-        const kc = new Keycloak(svc.env.keycloak);
+        const kc = keycloakOf({ ...svc.env, keycloak: svc.env.keycloak });
         await use(kc);
         await kc.cleanup();
       },
@@ -76,7 +77,8 @@ export function createTest<P>() {
     db: [
       async ({ svc }, use) => {
         if (!svc.env.db) throw new Error(`Environment ${svc.env.name} of ${svc.name} has no db configured`);
-        const db = new Db(svc.env.db);
+        // A shared environment's database is read, never written: its sessions are read-only.
+        const db = new Db(svc.env.db, { readOnly: !svc.env.disposable });
         await use(db);
         await db.close();
       },
@@ -112,10 +114,15 @@ export function createTest<P>() {
       },
       { auto: true },
     ],
+    // Playwright's own request context, behind the write guard: a test that skips the client is held to the same rule.
+    request: async ({ request, svc }, use) => {
+      await use(guardRequest(request, svc.env, svc.schemathesis));
+    },
     api: async ({ request, svc, contract, auth }, use, testInfo) => {
       const observed = resolve(reportsDir, 'observed', `${process.env.RUN_ID ?? 'run'}-w${testInfo.workerIndex}.jsonl`);
       const recorder = new CallRecorder(observed, testInfo.titlePath.slice(1).join(' > '));
-      await use(new ApiClient<P>(request, svc, contract, auth, recorder));
+      // The client guards each call by its operation itself (allowWrites and readOnlyPaths name templates).
+      await use(new ApiClient<P>(unguarded(request), svc, contract, auth, recorder));
       if (testInfo.status !== testInfo.expectedStatus && recorder.calls.length > 0) {
         await testInfo.attach('http-calls.json', {
           body: JSON.stringify(recorder.calls, null, 2),

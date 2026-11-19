@@ -159,6 +159,16 @@ vgate:gate:$[[ inputs.service ]]:
           "$VGATE_TMP/migrations.json" > "vgate-evidence/$SERVICE/migrations.json" 2>/dev/null \
           || rm -f "vgate-evidence/$SERVICE/migrations.json"
       fi
+      # Mutation score, when vgate.yaml sets policy.mutationScore (a rebuild per mutant): do the tests catch bugs in the
+      # lines this change wrote? decide reads the evidence; a low score asks for a human, never blocks.
+      if [ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" ] && grep -Eq '^[^#]*mutationScore['\''"]?[[:space:]]*:' "$CI_PROJECT_DIR/vgate.yaml"; then
+        vgate mutate --root "$CI_PROJECT_DIR" --service "$SERVICE" --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" \
+          --json > "$VGATE_TMP/mutation.json"
+        jq -r '.summary' "$VGATE_TMP/mutation.json" 2>/dev/null || true
+        jq -e --arg s "$SERVICE" '.data | select(.schema == "vgate.mutation/1" and .service == $s)' \
+          "$VGATE_TMP/mutation.json" > "vgate-evidence/$SERVICE/mutation.json" 2>/dev/null \
+          || rm -f "vgate-evidence/$SERVICE/mutation.json"
+      fi
       exit $status
   artifacts:
     when: always
