@@ -90,7 +90,7 @@ describe('after-deploy workflow', { skip }, () => {
 });
 
 // The gate job's mutation step: it runs `vgate mutate` when vgate.yaml sets policy.mutationScore, in any YAML style.
-const gate = (parse(read('github/vgate.yml')) ?? { jobs: {} }) as {
+const gate = (parse(read('github/vgate.yml')) ?? { jobs: { gate: { steps: [] } } }) as {
   jobs: { gate: { steps: Array<{ name?: string; run?: string }> } };
 };
 const mutationStep = gate.jobs.gate.steps.find((step) => step.name === 'Mutation score')?.run ?? '';
