@@ -81,6 +81,18 @@ const error = res.expectError(409, 'idempotency_conflict');  // asserts status (
 expect(error.message).toContain('Idempotency-Key');
 ```
 
+The code is read from `rules.envelope.codeField` and the data from `dataField`, each a dotted path (`error.code`,
+`result.data`). The envelope is runtime config, so the types learn where the data sits from the second parameter of
+`createTest` (and `createDepsTest`, `createUiTest`): `null` when the service has no envelope or no `dataField`, the
+`dataField` path when it has one. Left out, `expectSuccess` is typed as the body's `data` field when the contract
+types one and as the whole body otherwise, which is wrong for a service without an envelope whose body has a `data`
+field. Declare it when you onboard the service, and use the same parameter on helpers typed `ApiClient<paths, ...>`:
+
+```ts
+export const test = createTest<paths, null>();            // no envelope: expectSuccess returns the body
+export const test = createTest<paths, 'result.data'>();   // dataField: result.data
+```
+
 Assertion messages already include the method, path, status, X-Request-Id and the body, so a failure is traceable in
 the backend's logs.
 

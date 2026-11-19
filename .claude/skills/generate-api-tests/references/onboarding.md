@@ -33,10 +33,10 @@ backend:
   syncedCommit: <short sha>
 
 rules:
-  envelope:            # only if responses share an envelope such as { code, message, data }
-    codeField: code
-    dataField: data
-    successCode: <code of a success>
+  envelope:            # only if responses carry a code, such as { code, message, data } or { error: { code } }
+    codeField: code    # a dotted path into the body: error.code reads { "error": { "code": ... } }
+    dataField: data    # dotted too (result.data); leave out when a success body is the data itself
+    successCode: <code of a success>   # leave out when only errors carry a code
     codePattern: '<regex that finds codes in response descriptions>'
   datetimeOffset: 'Z'               # only if a source fixes the offset
   strictResponseProperties: true    # undocumented response fields fail the gate
@@ -94,7 +94,9 @@ What the service talks to:
 
 - Headers that the security configuration or framework defaults put on every response (check the configuration,
   then confirm the header name and value with one call: a confirmation, not a source).
-- The envelope from the shared response types.
+- The envelope from the shared response types, including where an error's code sits (`error.code`), so
+  `expectError(status, code)` checks it and coverage counts each documented code. Declare the same data path in
+  `support/fixtures.ts` (test-conventions.md, "Asserting") so `expectSuccess` is typed by it.
 - The datetime offset from the README or the time configuration.
 - The stream terminal from the provider style the API mirrors and its docs.
 - A response code that only the implementation can produce under a broken environment goes to `coverage.exclude`.

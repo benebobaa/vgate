@@ -23,6 +23,7 @@ import { MongoDocs } from './mongo.ts';
 import { MySqlDb } from './mysql.ts';
 import { S3Store } from './s3.ts';
 import { SqsQueues } from './sqs.ts';
+import type { DataPath } from '../http/client.ts';
 
 export interface CatalogWorkerFixtures {
   inbox: Inbox;
@@ -36,8 +37,9 @@ export interface CatalogWorkerFixtures {
 // The environment's dependencies, with the catalog's kinds among them (parsed by deps/config.ts).
 type Deps = Record<string, { kind: string } | CatalogDependency>;
 
-export function createCatalogTest<P>() {
-  return createDepsTest<P>().extend<object, CatalogWorkerFixtures>({
+/** `D` is createTest's: where the envelope's success data sits, for the type of `expectSuccess`. */
+export function createCatalogTest<P, D extends DataPath = undefined>() {
+  return createDepsTest<P, D>().extend<object, CatalogWorkerFixtures>({
     inbox: [
       async ({ svc }, use) => {
         const [name, dep] = soleEntryOf((svc.env.dependencies ?? {}) as Deps, ['mailpit'], 'inbox', svc.env.name);

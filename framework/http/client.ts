@@ -50,8 +50,31 @@ export type SuccessBody<O> = {
 export type ErrorBody<O> = {
   [S in Exclude<keyof Responses<O>, SuccessStatus>]: ContentOf<Responses<O>[S]>;
 }[Exclude<keyof Responses<O>, SuccessStatus>];
-/** The envelope's data of a success response (or the whole body for services without an envelope). */
-export type SuccessData<O> = NonNullable<SuccessBody<O>> extends { data?: infer D } ? NonNullable<D> : SuccessBody<O>;
+/**
+ * Where a service's success data sits, for the types: the envelope's `dataField` (`data`, `result.data`), `null` for a
+ * service whose success body is the data itself, or `undefined` (the default) for a service that does not say.
+ */
+export type DataPath = string | null | undefined;
+type Step<T, K extends string> = T extends object ? (K extends keyof T ? T[K] : unknown) : unknown;
+/** The type at a dotted path, step by step as `field` reads it; unknown where the contract types no such field. */
+type At<T, Path extends string> = Path extends `${infer Head}.${infer Rest}`
+  ? At<NonNullable<Step<NonNullable<T>, Head>>, Rest>
+  : Step<NonNullable<T>, Path>;
+/** T without null and undefined, but unknown stays unknown (NonNullable would make it `{}`, a promise of an object). */
+type Defined<T> = unknown extends T ? unknown : NonNullable<T>;
+/**
+ * What `expectSuccess` returns, given where the data sits (DataPath). The service's envelope is runtime config
+ * (service.yaml), so the types only know it when the service's `createTest<paths, D>()` declares it. Undeclared, the
+ * type guesses as it always has: the body's `data` when the contract types one, else the whole body. That guess is
+ * wrong for a service without an envelope whose body has a `data` field, and for a dataField other than `data`.
+ */
+export type SuccessData<O, D extends DataPath = undefined> = [D] extends [undefined]
+  ? NonNullable<SuccessBody<O>> extends { data?: infer Data }
+    ? NonNullable<Data>
+    : SuccessBody<O>
+  : [D] extends [string]
+    ? Defined<At<SuccessBody<O>, D>>
+    : SuccessBody<O>;
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
 
@@ -180,11 +203,22 @@ export function queryString(query: object | undefined): string {
   return text ? `?${text}` : '';
 }
 
-function field(body: unknown, name: string): unknown {
-  return body && typeof body === 'object' ? (body as Record<string, unknown>)[name] : undefined;
+/**
+ * The value at a dotted path of a response body: `code` is `body.code`, `error.code` is `body.error.code`. A step that
+ * is missing or not an object gives undefined rather than throwing, because an error body (a gateway's HTML page, an
+ * empty 502) need not have the envelope's shape. Every dot separates two steps, so a key that itself contains a dot
+ * cannot be named; no envelope we know of uses one.
+ */
+function field(body: unknown, path: string): unknown {
+  let value = body;
+  for (const name of path.split('.')) {
+    if (!value || typeof value !== 'object') return undefined;
+    value = (value as Record<string, unknown>)[name];
+  }
+  return value;
 }
 
-export class ApiResult<O = unknown> {
+export class ApiResult<O = unknown, D extends DataPath = undefined> {
   /** The events of a `text/event-stream` response, in order; empty for other responses. */
   events: SseEvent[] = [];
 
@@ -213,12 +247,18 @@ export class ApiResult<O = unknown> {
     return `${this.method} ${this.path} -> ${this.status} [X-Request-Id ${this.requestId ?? '-'}] ${this.text.slice(0, 600)}`;
   }
 
-  /** Asserts a 2xx answer (and the envelope's success code); returns the envelope data. */
-  expectSuccess(status = 200): SuccessData<O> {
+  /**
+   * Asserts a 2xx answer (and the envelope's success code, when it has one); returns the envelope's data, or the whole
+   * body when the service has no envelope or its envelope names no dataField.
+   */
+  expectSuccess(status = 200): SuccessData<O, D> {
     expect(this.status, this.describe()).toBe(status);
-    if (!this.envelope) return this.body;
-    expect(this.code, this.describe()).toBe(this.envelope.successCode);
-    return field(this.body, this.envelope.dataField) as SuccessData<O>;
+    const envelope = this.envelope;
+    // An envelope may carry codes on errors only (`{ error: { code } }`): then a success carries no code at all, and a
+    // 2xx that does (an error body sent with 200) is not a success.
+    if (envelope) expect(this.code, this.describe()).toBe(envelope.successCode);
+    const data = envelope?.dataField === undefined ? this.body : field(this.body, envelope.dataField);
+    return data as SuccessData<O, D>;
   }
 
   /** The JSON data of every event (non-JSON markers such as `[DONE]` left out). */
@@ -235,7 +275,7 @@ export class ApiResult<O = unknown> {
 }
 
 /** A response read as a stream: its events, when each arrived, and how it ended. */
-export class StreamResult<O = unknown> extends ApiResult<O> {
+export class StreamResult<O = unknown, D extends DataPath = undefined> extends ApiResult<O, D> {
   /** True when the stream ended the way the contract says a stream ends (`ending` is `terminal`). */
   complete = false;
   ending: StreamEnding = 'terminal';
@@ -247,9 +287,9 @@ export class StreamResult<O = unknown> extends ApiResult<O> {
  * One caller identity. `get`, `post`, `put`, `patch` and `delete` are typed by the contract (path, path and query
  * parameters, body, response); `send` is the untyped escape hatch for calls outside it.
  */
-export class Caller<P> {
+export class Caller<P, D extends DataPath = undefined> {
   constructor(
-    private readonly client: ApiClient<P>,
+    private readonly client: ApiClient<P, D>,
     private readonly auth: AuthHeaders,
   ) {}
 
@@ -273,7 +313,7 @@ export class Caller<P> {
     return this.client.call<OpOf<P, K, 'delete'>>('DELETE', path, options, this.auth);
   }
 
-  send(method: HttpMethod, path: string, options: CallOptions = {}): Promise<ApiResult<unknown>> {
+  send(method: HttpMethod, path: string, options: CallOptions = {}): Promise<ApiResult<unknown, D>> {
     return this.client.call<unknown>(method, path, options, this.auth);
   }
 
@@ -286,12 +326,12 @@ export class Caller<P> {
     method: M,
     path: K,
     options: OptionsOf<OpOf<P, K, M>> = {},
-  ): Promise<StreamResult<OpOf<P, K, M>>> {
+  ): Promise<StreamResult<OpOf<P, K, M>, D>> {
     return this.client.stream<OpOf<P, K, M>>(method.toUpperCase() as HttpMethod, path, options, this.auth);
   }
 
   /** The untyped `stream`, for calls outside the typed contract. */
-  sendStream(method: HttpMethod, path: string, options: CallOptions = {}): Promise<StreamResult<unknown>> {
+  sendStream(method: HttpMethod, path: string, options: CallOptions = {}): Promise<StreamResult<unknown, D>> {
     return this.client.stream<unknown>(method, path, options, this.auth);
   }
 }
@@ -310,9 +350,10 @@ interface Prepared {
 
 /**
  * Calls the service under test and holds every response to the contract: documented status, response schema,
- * header rules and datetime offsets. A violation fails the test with the full list.
+ * header rules and datetime offsets. A violation fails the test with the full list. `D` types what `expectSuccess`
+ * returns (SuccessData); it must say what the service's `rules.envelope.dataField` says.
  */
-export class ApiClient<P = Record<string, unknown>> {
+export class ApiClient<P = Record<string, unknown>, D extends DataPath = undefined> {
   constructor(
     private readonly request: APIRequestContext,
     private readonly svc: ServiceConfig,
@@ -325,7 +366,7 @@ export class ApiClient<P = Record<string, unknown>> {
    * A seeded user from service.yaml (password, token or anonymous, see Auth). A session user shares one login per
    * worker; `newSession` gives this caller its own, for a test that logs out or revokes sessions.
    */
-  as(user: string, options: { newSession?: boolean } = {}): Caller<P> {
+  as(user: string, options: { newSession?: boolean } = {}): Caller<P, D> {
     return new Caller(this, this.auth.forUser(user, options));
   }
 
@@ -333,21 +374,21 @@ export class ApiClient<P = Record<string, unknown>> {
   asCredentials(
     credentials: { username: string; password: string },
     options: { newSession?: boolean } = {},
-  ): Caller<P> {
+  ): Caller<P, D> {
     return new Caller(this, this.auth.forCredentials(credentials, options));
   }
 
   /** A session cookie the test obtained itself (from a login it made), with its CSRF token when the service uses one. */
-  asSession(cookie: string, csrf?: string): Caller<P> {
+  asSession(cookie: string, csrf?: string): Caller<P, D> {
     return new Caller(this, this.auth.forSession(cookie, csrf));
   }
 
   /** A token the test obtained itself, sent the way the environment's `auth` says. */
-  asToken(token: string): Caller<P> {
+  asToken(token: string): Caller<P, D> {
     return new Caller(this, this.auth.forToken(token));
   }
 
-  anonymous(): Caller<P> {
+  anonymous(): Caller<P, D> {
     return new Caller(this, () => Promise.resolve({}));
   }
 
@@ -356,7 +397,7 @@ export class ApiClient<P = Record<string, unknown>> {
    * config names, and holds the answer to the contract. `timestamp`, `secret`, `unsigned` and `bodyAfterSigning`
    * build the deliveries a verifier must refuse (old, forged, unsigned, tampered).
    */
-  async webhook(name: string, payload: unknown, options: WebhookOptions = {}): Promise<ApiResult<unknown>> {
+  async webhook(name: string, payload: unknown, options: WebhookOptions = {}): Promise<ApiResult<unknown, D>> {
     const cfg = this.svc.env.webhooks?.[name];
     if (!cfg) {
       throw new Error(
@@ -412,10 +453,10 @@ export class ApiClient<P = Record<string, unknown>> {
   }
 
   /** Every check of one response: contract (per event for a stream), header rules, datetime offsets. */
-  private violations(
+  private violations<O>(
     method: string,
     template: string,
-    result: ApiResult<unknown>,
+    result: ApiResult<O, D>,
     origin: string | undefined,
     stream?: { ending: StreamEnding; allowIncomplete?: boolean; partial: boolean; timeoutMs: number },
   ): string[] {
@@ -473,7 +514,7 @@ export class ApiClient<P = Record<string, unknown>> {
     };
   }
 
-  private check(violations: string[], method: string, template: string, result: ApiResult<unknown>): void {
+  private check<O>(violations: string[], method: string, template: string, result: ApiResult<O, D>): void {
     expect(
       violations,
       `Contract violations: ${method} ${template} -> ${result.status} [X-Request-Id ${result.requestId ?? '-'}]`,
@@ -485,7 +526,7 @@ export class ApiClient<P = Record<string, unknown>> {
     template: string,
     options: CallOptions<unknown, object, object>,
     auth: AuthHeaders,
-  ): Promise<StreamResult<O>> {
+  ): Promise<StreamResult<O, D>> {
     const { url, origin, headers, data } = await this.prepare(method, template, options, auth, {
       Accept: 'text/event-stream',
     });
@@ -570,7 +611,7 @@ export class ApiClient<P = Record<string, unknown>> {
         : sawTerminal || !terminals?.length
           ? 'terminal'
           : 'closed';
-    const result = new StreamResult<O>(
+    const result = new StreamResult<O, D>(
       method,
       template,
       response.status,
@@ -614,7 +655,7 @@ export class ApiClient<P = Record<string, unknown>> {
     template: string,
     options: CallOptions<unknown, object, object>,
     auth: AuthHeaders,
-  ): Promise<ApiResult<O>> {
+  ): Promise<ApiResult<O, D>> {
     const { url, origin, headers, data } = await this.prepare(method, template, options, auth);
 
     const started = Date.now();
@@ -624,7 +665,7 @@ export class ApiClient<P = Record<string, unknown>> {
     );
     const text = await response.text();
     const streaming = isEventStream(response.headers()['content-type']);
-    const result = new ApiResult<O>(
+    const result = new ApiResult<O, D>(
       method,
       template,
       response.status(),

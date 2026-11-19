@@ -193,6 +193,7 @@ describe('configRule', () => {
       datetimeOffset: '+01:00',
       headers: { always: { 'X-Request-Id': '/^.+$/' }, onStatus: { '401': { 'WWW-Authenticate': 'Bearer' } } },
       streaming: { terminal: [{ data: '[DONE]' }] },
+      envelope: { codeField: 'code', dataField: 'data', successCode: 'OK', codePattern: 'E\\d{3}' },
     },
     coverage: { exclude: [{ status: '500', reason: 'x' }] },
     schemathesis: {
@@ -269,6 +270,18 @@ describe('configRule', () => {
     ]);
   });
 
+  it('shows a changed envelope field or pattern as info, not a finding', () => {
+    const head = structuredClone(base) as any;
+    head.rules.envelope.codeField = 'error.code';
+    head.rules.envelope.codePattern = 'ORD\\d{3}';
+    const outcome = configRule('s', stringify(base), stringify(head));
+    assert.deepEqual(details(outcome), []);
+    assert.deepEqual(
+      infos(outcome).filter((d) => d.startsWith('rules.envelope')),
+      ['rules.envelope.codeField code -> error.code', 'rules.envelope.codePattern E\\d{3} -> ORD\\d{3}'],
+    );
+  });
+
   it('flags every loosening', () => {
     assert.deepEqual(
       rule((c) => c.coverage.exclude.push({ status: '503', reason: 'y' })),
@@ -281,6 +294,22 @@ describe('configRule', () => {
     assert.deepEqual(
       rule((c) => (c.rules.optionalPropertiesNullable = true)),
       ['rules.optionalPropertiesNullable turned on'],
+    );
+    assert.deepEqual(
+      rule((c) => delete c.rules.envelope.successCode),
+      ['rules.envelope.successCode removed (was OK)'],
+    );
+    assert.deepEqual(
+      rule((c) => delete c.rules.envelope.dataField),
+      ['rules.envelope.dataField removed (was data)'],
+    );
+    assert.deepEqual(
+      rule((c) => delete c.rules.envelope),
+      ['rules.envelope removed'],
+    );
+    assert.deepEqual(
+      rule((c) => (c.rules.envelope.successCode = null)),
+      ['rules.envelope.successCode removed (was OK)'],
     );
     assert.deepEqual(
       rule((c) => delete c.rules.datetimeOffset),

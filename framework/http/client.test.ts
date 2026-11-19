@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { request } from '@playwright/test';
 import { Auth } from '../auth/auth.ts';
-import type { EnvironmentConfig, ServiceConfig } from '../config.ts';
-import { ApiClient, CallRecorder, queryString } from './client.ts';
+import type { EnvelopeRules, EnvironmentConfig, ServiceConfig } from '../config.ts';
+import { ApiClient, ApiResult, CallRecorder, queryString, type SuccessData } from './client.ts';
 import { OpenApiContract } from './openapi.ts';
 import { installRawGuard } from './write-guard.ts';
 
@@ -32,6 +35,8 @@ const spec = {
       },
     },
     '/items/{id}': { delete: { responses: { '204': { description: 'Deleted' } } } },
+    // Answers errors the way many APIs do, as `{ error: { code, message } }`: the code is not a top-level field.
+    '/orders/{id}': { get: { responses: { '404': { description: 'ORD404 when there is no such order' } } } },
   },
   components: {
     schemas: {
@@ -53,6 +58,12 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   res.setHeader('X-Request-Id', '3f1c2b9e-0000-4000-8000-000000000000');
   if (req.headers['x-api-key'] !== 'k-reader') {
     res.writeHead(401).end();
+    return;
+  }
+  if (url.pathname.startsWith('/orders/')) {
+    res
+      .writeHead(404, { 'Content-Type': 'application/json' })
+      .end(JSON.stringify({ error: { code: 'ORD404', message: 'no such order' } }));
     return;
   }
   if (req.method === 'DELETE') {
@@ -224,3 +235,106 @@ describe('ApiClient', () => {
     await assert.rejects(auth.forUser('pw')(), /has no keycloak/);
   });
 });
+
+/** A response as the client builds it, without a server: the envelope rules are all that decide `code` and the data. */
+function result(status: number, body: unknown, envelope: EnvelopeRules) {
+  const text = body === undefined ? '' : typeof body === 'string' ? body : JSON.stringify(body);
+  return new ApiResult('GET', '/x', status, {}, text, body, envelope);
+}
+
+describe('ApiResult envelope fields', () => {
+  const nested = { codeField: 'status.code', dataField: 'result.data', successCode: 'OK', codePattern: 'E\\d{3}' };
+
+  it('reads a dotted codeField from the nested object, and expectError checks it', () => {
+    const res = result(404, { status: { code: 'E404' } }, nested);
+    assert.equal(res.code, 'E404');
+    assert.deepEqual(res.expectError(404, 'E404'), { status: { code: 'E404' } });
+    assert.throws(() => res.expectError(404, 'E500'), /E500/);
+  });
+
+  it('gives no code, and never throws, when a step of the path is missing or not an object', () => {
+    for (const body of [{}, { status: null }, { status: 'E404' }, { status: { other: 1 } }, 'not json', undefined]) {
+      const res = result(404, body, nested);
+      assert.equal(res.code, undefined, JSON.stringify(body));
+      assert.doesNotThrow(() => res.expectError(404));
+      assert.throws(() => res.expectError(404, 'E404'));
+    }
+  });
+
+  it('returns the dotted dataField from expectSuccess, after checking the nested success code', () => {
+    const body = { status: { code: 'OK' }, result: { data: { id: '1' } } };
+    assert.deepEqual(result(200, body, nested).expectSuccess(), { id: '1' });
+    assert.throws(() => result(200, { ...body, status: { code: 'E500' } }, nested).expectSuccess(), /OK/);
+  });
+
+  it('reads a top-level field name exactly as before', () => {
+    const flat = { codeField: 'code', dataField: 'data', successCode: 'OK', codePattern: 'E\\d{3}' };
+    const res = result(200, { code: 'OK', data: { id: '1' } }, flat);
+    assert.equal(res.code, 'OK');
+    assert.deepEqual(res.expectSuccess(), { id: '1' });
+    assert.equal(result(400, { code: 7 }, flat).code, undefined, 'a code that is not a string is no code');
+    assert.equal(result(400, ['E400'], flat).code, undefined);
+  });
+
+  it('with only a codeField, holds a success to its status and returns the whole body', () => {
+    // An API whose errors carry `{ error: { code } }` and whose successes are the resource itself.
+    const errorsOnly = { codeField: 'error.code', codePattern: 'ORD\\d{3}' };
+    assert.deepEqual(result(200, { id: '1' }, errorsOnly).expectSuccess(), { id: '1' });
+    assert.equal(result(404, { error: { code: 'ORD404' } }, errorsOnly).code, 'ORD404');
+  });
+
+  it('with only a codeField, refuses a 2xx that carries an error code', () => {
+    // An error body sent with 200 is not a success, though no successCode is declared to compare it with.
+    const errorsOnly = { codeField: 'error.code', codePattern: 'ORD\\d{3}' };
+    assert.throws(() => result(200, { error: { code: 'ORD500' } }, errorsOnly).expectSuccess(), /ORD500/);
+  });
+});
+
+describe('ApiClient with a dotted codeField', () => {
+  it('records the nested code in the observed-coverage feed, which attributes the response to its code', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vgate-client-'));
+    const observed = join(dir, 'observed.jsonl');
+    const ctx = await request.newContext();
+    try {
+      const withEnvelope = {
+        ...svc,
+        rules: { ...svc.rules, envelope: { codeField: 'error.code', codePattern: 'ORD\\d{3}' } },
+      };
+      const recorder = new CallRecorder(observed, 'orders');
+      const api = new ApiClient(ctx, withEnvelope, contract, new Auth(env), recorder);
+      (await api.as('reader').send('GET', '/orders/{id}', { params: { id: '9' } })).expectError(404, 'ORD404');
+      assert.deepEqual(JSON.parse(readFileSync(observed, 'utf8')), {
+        method: 'GET',
+        path: '/orders/{id}',
+        status: 404,
+        code: 'ORD404',
+        validated: true,
+        test: 'orders',
+      });
+    } finally {
+      await ctx.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Type-level checks, enforced by tsc (the selftest's type-check), not at run time: what expectSuccess is typed to return.
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+interface Op {
+  responses: {
+    200: { content: { 'application/json': { data: number; result: { data: { id: string } } } } };
+    404: { content: { 'application/json': { error: { code: string } } } };
+  };
+}
+type Body = Op['responses'][200]['content']['application/json'];
+export const successDataTypes: [
+  // Undeclared: the body's `data` when the contract types one (the type before the envelope could be declared).
+  Equal<SuccessData<Op>, number>,
+  // No envelope: the whole body, whatever fields it has.
+  Equal<SuccessData<Op, null>, Body>,
+  // The envelope's dataField, a dotted path into the body.
+  Equal<SuccessData<Op, 'data'>, number>,
+  Equal<SuccessData<Op, 'result.data'>, { id: string }>,
+  // A path the contract does not type: nothing is promised.
+  Equal<SuccessData<Op, 'result.missing'>, unknown>,
+] = [true, true, true, true, true];

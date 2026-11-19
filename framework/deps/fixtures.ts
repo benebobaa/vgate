@@ -12,6 +12,7 @@ import { resolve } from 'node:path';
 import { reportsDir, type ServiceConfig } from '../config.ts';
 import { ComposeFaults } from '../faults/compose.ts';
 import { createTest } from '../fixtures.ts';
+import type { DataPath } from '../http/client.ts';
 import { OpenApiContract } from '../http/openapi.ts';
 import { ofKind } from './config.ts';
 import { KafkaEvents } from './kafka.ts';
@@ -77,8 +78,9 @@ function stubRecorder(workerIndex: number): (record: StubRecord) => void {
   };
 }
 
-export function createDepsTest<P>() {
-  return createTest<P>().extend<DepsTestFixtures, DepsWorkerFixtures>({
+/** `D` is createTest's: where the envelope's success data sits, for the type of `expectSuccess`. */
+export function createDepsTest<P, D extends DataPath = undefined>() {
+  return createTest<P, D>().extend<DepsTestFixtures, DepsWorkerFixtures>({
     providerContracts: [
       async ({ svc }, use) => {
         const stubs = ofKind(svc.env.dependencies ?? {}, 'http-stub');
