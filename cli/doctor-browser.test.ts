@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
-import { browserCheck } from './doctor.ts';
+import type { ServiceConfig } from '../framework/config.ts';
+import { browserCheck, uvNeeded } from './doctor.ts';
 import type { Runtime } from './runtime.ts';
 
 const dirs: string[] = [];
@@ -42,5 +43,27 @@ describe('doctor: the browser of UI services', () => {
     const check = browserCheck(runtime(false), ['web', 'admin'], () => '/nowhere');
     assert.equal(check?.status, 'fail');
     assert.match(check?.detail ?? '', /runtime is not installed yet .* web, admin/);
+  });
+});
+
+describe('doctor: uv, for the contract step', () => {
+  it('is needed by every service with a contract, a UI service with one too, and by a service that does not load', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vgate-uv-'));
+    dirs.push(dir);
+    const spec = join(dir, 'openapi.yaml');
+    writeFileSync(spec, 'openapi: 3.1.0\n');
+    const svc = (over: Partial<ServiceConfig>) =>
+      ({ name: 's', specPath: join(dir, 'none.yaml'), ...over }) as ServiceConfig;
+    const ui = {
+      allowedOrigins: ['self'],
+      viewports: {},
+      clock: '',
+      a11y: { minImpact: 'serious' as const, disable: [] },
+    };
+    assert.equal(uvNeeded([svc({ ui })]), false, 'a UI service without a contract');
+    assert.equal(uvNeeded([svc({ ui, specPath: spec })]), true, 'a UI service with a contract runs Schemathesis');
+    assert.equal(uvNeeded([svc({ ui }), svc({ specPath: spec })]), true);
+    assert.equal(uvNeeded([svc({ ui }), undefined]), true);
+    assert.equal(uvNeeded([]), true);
   });
 });

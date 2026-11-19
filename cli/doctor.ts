@@ -340,6 +340,15 @@ function chromiumPath(runtime: Runtime): string | undefined {
   return run.code === 0 && run.out.trim() !== '' ? run.out.trim() : undefined;
 }
 
+/**
+ * Does any service run the contract step (Schemathesis through uvx)? Every service with a contract does, a UI service
+ * with one too; only a UI service without a contract does not. A service whose config does not load counts as needing
+ * it: never skip a check on missing information.
+ */
+export function uvNeeded(services: Array<ServiceConfig | undefined>): boolean {
+  return services.length === 0 || services.some((svc) => !svc || !svc.ui || existsSync(svc.specPath));
+}
+
 /** UI services drive a real browser: Chromium must be installed for the runtime's Playwright (docs/frontend.md). */
 export function browserCheck(runtime: Runtime, uiServices: string[], find = chromiumPath): Check | undefined {
   if (uiServices.length === 0) return undefined;
@@ -377,8 +386,7 @@ async function collect(
     perService.flatMap(({ svc }) => (svc?.ui ? [svc.name] : [])),
   );
   return [
-    // A service whose config does not load counts as needing uv: never skip a check on missing information.
-    ...toolChecks(runtime, dockerNeededBy, perService.length === 0 || perService.some(({ svc }) => !svc || !svc.ui)),
+    ...toolChecks(runtime, dockerNeededBy, uvNeeded(perService.map(({ svc }) => svc))),
     projectCheck(project),
     runtimeCheck(runtime),
     ...(links ? [links] : []),
