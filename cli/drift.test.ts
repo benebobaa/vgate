@@ -60,13 +60,13 @@ after(() => {
   servers.forEach((server) => server.close());
 });
 
-/** A stand-in for the provider's sandbox: answers POST /charges with `charge`. */
-async function provider(charge: Record<string, unknown>, status = 201): Promise<string> {
+/** A stand-in for the provider's sandbox: answers POST /charges (or `path`) with `charge`. */
+async function provider(charge: Record<string, unknown>, status = 201, path = '/charges'): Promise<string> {
   const server = createServer((req, res) => {
     let body = '';
     req.on('data', (chunk: Buffer) => (body += chunk.toString()));
     req.on('end', () => {
-      if (req.method !== 'POST' || req.url !== '/charges' || req.headers.authorization !== 'Bearer sandbox-key') {
+      if (req.method !== 'POST' || req.url !== path || req.headers.authorization !== 'Bearer sandbox-key') {
         res.writeHead(404).end();
         return;
       }
@@ -205,6 +205,56 @@ describe('vgate drift against a sandbox', () => {
     const [check] = await checkSandbox(sandbox);
     assert.equal(check.state, 'drift');
     assert.match(check.problems[0], /status 410 is not documented/);
+  });
+
+  it('never passes on a documented refusal: the call compared nothing (an expired key, a declined test card)', async () => {
+    const declined = await provider({ code: 'card_declined', message: 'declined' }, 402);
+    const result = await drift(readProject(project(declined)), { env: 'local' });
+    assert.equal(result.exitCode, EXIT.notReady, result.summary);
+    assert.match(result.summary, /NOT CHECKED: 1 of 1 .*payments POST \/charges -> 402/);
+    assert.ok((result.text ?? []).some((line) => /answered 402, not the 2xx the call asks for/.test(line)));
+  });
+
+  it('compares an error answer the request names on purpose', async () => {
+    const declined = await provider({ code: 'card_declined', message: 'declined' }, 402);
+    const root = project(declined);
+    const file = join(root, 'regression/orders/service.yaml');
+    writeFileSync(
+      file,
+      serviceYaml(declined).replace(
+        `body: ${JSON.stringify(REQUEST)} }`,
+        `body: ${JSON.stringify(REQUEST)}, status: 402 }`,
+      ),
+    );
+    const result = await drift(readProject(root), { env: 'local' });
+    assert.equal(result.exitCode, EXIT.ok, result.summary);
+  });
+
+  it('masks the sandbox secrets it prints, and keeps a provider field name on one line', async () => {
+    process.env.PAYMENTS_ACCOUNT = 'acct-secret-9f2';
+    try {
+      const url = await provider({ ...CHARGE, 'x\n```\n@someone': 1 }, 201, '/acct-secret-9f2/charges');
+      const root = project(url);
+      const file = join(root, 'regression/orders/service.yaml');
+      writeFileSync(
+        file,
+        serviceYaml(url).replace(
+          `body: ${JSON.stringify(REQUEST)} }`,
+          `body: ${JSON.stringify(REQUEST)}, path: '/\${PAYMENTS_ACCOUNT}/charges' }`,
+        ),
+      );
+      const result = await drift(readProject(root), { env: 'local' });
+      assert.equal(result.exitCode, EXIT.failed, result.summary);
+      const printed = [...(result.text ?? []), JSON.stringify(result.data)].join('\n');
+      assert.ok(!printed.includes('acct-secret-9f2'), printed);
+      assert.match(printed, /\/\*\*\*\/charges/);
+      assert.ok(
+        (result.text ?? []).every((line) => !line.includes('\n')),
+        'every printed line is one line',
+      );
+    } finally {
+      delete process.env.PAYMENTS_ACCOUNT;
+    }
   });
 
   it('never passes when the sandbox cannot be reached', async () => {

@@ -82,6 +82,7 @@ environments:
           requests: # optional; default: every GET of the contract without path parameters
             - { operation: 'POST /charges', body: { amount: 100, currency: IDR, customer: c1, reference: drift-1 } }
             - { operation: 'GET /charges/{id}', path: /charges/ch_test_1 }
+            - { operation: 'GET /charges/{id}', path: /charges/missing, status: 404 } # an error answer, on purpose
 ```
 
 ```bash
@@ -90,14 +91,18 @@ vgate drift --env local [--service orders] [--dependency payments]
 
 Every answer is held strictly to the vendored contract: an undocumented status, a missing required field or a field
 the contract does not declare is drift. A missing field next to a new one is reported as a likely rename. Requests
-and bodies are checked against the contract before anything is sent.
+and bodies are checked against the contract before anything is sent. A call is compared only when it did what it asks: a
+2xx answer, or the `status` the request names. Any other answer the contract allows (a documented 401 for an expired
+key, a 402 for a declined test card, a 503) compared nothing, so the run is not checked (exit 3), never a pass. The
+values of the `${VAR}`s a sandbox names are masked (`***`) in everything drift prints, and the workflow masks them in
+its log.
 
 | Exit | Meaning                                                                                |
 | ---- | -------------------------------------------------------------------------------------- |
 | 0    | Every sandbox answer matches the vendored contract                                     |
 | 1    | Drift: the operation, status and fields are named (a sure finding wins over an outage) |
 | 2    | A wrong call, or no dependency of the environment declares a sandbox                   |
-| 3    | Nothing could be compared: a sandbox unreachable, or a secret it names not set         |
+| 3    | Not compared: a sandbox unreachable or refusing the call, or a secret it names not set |
 
 `vgate init --ci github` installs `.github/workflows/vgate-drift.yml`: daily, it runs `vgate drift` and opens (or
 updates) one issue titled "vgate: provider drift". The repository variable `VGATE_DRIFT_ENVIRONMENT` names the

@@ -62,6 +62,9 @@ jobs:
               [A-Za-z_]*=*) key=${line%%=*}; case "$key" in *[!A-Za-z0-9_]*) echo "::error::bad key in VGATE_ENV"; exit 1 ;; esac ;;
               *) echo "::error::VGATE_ENV holds a line that is not KEY=value"; exit 1 ;;
             esac
+            # GitHub masks each line of the secret, KEY=value; the value alone (a key in a URL) must be masked too.
+            value=${line#*=}
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
             printf '%s\n' "$line" >>"$GITHUB_ENV"
           done
       - id: pin

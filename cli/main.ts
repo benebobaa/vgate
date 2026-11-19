@@ -145,7 +145,7 @@ const CATALOGUE = {
       name: 'drift',
       usage: `${CLI} drift --env <environment> [--service <name>] [--dependency <name>]`,
       about:
-        "Has a provider changed under its vendored contract? Asks each dependency's sandbox (environments.<env>.dependencies.<name>.sandbox) and holds every answer strictly to the vendored contract the stubs use. Exit 1 drift (named field and operation), 3 sandbox unreachable or its secret unset (never a pass). Writes reports/drift.json.",
+        "Has a provider changed under its vendored contract? Asks each dependency's sandbox (environments.<env>.dependencies.<name>.sandbox) and holds every answer strictly to the vendored contract the stubs use. Exit 1 drift (named field and operation), 3 a call not compared: the sandbox unreachable, refusing it (a documented 401 or 5xx), or its secret unset (never a pass). Writes reports/drift.json.",
     },
     {
       name: 'inventory',
