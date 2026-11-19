@@ -23,6 +23,7 @@ import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { gunzipSync } from 'node:zlib';
 import { parseArgs, str } from '../framework/cli/args.ts';
 import {
   assetName,
@@ -156,10 +157,15 @@ for (const platform of PLATFORMS) {
   compile(join(stage, NAME), platform.bunTarget);
   writeFileSync(join(stage, 'LICENSE'), licenseText);
   const file = assetName(version, platform);
-  // Explicit member order, and no macOS metadata members (._*) for extended attributes such as the signature's.
+  // Explicit member order, and no macOS metadata: COPYFILE_DISABLE keeps out the ._* members, --no-xattrs the pax
+  // headers bsdtar writes for extended attributes (com.apple.provenance), on which GNU tar (Fedora, Debian) warns
+  // "Ignoring unknown extended header keyword" at every install. GNU tar, building on Linux, takes the same flag.
   process.env.COPYFILE_DISABLE = '1';
-  run('tar', ['-czf', join(releaseDir, file), '-C', stage, NAME, 'LICENSE'], root);
+  run('tar', ['--no-xattrs', '-czf', join(releaseDir, file), '-C', stage, NAME, 'LICENSE'], root);
   const path = join(releaseDir, file);
+  if (gunzipSync(readFileSync(path)).includes('LIBARCHIVE.xattr')) {
+    die(`${file} carries extended-attribute headers: GNU tar would warn on every install`);
+  }
   assets.push({
     os: platform.os,
     arch: platform.arch,

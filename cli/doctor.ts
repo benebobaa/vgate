@@ -8,6 +8,7 @@ import { join, relative } from 'node:path';
 import { loadService, type ServiceConfig } from '../framework/config.ts';
 import { PROJECT_FILE, type ProjectConfig } from '../framework/project.ts';
 import { CLI, EXIT, type Result } from './output.ts';
+import { detectInstaller, dockerInstallHint, installCommand, onPath, pnpmInstallHint } from './packages.ts';
 import { capture, listServices } from './project.ts';
 import { ensureRuntime, linkProject, runtimeState, stepEnv, toolEnv, type Runtime } from './runtime.ts';
 import { checkPin, VERSION } from './version.ts';
@@ -75,6 +76,21 @@ export function checkTool(spec: ToolSpec): Check {
   return { id: spec.id, status: 'ok', detail: line };
 }
 
+/**
+ * ps and pgrep: the stack library tells its own app by pid, parent and start time, and stops it with its children;
+ * mutate checks a recorded pid the same way. Minimal images (fedora, debian-slim) come without them.
+ */
+export function processToolsCheck(has: (command: string) => boolean = onPath): Check {
+  const missing = ['ps', 'pgrep'].filter((command) => !has(command));
+  if (missing.length === 0) return { id: 'procps', status: 'ok', detail: 'ps and pgrep' };
+  return {
+    id: 'procps',
+    status: 'fail',
+    detail: `${missing.join(' and ')} not installed (vgate tells its own processes by pid and start time)`,
+    fix: install('procps'),
+  };
+}
+
 /** A runtime file: from the binary's embedded copy (before it is extracted) or from disk. */
 function runtimeFile(runtime: Runtime, path: string): string | undefined {
   if (runtime.files) return runtime.files[path];
@@ -91,6 +107,8 @@ function runtimeVersions(runtime: Runtime): { node: string; pnpm: string } {
 }
 
 const mac = process.platform === 'darwin';
+const installer = detectInstaller();
+const install = (tool: string) => installCommand(installer, tool);
 
 /**
  * `uvNeeded`: some service runs the contract step (Schemathesis through uvx). A web frontend (`ui:`) has none, so a
@@ -111,11 +129,11 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true)
       command: 'pnpm',
       args: ['--version'],
       min: need.pnpm,
-      fix: 'corepack enable pnpm',
+      fix: pnpmInstallHint(onPath('corepack')),
     },
-    { id: 'git', command: 'git', args: ['--version'], fix: mac ? 'brew install git' : 'apt-get install -y git' },
+    { id: 'git', command: 'git', args: ['--version'], fix: install('git') },
     { id: 'bash', command: 'bash', args: ['--version'], fix: 'Install bash: every stack.sh needs it' },
-    { id: 'curl', command: 'curl', args: ['--version'], fix: mac ? 'brew install curl' : 'apt-get install -y curl' },
+    { id: 'curl', command: 'curl', args: ['--version'], fix: install('curl') },
     {
       id: 'lsof',
       command: 'lsof',
@@ -123,7 +141,7 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true)
       optional:
         "the stack library uses it to tell this project's app from another process on its port; without it `vgate up` " +
         'restarts the app every time and `vgate status` cannot vouch for the running build',
-      fix: mac ? 'lsof ships with macOS' : 'apt-get install -y lsof',
+      fix: mac ? 'lsof ships with macOS' : install('lsof'),
     },
     ...(uvNeeded
       ? [
@@ -140,7 +158,7 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true)
       command: 'java',
       args: ['-version'],
       optional: 'only the Allure report needs it; the verdict does not',
-      fix: mac ? 'brew install temurin' : 'apt-get install -y default-jre-headless',
+      fix: install('java'),
     },
     {
       id: 'k6',
@@ -151,6 +169,7 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true)
     },
   ];
   const checks = specs.map(checkTool);
+  checks.push(processToolsCheck());
 
   if (dockerNeededBy.length > 0) {
     const docker = capture('docker', ['info', '--format', '{{.ServerVersion}}'], undefined, 15_000);
@@ -160,7 +179,7 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true)
         id: 'docker',
         status: 'fail',
         detail: `not installed (${who})`,
-        fix: mac ? 'brew install --cask docker' : 'See https://docs.docker.com/engine/install/',
+        fix: dockerInstallHint(installer),
       });
     } else if (docker.code !== 0) {
       checks.push({

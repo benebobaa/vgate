@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import type { ServiceConfig } from '../framework/config.ts';
-import { atLeast, checkTool, healthUrl, parseVersion } from './doctor.ts';
+import { atLeast, checkTool, healthUrl, parseVersion, processToolsCheck } from './doctor.ts';
 
 describe('parseVersion', () => {
   it('reads the version out of what each tool prints', () => {
@@ -87,5 +87,15 @@ describe('checkTool', () => {
     });
     assert.equal(check.status, 'warn');
     assert.match(check.detail, /not installed \(up restarts the app every time\)/);
+  });
+});
+
+describe('processToolsCheck', () => {
+  it('passes with ps and pgrep, and fails naming what a minimal image left out', () => {
+    assert.equal(processToolsCheck(() => true).status, 'ok');
+    const check = processToolsCheck((command) => command !== 'pgrep');
+    assert.equal(check.status, 'fail');
+    assert.match(check.detail, /^pgrep not installed/);
+    assert.ok(check.fix);
   });
 });
