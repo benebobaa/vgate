@@ -41,7 +41,17 @@ jobs:
             exit 1
           fi
       - run: pnpm task selftest
-      - run: bun cli/build.ts --all
+      - name: Build and sign every platform
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.VGATE_MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then echo "::error::secret VGATE_MINISIGN_SECRET_KEY is not set"; exit 1; fi
+          sudo apt-get install -y -qq minisign >/dev/null
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          chmod 600 "$key"
+          VGATE_MINISIGN_KEY="$key" bun cli/build.ts --all
+          rm -f "$key"
       - run: npm install --global wrangler@4.72.0
       - name: Publish to R2
         env:

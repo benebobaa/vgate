@@ -93,6 +93,33 @@ if (existsSync(installer)) {
     problems.push(`install.sh's default base URL is not ${BASE_URL}`);
   if (!script.includes(`\nNAME=${NAME}\n`)) problems.push(`install.sh's NAME is not ${NAME}`);
 }
+// Every release from 0.6.0 on is signed, and the signature must verify against the published key (minisign.pub):
+// install.sh refuses a release whose signature is missing or wrong, so an unsigned one would break every install.
+const signature = join(localVersionDir, 'SHA256SUMS.minisig');
+const publicKey = join(root, 'minisign.pub');
+if (!existsSync(signature)) {
+  // A dry run (CI's release build, which holds no key) only warns; publishing an unsigned release is refused.
+  const unsigned = 'SHA256SUMS.minisig is missing: build with VGATE_MINISIGN_KEY=<secret key> (docs/releasing.md)';
+  if (publish) problems.push(unsigned);
+  else process.stderr.write(`warning: ${unsigned}; --publish would refuse this release\n`);
+} else if (!existsSync(publicKey)) {
+  problems.push('minisign.pub is missing at the repository root');
+} else {
+  const check = spawnSync('minisign', ['-Vm', join(localVersionDir, 'SHA256SUMS'), '-p', publicKey, '-x', signature], {
+    encoding: 'utf8',
+  });
+  if (check.error) problems.push('minisign is not installed: the signature cannot be checked before publishing');
+  else if (check.status !== 0)
+    problems.push(`the signature does not verify against minisign.pub: ${check.stderr.trim()}`);
+}
+const releaseKey = readFileSync(publicKey, 'utf8').split('\n')[1]?.trim() ?? '';
+if (
+  existsSync(installer) &&
+  releaseKey &&
+  !readFileSync(installer, 'utf8').includes(`VGATE_MINISIGN_PUBKEY:-${releaseKey}}`)
+) {
+  problems.push("install.sh's default public key is not minisign.pub's");
+}
 if (problems.length > 0) fail(`Release ${version} is not publishable:\n  ${problems.join('\n  ')}`);
 
 interface Upload {
