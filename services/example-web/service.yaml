@@ -1,0 +1,27 @@
+# example-web: the framework's reference for a web frontend (README.md). The notes UI in public/, served by server.ts
+# in front of the example notes API; both in-memory, no Docker: `vgate up --service example-web`.
+name: example-web
+
+# No contract of its own: a UI service is verified through the browser. The contract steps (Schemathesis, response
+# coverage) do not apply; the plan's scenarios must each have a test (docs/frontend.md).
+
+ui:
+  allowedOrigins: [self] # README rule 8: the page talks to its own origin only
+  viewports:
+    desktop: { width: 1280, height: 800 }
+    mobile: { width: 390, height: 844 }
+  clock: '2026-01-15T09:00:00Z'
+  a11y:
+    minImpact: serious # README rule 7
+  budgets:
+    lcpMs: 2500
+    cls: 0.1
+
+environments:
+  local:
+    disposable: true # in-memory; `vgate reset --service example-web --yes` restarts it empty
+    baseUrl: http://localhost:${EXAMPLE_WEB_PORT:-8094}
+    healthPath: /health
+    users:
+      writer: { token: '${EXAMPLE_WRITER_KEY:-writer-key}', role: writer }
+      reader: { token: '${EXAMPLE_READER_KEY:-reader-key}', role: reader }

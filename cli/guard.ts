@@ -12,6 +12,7 @@ import { join, relative, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { OpenApiContract, type DocumentedPair } from '../framework/http/openapi.ts';
 import { readProject } from '../framework/project.ts';
+import { impactLoosening, parseUi } from '../framework/ui/config.ts';
 import { treeState, type TreeState } from './commit.ts';
 import { CLI, EXIT, UsageError, type Result } from './output.ts';
 
@@ -23,6 +24,8 @@ export type Rule =
   | 'config-loosened'
   | 'known-failure-added'
   | 'tests-weakened'
+  | 'incident-dropped'
+  | 'visual-changed'
   | 'machinery-changed';
 
 export interface Finding {
@@ -578,6 +581,45 @@ export function knownFailuresRule(file: string, base: string | undefined, head: 
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// 4b. incident-dropped
+
+/**
+ * Incident files of base and head (path -> text): every escaped bug the gate learned from must stay guarded. Deleting
+ * an incident, re-pointing its scenario, or newly calling it not testable (which exempts it from the coverage gate)
+ * needs a human; a new incident is info. Removing its scenario or its test is caught by plan-weakened and
+ * tests-weakened.
+ */
+export function incidentsRule(base: Map<string, string>, head: Map<string, string>): RuleOutcome {
+  const result = outcome();
+  const field = (text: string | undefined, name: string) => {
+    const value = at(yaml(text), name);
+    return value === undefined || value === null ? undefined : scalar(value);
+  };
+  for (const [file, before] of base) {
+    const after = head.get(file);
+    if (after === undefined) {
+      result.findings.push({ rule: 'incident-dropped', file, detail: 'incident deleted' });
+      continue;
+    }
+    if (field(after, 'scenario') !== field(before, 'scenario'))
+      result.findings.push({
+        rule: 'incident-dropped',
+        file,
+        detail: `scenario ${field(before, 'scenario') ?? 'none'} -> ${field(after, 'scenario') ?? 'none'}`,
+      });
+    if (field(after, 'missedBy') === 'not-testable' && field(before, 'missedBy') !== 'not-testable')
+      result.findings.push({
+        rule: 'incident-dropped',
+        file,
+        detail: 'now marked not-testable, which exempts it from the coverage gate',
+      });
+  }
+  for (const file of head.keys())
+    if (!base.has(file)) result.info.push({ rule: 'incident-dropped', file, detail: 'incident recorded' });
+  return result;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // 5. tests-weakened
 
 /** Source without comments, so a commented-out assertion does not count as one. */
@@ -598,6 +640,29 @@ function markers(source: string): Record<'fail' | 'fixme' | 'skip', number> {
 
 const SCENARIO_ID = /\[([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\]/g;
 
+/**
+ * Screenshot options that let a visual comparison accept more (`toHaveScreenshot(name, { ... })`, `expect.configure`):
+ * a tolerance, a mask, a clip, an injected style, a smaller page. Each `name: value` as written, spaces collapsed.
+ */
+const VISUAL_OPTION = /\b(maxDiffPixels|maxDiffPixelRatio|threshold|mask|stylePath|clip|fullPage)\s*:\s*([^,}\n]*)/g;
+
+function visualOptions(source: string): string[] {
+  return [...code(source).matchAll(VISUAL_OPTION)].map(
+    ([, name, value]) => `${name}: ${value.replace(/\s+/g, ' ').trim()}`,
+  );
+}
+
+/** What `after` has that `before` has not, counting repeats. */
+function added(before: string[], after: string[]): string[] {
+  const left = [...before];
+  return after.filter((item) => {
+    const at = left.indexOf(item);
+    if (at === -1) return true;
+    left.splice(at, 1);
+    return false;
+  });
+}
+
 function ids(sources: Map<string, string>): Map<string, string> {
   const out = new Map<string, string>();
   for (const [file, source] of sources)
@@ -607,7 +672,8 @@ function ids(sources: Map<string, string>): Map<string, string> {
 
 /**
  * Test sources (path -> text) of base and head: a file deleted, fewer assertions in a file, a scenario id no longer
- * in any source, or a new `.fail(`, `.fixme(` or `.skip(`.
+ * in any source, a new `.fail(`, `.fixme(` or `.skip(`, or a screenshot comparison that accepts more (a new or changed
+ * tolerance, mask, clip or style, or `fullPage: true` removed).
  */
 export function testsRule(base: Map<string, string>, head: Map<string, string>): RuleOutcome {
   const result = outcome();
@@ -622,17 +688,24 @@ export function testsRule(base: Map<string, string>, head: Map<string, string>):
     const now = countExpects(after);
     if (now < was) find(file, `assertions ${was} -> ${now}`);
   }
-  for (const [file, after] of head) {
+  for (const [file, source] of head) {
     const was = markers(base.get(file) ?? '');
-    const now = markers(after);
+    const now = markers(source);
     for (const kind of ['fail', 'fixme', 'skip'] as const) {
       if (now[kind] > was[kind]) find(file, `.${kind}( ${was[kind]} -> ${now[kind]}`);
     }
+    // A screenshot that tolerates a difference, masks or clips part of the page, or no longer covers the full page.
+    const optionsBefore = visualOptions(base.get(file) ?? '');
+    const optionsAfter = visualOptions(source);
+    for (const option of added(optionsBefore, optionsAfter).filter((o) => o !== 'fullPage: true'))
+      find(file, `a screenshot comparison now accepts more: ${option}`);
+    if (added(optionsAfter, optionsBefore).includes('fullPage: true'))
+      find(file, 'a screenshot comparison no longer covers the full page (fullPage: true removed)');
     if (!base.has(file))
       result.info.push({
         rule: 'tests-weakened',
         file,
-        detail: `test source added (${countExpects(after)} assertions)`,
+        detail: `test source added (${countExpects(source)} assertions)`,
       });
   }
   const after = ids(head);
@@ -686,6 +759,65 @@ export function machineryRule(changed: string[], servicesDir?: string): RuleOutc
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// UI services (framework/ui): visual baselines and the browser rules are expectations
+
+/** Committed screenshots of a service: `<tests>/__screenshots__/<platform>/<spec>/<name>.png` (playwright.config.ts). */
+export const isBaseline = (path: string) => /\/__screenshots__\/.+\.png$/.test(path);
+
+/**
+ * A baseline image is what the page must look like: changing or deleting one changes the expectation, which a human
+ * looks at (the diff is in the run's evidence). A new baseline is additive. Inputs: path -> git blob id.
+ */
+export function visualRule(base: ReadonlyMap<string, string>, head: ReadonlyMap<string, string>): RuleOutcome {
+  const result = outcome();
+  for (const [file, blob] of base) {
+    if (!head.has(file))
+      result.findings.push({ rule: 'visual-changed', file, detail: 'a visual baseline was deleted' });
+    else if (head.get(file) !== blob)
+      result.findings.push({ rule: 'visual-changed', file, detail: 'a visual baseline changed: check the image diff' });
+  }
+  for (const file of head.keys())
+    if (!base.has(file)) result.info.push({ rule: 'visual-changed', file, detail: 'a new visual baseline' });
+  return result;
+}
+
+/** The browser rules of `ui:` loosened: a lower accessibility bar, disabled axe rules, more origins, laxer budgets. */
+export function uiConfigRule(file: string, base: string | undefined, head: string | undefined): RuleOutcome {
+  const result = outcome();
+  const read = (text: string | undefined) => {
+    try {
+      return parseUi(at(yaml(text), 'ui'));
+    } catch {
+      return undefined;
+    }
+  };
+  const before = read(base);
+  const after = read(head);
+  if (!before) return result;
+  const find = (detail: string) => result.findings.push({ rule: 'config-loosened', file, detail });
+  if (!after) {
+    find('ui: removed: the browser rules (sealed page, accessibility, budgets) no longer apply');
+    return result;
+  }
+  if (impactLoosening(before.a11y.minImpact, after.a11y.minImpact) > 0)
+    find(`ui.a11y.minImpact lowered the bar: ${before.a11y.minImpact} -> ${after.a11y.minImpact}`);
+  for (const rule of after.a11y.disable.filter((r) => !before.a11y.disable.includes(r)))
+    find(`ui.a11y.disable now skips the axe rule ${rule}`);
+  for (const origin of after.allowedOrigins.filter((o) => !before.allowedOrigins.includes(o)))
+    find(`ui.allowedOrigins now lets the page reach ${origin}`);
+  for (const name of Object.keys(before.viewports).filter((v) => !(v in after.viewports)))
+    find(`ui.viewports: ${name} is no longer checked`);
+  for (const key of ['lcpMs', 'cls'] as const) {
+    const was = before.budgets?.[key];
+    if (was === undefined) continue;
+    const now = after.budgets?.[key];
+    if (now === undefined) find(`ui.budgets.${key} removed (was ${was})`);
+    else if (now > was) find(`ui.budgets.${key} raised: ${was} -> ${now}`);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Gathering the files
 
 export function git(cwd: string, args: string[]): { code: number | null; out: string; err: string } {
@@ -714,6 +846,32 @@ class Repo {
   baseFile(path: string): string | undefined {
     const run = git(this.top, ['show', `${this.base}:${this.prefix}${path}`]);
     return run.code === 0 ? run.out : undefined;
+  }
+
+  /** path -> git blob id of the files under `dir` at the base that `keep` accepts (binary-safe: images). */
+  baseBlobs(dir: string, keep: (path: string) => boolean): Map<string, string> {
+    const run = git(this.top, ['ls-tree', '-r', this.base, '--', `${this.prefix}${dir}`]);
+    const blobs = new Map<string, string>();
+    for (const line of run.code === 0 ? run.out.split('\n') : []) {
+      const match = /^\d+ blob ([0-9a-f]+)\t(.+)$/.exec(line);
+      if (!match) continue;
+      const path = match[2].slice(this.prefix.length);
+      if (keep(path)) blobs.set(path, match[1]);
+    }
+    return blobs;
+  }
+
+  /** The same for the working tree: what `git hash-object` gives each file on disk. */
+  headBlobs(dir: string, keep: (path: string) => boolean): Map<string, string> {
+    const files = this.headFiles(dir).filter(keep);
+    const blobs = new Map<string, string>();
+    if (files.length === 0) return blobs;
+    const run = git(this.root, ['hash-object', '--', ...files]);
+    const ids = run.code === 0 ? run.out.trim().split('\n') : [];
+    files.forEach((file, index) => {
+      if (ids[index]) blobs.set(file, ids[index]);
+    });
+    return blobs;
   }
 
   headFile(path: string): string | undefined {
@@ -757,6 +915,8 @@ class Repo {
 /** Test sources and their support code: an assertion moved into a helper still counts. */
 const TEST_DIRS = (svc: string) => [`${svc}/tests`, `${svc}/support`];
 const SOURCE = /\.(ts|js|mts|mjs)$/;
+/** Incident records (framework/incidents.ts). */
+const INCIDENT_FILE = /\/INC-\d+\.ya?ml$/;
 
 export interface GuardReport {
   schema: 'vgate.guard/1';
@@ -810,10 +970,10 @@ export function guard(root: string, options: { service: string; base: string | u
   const baseContractPath = contractPath(baseService);
   const headContractPath = contractPath(headService);
 
-  const sources = (files: string[], read: (path: string) => string | undefined) =>
+  const sources = (files: string[], read: (path: string) => string | undefined, only = SOURCE) =>
     new Map(
       files
-        .filter((path) => SOURCE.test(path))
+        .filter((path) => only.test(path))
         .flatMap((path) => {
           const text = read(path);
           return text === undefined ? [] : [[path, text] as const];
@@ -839,7 +999,13 @@ export function guard(root: string, options: { service: string; base: string | u
     planRule(`${svc}/inventory.yaml`, ...both(`${svc}/inventory.yaml`)),
     configRule(`${svc}/service.yaml`, baseService, headService),
     knownFailuresRule(`${svc}/known-failures.yaml`, ...both(`${svc}/known-failures.yaml`)),
+    incidentsRule(
+      sources(repo.baseFiles(`${svc}/incidents`), (path) => repo.baseFile(path), INCIDENT_FILE),
+      sources(repo.headFiles(`${svc}/incidents`), (path) => repo.headFile(path), INCIDENT_FILE),
+    ),
     testsRule(baseTests, headTests),
+    uiConfigRule(`${svc}/service.yaml`, baseService, headService),
+    visualRule(repo.baseBlobs(`${svc}/tests`, isBaseline), repo.headBlobs(`${svc}/tests`, isBaseline)),
     machineryRule(repo.changed(), servicesDir),
   ];
   const findings = outcomes.flatMap((o) => o.findings);

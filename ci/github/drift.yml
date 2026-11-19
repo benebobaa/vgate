@@ -1,0 +1,137 @@
+# vgate provider drift: copied into a project's .github/workflows/ by `vgate init --ci github` (docs/learning-loop.md).
+#
+# Daily, it asks each provider sandbox that service.yaml declares (environments.<env>.dependencies.<name>.sandbox) and
+# holds every answer to the provider's vendored contract, the one the tests' stubs answer from. When a provider has
+# changed under its contract, the stubs and the tests still agree with each other and nobody notices: this run does,
+# and opens (or updates) one issue titled "vgate: provider drift". Nothing here can merge or deploy anything.
+#
+#   VGATE_DRIFT_ENVIRONMENT   repository variable: the service.yaml environment whose dependencies declare a sandbox
+#                             (default: local); also the GitHub environment holding its secrets
+#   VGATE_ENV                 secret of that GitHub environment: KEY=value lines, the ${VAR}s the sandboxes name
+name: vgate provider drift
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vgate-drift
+  cancel-in-progress: false
+
+env:
+  # Where vgate.yaml sits, relative to the repository root.
+  VGATE_PROJECT_DIR: .
+  VGATE_BASE_URL: https://vgate.benelabs.tech
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.VGATE_DRIFT_ENVIRONMENT || 'local' }}
+    permissions:
+      contents: read
+      # Only to open or update the one drift issue.
+      issues: write
+    env:
+      VGATE_DRIFT_ENVIRONMENT: ${{ vars.VGATE_DRIFT_ENVIRONMENT || 'local' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Environment name
+        run: |
+          case "$VGATE_DRIFT_ENVIRONMENT" in
+            '' | *[!A-Za-z0-9._-]*) echo "::error::not an environment name: '$VGATE_DRIFT_ENVIRONMENT'"; exit 1 ;;
+          esac
+      - name: Credentials of the sandboxes
+        env:
+          VGATE_ENV: ${{ secrets.VGATE_ENV }}
+        run: |
+          # KEY=value lines, one per variable; anything else is refused rather than written to the job's environment.
+          [ -z "$VGATE_ENV" ] && exit 0
+          printf '%s\n' "$VGATE_ENV" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in
+              [A-Za-z_]*=*) key=${line%%=*}; case "$key" in *[!A-Za-z0-9_]*) echo "::error::bad key in VGATE_ENV"; exit 1 ;; esac ;;
+              *) echo "::error::VGATE_ENV holds a line that is not KEY=value"; exit 1 ;;
+            esac
+            # GitHub masks each line of the secret, KEY=value; the value alone (a key in a URL) must be masked too.
+            value=${line#*=}
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+            printf '%s\n' "$line" >>"$GITHUB_ENV"
+          done
+      - id: pin
+        name: Read the pinned vgate version
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: |
+          version=$(sed -n "s/^version:[[:space:]]*['\"]\{0,1\}\([0-9][0-9A-Za-z.-]*\).*/\1/p" vgate.yaml | head -1)
+          if [ -z "$version" ]; then echo "::error file=vgate.yaml::no 'version: x.y.z' in vgate.yaml"; exit 1; fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+      - name: Install vgate
+        env:
+          VGATE_VERSION: ${{ steps.pin.outputs.version }}
+        run: |
+          curl -fsSL "$VGATE_BASE_URL/install.sh" | VGATE_INSTALL_DIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - name: Drift
+        id: drift
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        run: |
+          set +e
+          vgate drift --env "$VGATE_DRIFT_ENVIRONMENT" --json >"$RUNNER_TEMP/drift.json"
+          code=$?
+          set -e
+          jq -r '"**vgate drift**: \(.summary)"' "$RUNNER_TEMP/drift.json" >>"$GITHUB_STEP_SUMMARY" || true
+          jq -r '(.text // [])[]' "$RUNNER_TEMP/drift.json" 2>/dev/null || cat "$RUNNER_TEMP/drift.json"
+          # No sandbox declared anywhere: nothing to compare, which is how most projects start. Green, with a note.
+          if [ $code -eq 2 ] && jq -e '.summary | test("declares a sandbox")' "$RUNNER_TEMP/drift.json" >/dev/null 2>&1; then
+            code=none
+          fi
+          echo "code=$code" >>"$GITHUB_OUTPUT"
+          # 1: drift (the issue below); 3: nothing could be asked (a red run, no issue: it says nothing about the
+          # provider); 2: a wrong call or no sandbox declared. Only 0 is green.
+          exit 0
+      - name: Open or update the drift issue
+        if: steps.drift.outputs.code == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='vgate: provider drift'
+          {
+            echo 'A provider sandbox no longer answers as its vendored contract says. The stubs of the tests answer from'
+            echo 'that contract, so the tests cannot notice: update the vendored contract from the provider (then run the'
+            echo 'gate, which holds stubs and tests to it) or ask the provider why it changed.'
+            echo
+            echo '```'
+            jq -r '(.text // [])[]' "$RUNNER_TEMP/drift.json"
+            echo '```'
+            echo
+            echo "Run: $RUN_URL"
+          } >"$RUNNER_TEMP/issue.md"
+          number=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number,title \
+            --jq "map(select(.title == \"$title\"))[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$REPO" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body-file "$RUNNER_TEMP/issue.md"
+          fi
+      - name: Verdict
+        env:
+          CODE: ${{ steps.drift.outputs.code }}
+        run: |
+          case "$CODE" in
+            0) echo "No drift." ;;
+            none) echo "::notice::no dependency declares a sandbox: nothing to compare (docs/learning-loop.md)" ;;
+            1) echo "::error::provider drift (see the issue)"; exit 1 ;;
+            3) echo "::error::the sandboxes could not be asked: nothing was compared"; exit 1 ;;
+            *) echo "::error::vgate drift could not run (exit ${CODE:-none}): see the step above"; exit 1 ;;
+          esac

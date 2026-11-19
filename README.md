@@ -22,18 +22,23 @@ backend disagrees with its spec. Install details, pinning and verification: [doc
 
 ## What the gate checks
 
-| Layer            | Tool                                       | Catches                                                                                                                                              |
-| ---------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Contract types   | `openapi-typescript` + `tsc`               | Tests that use a field, path or body the contract does not have                                                                                      |
-| Every response   | Playwright Test + Ajv                      | An undocumented status, a schema violation or undocumented field, a missing header, a datetime without its offset                                    |
-| Streams          | SSE parser + per-event schema              | An event that violates its schema, a stream cut off before its terminal event, a stalled stream ([docs/streaming.md](docs/streaming.md))             |
-| Behaviour        | Playwright Test scenarios                  | Wrong codes and values, wrong rows in the database, writes on rejected calls, role and permission rules, signed webhooks                             |
-| Generated inputs | Schemathesis                               | Server errors, schema conformance and input handling on read-only operations, from the contract alone                                                |
-| Dependencies     | WireMock, Kafka, Redis, Toxiproxy fixtures | Wrong calls to a third party, stubs that lie about it, missing or malformed events, behaviour when a dependency is slow or down                      |
-| Completeness     | coverage gate                              | A documented (operation, status, code) no test reaches; a planned scenario no collected test runs; a provider answer no test simulates               |
-| Known failures   | registry with ticket, owner and expiry     | An expired or stale entry; a known failure that now passes ([docs/known-failures.md](docs/known-failures.md))                                        |
-| The expectations | `vgate guard`                              | A change that weakens the judge: a breaking contract change, a removed scenario or assertion, a loosened rule, a new known failure, edited machinery |
-| The framework    | `node:test` self-tests                     | A change to vgate itself that would make it judge wrongly                                                                                            |
+| Layer            | Tool                                         | Catches                                                                                                                                                                                      |
+| ---------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Contract types   | `openapi-typescript` + `tsc`                 | Tests that use a field, path or body the contract does not have                                                                                                                              |
+| Every response   | Playwright Test + Ajv                        | An undocumented status, a schema violation or undocumented field, a missing header, a datetime without its offset                                                                            |
+| Streams          | SSE parser + per-event schema                | An event that violates its schema, a stream cut off before its terminal event, a stalled stream ([docs/streaming.md](docs/streaming.md))                                                     |
+| Behaviour        | Playwright Test scenarios                    | Wrong codes and values, wrong rows in the database, writes on rejected calls, role and permission rules, signed webhooks                                                                     |
+| Generated inputs | Schemathesis                                 | Server errors, schema conformance and input handling on read-only operations, from the contract alone                                                                                        |
+| Dependencies     | WireMock, Kafka, Redis, Toxiproxy fixtures   | Wrong calls to a third party, stubs that lie about it, missing or malformed events, behaviour when a dependency is slow or down                                                              |
+| Completeness     | coverage gate                                | A documented (operation, status, code) no test reaches; a planned scenario no collected test runs; a provider answer no test simulates                                                       |
+| Web frontends    | Playwright (Chromium) + axe-core             | A broken user flow, a call to an undeclared origin, a console error, an accessibility violation, a changed screenshot, a web-vitals budget breach ([docs/frontend.md](docs/frontend.md))     |
+| Incidents        | `vgate incident`                             | A bug that escaped to production with no regression test guarding it ([docs/learning-loop.md](docs/learning-loop.md))                                                                        |
+| Provider drift   | `vgate drift`                                | A real third party (its sandbox) that no longer answers like its vendored contract, so the stubs would lie                                                                                   |
+| Deploy safety    | `vgate compat`, `config-check`, `migrations` | A contract break against what production runs, a setting production lacks, an unsafe migration, the deployed code failing on the new schema ([docs/deploy-safety.md](docs/deploy-safety.md)) |
+| Test strength    | `vgate mutate`                               | Tests that would not notice a bug planted in the lines a change wrote ([docs/mutation.md](docs/mutation.md))                                                                                 |
+| Known failures   | registry with ticket, owner and expiry       | An expired or stale entry; a known failure that now passes ([docs/known-failures.md](docs/known-failures.md))                                                                                |
+| The expectations | `vgate guard`                                | A change that weakens the judge: a breaking contract change, a removed scenario or assertion, a loosened rule, a new known failure, edited machinery                                         |
+| The framework    | `node:test` self-tests                       | A change to vgate itself that would make it judge wrongly                                                                                                                                    |
 
 Auth: Keycloak password users, static bearer tokens, API keys and cookie sessions with CSRF
 ([docs/auth.md](docs/auth.md)). Reports: `reports/verdict.json` (the machine-readable verdict), JUnit XML, Playwright
@@ -57,22 +62,26 @@ Made for the agent that operates it as much as for a person: every command takes
 `{ command, ok, exitCode, summary, data, next }`; it never prompts; `next` lists the commands that move the caller
 forward.
 
-| Command                                          | What it does                                                                                                                        |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `init [--service <svc>] [--ci github] [--force]` | Makes the current repository a project: `vgate.yaml` (pinned version), the service skeleton, the skills, the CI workflow            |
-| `doctor [--service <svc>] [--fix]`               | Checks tools and versions, the runtime, each service's config, contract and stack; every failed check names its fix                 |
-| `gate --service <svc> [--steps a,b]`             | Runs every step and writes `reports/verdict.json`: steps, failed tests (scenario id, file, line, message), coverage, known failures |
-| `guard --service <svc> --base <ref>`             | Compares the expectations with a base ref: exit 0 `auto`, exit 1 `needs-human` with the findings; writes `reports/guard.json`       |
-| `inventory --service <svc> [--write]`            | The test plan's skeleton from the vendored contract, for the agent to enrich                                                        |
-| `smoke --service <svc> --env <env>`              | After a deploy: the smoke subset against a deployed environment; writes are refused before they are sent                            |
-| `canary --service <svc> --env <env> [--for 10m]` | While a version takes traffic: metrics against limits and baseline; 1 on breach (runs `--on-fail` once), 3 unknown                  |
-| `affected --base <ref>`                          | The services a change touches (by each `service.yaml`'s `paths:`) and the ones it deletes                                           |
-| `risk --base <ref>`                              | The change's risk tier (low, medium, high) and the file and rule behind it                                                          |
-| `decide --base <ref> --evidence <dir>`           | The pull request's decision from every verdict and guard result: `merge`, `needs-approval` or `blocked`, and the PR comment         |
-| `up` / `down` / `status --service <svc>`         | The service's local stack                                                                                                           |
-| `reset --service <svc> --yes`                    | **Destructive**: wipes the service's local test data; refused without `--yes`                                                       |
-| `skills list` / `skills install`                 | The agent skills the binary carries                                                                                                 |
-| `services`, `help`, `version`                    | The project's services; the command catalogue (`help --json` returns it as data); the build's version                               |
+| Command                                                        | What it does                                                                                                                                                                                                |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init [--service <svc>] [--ci github] [--force]`               | Makes the current repository a project: `vgate.yaml` (pinned version), the service skeleton, the skills, the CI workflow                                                                                    |
+| `doctor [--service <svc>] [--fix]`                             | Checks tools and versions, the runtime, each service's config, contract and stack; every failed check names its fix                                                                                         |
+| `gate --service <svc> [--steps a,b]`                           | Runs every step and writes `reports/verdict.json`: steps, failed tests (scenario id, file, line, message), coverage, known failures                                                                         |
+| `guard --service <svc> --base <ref>`                           | Compares the expectations with a base ref: exit 0 `auto`, exit 1 `needs-human` with the findings; writes `reports/guard.json`                                                                               |
+| `inventory --service <svc> [--write]`                          | The test plan's skeleton from the vendored contract, for the agent to enrich                                                                                                                                |
+| `smoke --service <svc> --env <env>`                            | After a deploy: the smoke subset against a deployed environment; writes are refused before they are sent                                                                                                    |
+| `canary --service <svc> --env <env> [--for 10m]`               | While a version takes traffic: metrics against limits and baseline; 1 on breach (runs `--on-fail` once), 3 unknown                                                                                          |
+| `mutate --service <svc> --base <ref>`                          | Plants small bugs in the lines the change wrote and reruns the tests: the share caught is the mutation score; `policy.mutationScore` makes a low one ask for a human ([docs/mutation.md](docs/mutation.md)) |
+| `compat` / `config-check` / `migrations --service <svc>`       | Safe to deploy: the contract against the deployed version, the settings each environment needs, the database migrations ([docs/deploy-safety.md](docs/deploy-safety.md))                                    |
+| `incident add --service <svc> --title "…"` / `incident report` | An escaped bug becomes a scenario the coverage step enforces (`[INC-<n>]`); the report shows the share of escapes the gate would catch today                                                                |
+| `drift --env <env> [--service <svc>]`                          | Asks each provider's sandbox and holds the answers to the vendored contract the stubs use; 1 on drift, 3 when nothing could be asked                                                                        |
+| `affected --base <ref>`                                        | The services a change touches (by each `service.yaml`'s `paths:`) and the ones it deletes                                                                                                                   |
+| `risk --base <ref>`                                            | The change's risk tier (low, medium, high) and the file and rule behind it                                                                                                                                  |
+| `decide --base <ref> --evidence <dir>`                         | The pull request's decision from every verdict and guard result: `merge`, `needs-approval` or `blocked`, and the PR comment                                                                                 |
+| `up` / `down` / `status --service <svc>`                       | The service's local stack                                                                                                                                                                                   |
+| `reset --service <svc> --yes`                                  | **Destructive**: wipes the service's local test data; refused without `--yes`                                                                                                                               |
+| `skills list` / `skills install`                               | The agent skills the binary carries                                                                                                                                                                         |
+| `services`, `help`, `version`                                  | The project's services; the command catalogue (`help --json` returns it as data); the build's version                                                                                                       |
 
 Global flags: `--json`, `--quiet`, `--root <dir>` (default: the nearest parent holding `vgate.yaml`), `--service`,
 `--env` (default `$TEST_ENV` or `local`).
@@ -163,6 +172,5 @@ Requirements for development: Node 22, pnpm 10, Bun 1.4, uv (Schemathesis), Dock
 ## Roadmap
 
 - A license, and signed releases (minisign).
-- The web frontend: UI end-to-end tests with the same Playwright setup and the same guard.
 - NDJSON and WebSocket streams; asymmetric webhook signatures; more databases than PostgreSQL.
 - Scheduled runs against shared environments, where cross-service flows belong.

@@ -25,6 +25,7 @@
     "@vgate/framework": "link:framework"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
     "@eslint/js": "^10.0.1",
     "@go-task/cli": "^3.54.0",
     "@platformatic/kafka": "^2.16.0",

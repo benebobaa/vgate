@@ -20,6 +20,8 @@ export default defineConfig(
       `${services}/node_modules/**`,
       `${services}/*/generated/**`,
       `${services}/*/perf/**`,
+      // A UI service's own app (the page's scripts) is the code under test, not test code.
+      `${services}/*/public/**`,
     ],
   },
   js.configs.recommended,

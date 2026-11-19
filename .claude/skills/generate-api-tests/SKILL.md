@@ -27,6 +27,9 @@ contract-checked dependency stubs, run-unique data and faults. Your job is every
   `next`. `vgate help --json` lists every command.
 - **Docs** live in the vgate repository, not in the project: `https://github.com/benebobaa/vgate/blob/main/docs/`
   (below, _vgate docs_).
+- **A web UI** (`ui:` in `service.yaml`): the plan names pages and user flows instead of operations, and tests come
+  from `createUiTest()` (`@vgate/framework/ui/fixtures.ts`) with the browser checks and screenshot baselines of
+  vgate docs `frontend.md`.
 
 ## The rule that makes or breaks this
 
@@ -146,6 +149,10 @@ Re-run what you touched with `--steps`, e.g. `--steps typecheck,lint,test`; a pa
 
 Failures of the `contract` step (Schemathesis on read-only operations) and of `coverage` are classified the same way.
 Repeat until every remaining failure is a recorded finding.
+
+When `vgate.yaml` sets `policy.mutationScore`, finish on `vgate mutate --service <svc> --base <ref> --json`: each
+surviving mutant names a boundary or rule no test pins. Add the scenario its hint points to, from a source (vgate docs
+`mutation.md`), and run the gate again.
 
 ### Phase 5 - Report
 

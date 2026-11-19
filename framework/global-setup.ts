@@ -38,10 +38,12 @@ export default async function globalSetup(): Promise<void> {
     );
   }
   const runId = (process.env.RUN_ID ??= newRunId());
-  const observedDir = resolve(reportsDir, 'observed');
-  if (existsSync(observedDir)) {
-    for (const file of readdirSync(observedDir).filter((name) => !name.startsWith(`${runId}-`))) {
-      rmSync(resolve(observedDir, file), { force: true });
+  // The observed-call feed and the browser findings (framework/ui) of earlier runs never count for this one.
+  for (const feed of ['observed', 'ui']) {
+    const dir = resolve(reportsDir, feed);
+    if (!existsSync(dir)) continue;
+    for (const file of readdirSync(dir).filter((name) => !name.startsWith(`${runId}-`))) {
+      rmSync(resolve(dir, file), { force: true });
     }
   }
 

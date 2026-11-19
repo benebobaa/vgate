@@ -40,8 +40,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # example needs nothing; example-orders and example-migrations start sealed environments in Docker.
-        service: [example, example-orders, example-migrations]
+        # example needs nothing; example-orders and example-migrations start sealed environments in Docker; example-web
+        # drives a real browser (doctor --fix installs Chromium).
+        service: [example, example-orders, example-migrations, example-web]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

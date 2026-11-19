@@ -6,6 +6,7 @@ import { parseEnvironment, type EnvironmentDecl } from './env/declare.ts';
 import { readState } from './env/lifecycle.ts';
 import { hasPlaceholders, resolveDeep } from './env/placeholders.ts';
 import { project, readProject } from './project.ts';
+import { parseUi, type UiConfig } from './ui/config.ts';
 
 /** Absolute path of the project under test (framework/project.ts): its vgate.yaml's directory. */
 export const projectRoot = project.root;
@@ -233,7 +234,10 @@ export interface ServiceConfig {
   name: string;
   /** Absolute path of services/<name>. */
   dir: string;
-  /** Absolute path of the vendored OpenAPI contract. */
+  /**
+   * Absolute path of the vendored OpenAPI contract. A UI service (`ui:`) may have none: then this names where one
+   * would be, the file does not exist, and the contract steps (Schemathesis, response coverage) do not apply.
+   */
   specPath: string;
   backend?: { repo: string; syncedCommit?: string };
   /**
@@ -249,6 +253,8 @@ export interface ServiceConfig {
   env: EnvironmentConfig;
   /** The sealed environment a run starts for itself (`environment:`); absent when the service uses its stack.sh. */
   environment?: EnvironmentDecl;
+  /** A web frontend verified in a real browser (`ui:`, framework/ui); absent for an API service. */
+  ui?: UiConfig;
 }
 
 /** `paths:` of a service.yaml: a list of non-empty globs, or absent. Shared with `vgate affected`. */
@@ -326,6 +332,25 @@ export function parseCanary(value: unknown, where: string): CanaryConfig | undef
   };
 }
 
+/**
+ * The environment without its dependencies' `sandbox` blocks: only `vgate drift` reads those (and interpolates them
+ * itself), so a provider sandbox's secret that is not set never stops the gate.
+ */
+function withoutSandboxes(rawEnv: unknown): unknown {
+  const env = record(rawEnv);
+  const deps = env.dependencies;
+  if (!deps || typeof deps !== 'object' || Array.isArray(deps)) return rawEnv;
+  return {
+    ...env,
+    dependencies: Object.fromEntries(
+      Object.entries(deps as Record<string, unknown>).map(([name, dep]) => [
+        name,
+        dep && typeof dep === 'object' && !Array.isArray(dep) ? { ...dep, sandbox: undefined } : dep,
+      ]),
+    ),
+  };
+}
+
 const VAR = /\$\{([A-Z0-9_]+)(?::-([^}]*))?\}/g;
 
 function interpolate(value: unknown, where: string): unknown {
@@ -383,7 +408,7 @@ export function loadService(
   const top = record(interpolate({ ...raw, environments: undefined }, `${name} service.yaml`));
   const project = readProject(root);
   const environment = parseEnvironment(top.environment, { service: dir, project: project.root }, `${name} environment`);
-  let env = record(interpolate(rawEnv, `${name} environment ${envName}`));
+  let env = record(interpolate(withoutSandboxes(rawEnv), `${name} environment ${envName}`));
   let declared: EnvironmentConfig['declared'];
   let composeOfRun: EnvironmentConfig['compose'];
   if (environment && hasPlaceholders(env)) {
@@ -412,7 +437,12 @@ export function loadService(
   return {
     name,
     dir,
-    specPath: resolve(dir, required(text(top.spec), 'spec')),
+    // A UI service may have no contract of its own; an API service always has one.
+    specPath: resolve(
+      dir,
+      top.ui === undefined ? required(text(top.spec), 'spec') : (text(top.spec) ?? 'openapi.yaml'),
+    ),
+    ui: parseUi(top.ui, `${name} service.yaml ui`),
     backend: backend
       ? { repo: resolve(dir, required(text(backend.repo), 'backend.repo')), syncedCommit: text(backend.syncedCommit) }
       : undefined,

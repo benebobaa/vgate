@@ -16,6 +16,8 @@ import { compat } from './compat.ts';
 import { configCheck } from './config-check.ts';
 import { migrations } from './migrations.ts';
 import { mutate } from './mutate.ts';
+import { drift } from './drift.ts';
+import { incidentAdd, incidentReport } from './incident.ts';
 import { canary, parseDuration } from './canary.ts';
 import { smoke } from './smoke.ts';
 import { decide, DECISION_FILE } from './decide.ts';
@@ -132,6 +134,18 @@ const CATALOGUE = {
       usage: `${CLI} mutate --service <name> --base <git ref> [--budget 20] [--timeout 10m]`,
       about:
         "Do the tests catch bugs in the code this change touched? Plants one small bug at a time in the changed lines (comparisons, boundaries, conditions, flags, arithmetic, negation, numbers, returned text), rebuilds and restarts the app in a scratch copy, and runs the service's tests: score = caught / (caught + survived). Lists each survivor with the scenario that would catch it. Writes reports/mutation.json for decide (policy.mutationScore). Exit 1 below the policy.",
+    },
+    {
+      name: 'incident',
+      usage: `${CLI} incident add --service <name> --title "<what escaped>" [--ticket <id>] [--evidence <request id, curl or http-calls.json>] [--missed-by spec-gap|missing-scenario|stub-drift|environment|not-testable] [--reason <why not testable>] | ${CLI} incident report [--service <name>]`,
+      about:
+        'The learning loop. add records a bug that escaped to production as <service dir>/incidents/INC-<n>.yaml and its scenario in the plan; from then on the coverage step fails until a test titled [INC-<n>] guards it (not-testable needs a reason). report: why escapes got through, and the share of testable ones the gate would catch today.',
+    },
+    {
+      name: 'drift',
+      usage: `${CLI} drift --env <environment> [--service <name>] [--dependency <name>]`,
+      about:
+        "Has a provider changed under its vendored contract? Asks each dependency's sandbox (environments.<env>.dependencies.<name>.sandbox) and holds every answer strictly to the vendored contract the stubs use. Exit 1 drift (named field and operation), 3 a call not compared: the sandbox unreachable, refusing it (a documented 401 or 5xx), or its secret unset (never a pass). Writes reports/drift.json.",
     },
     {
       name: 'inventory',
@@ -265,6 +279,34 @@ async function run(argv: string[]): Promise<Result> {
       next: [],
       text: services,
     };
+  }
+  if (command === 'incident') {
+    const action = rest[0];
+    if (action === 'add') {
+      for (const flag of ['title', 'ticket', 'evidence', 'missed-by', 'reason'] as const)
+        if (args[flag] === true) throw new UsageError(`--${flag} needs a value`);
+      return incidentAdd(project, {
+        service: resolveService(root, serviceFlag),
+        title: str(args.title),
+        ticket: str(args.ticket),
+        evidence: str(args.evidence),
+        missedBy: str(args['missed-by']),
+        reason: str(args.reason),
+      });
+    }
+    if (action === 'report')
+      return incidentReport(project, serviceFlag === undefined ? undefined : resolveService(root, serviceFlag));
+    throw new UsageError(`Usage: ${CLI} incident add|report (see ${CLI} help)`);
+  }
+  if (command === 'drift') {
+    if (args.dependency === true) throw new UsageError("--dependency needs a name from the environment's dependencies");
+    if (args.env === undefined)
+      throw new UsageError('--env needs the environment whose dependencies declare a sandbox');
+    return drift(project, {
+      service: serviceFlag === undefined ? undefined : resolveService(root, serviceFlag),
+      env: envName,
+      dependency: str(args.dependency),
+    });
   }
   if (command === 'inventory') {
     const svc = loadService(resolveService(root, serviceFlag), envName, root);

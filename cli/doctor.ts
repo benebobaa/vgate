@@ -89,7 +89,11 @@ function runtimeVersions(runtime: Runtime): { node: string; pnpm: string } {
 
 const mac = process.platform === 'darwin';
 
-function toolChecks(runtime: Runtime, dockerNeededBy: string[]): Check[] {
+/**
+ * `uvNeeded`: some service runs the contract step (Schemathesis through uvx). A web frontend (`ui:`) has none, so a
+ * project of UI services only does not need uv.
+ */
+function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true): Check[] {
   const need = runtimeVersions(runtime);
   const specs: ToolSpec[] = [
     {
@@ -109,12 +113,16 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[]): Check[] {
     { id: 'git', command: 'git', args: ['--version'], fix: mac ? 'brew install git' : 'apt-get install -y git' },
     { id: 'bash', command: 'bash', args: ['--version'], fix: 'Install bash: every stack.sh needs it' },
     { id: 'curl', command: 'curl', args: ['--version'], fix: mac ? 'brew install curl' : 'apt-get install -y curl' },
-    {
-      id: 'uv',
-      command: 'uvx',
-      args: ['--version'],
-      fix: mac ? 'brew install uv' : 'curl -LsSf https://astral.sh/uv/install.sh | sh',
-    },
+    ...(uvNeeded
+      ? [
+          {
+            id: 'uv',
+            command: 'uvx',
+            args: ['--version'],
+            fix: mac ? 'brew install uv' : 'curl -LsSf https://astral.sh/uv/install.sh | sh',
+          },
+        ]
+      : []),
     {
       id: 'java',
       command: 'java',
@@ -250,7 +258,10 @@ async function serviceChecks(
   }
   const checks: Check[] = [{ id: id('config'), status: 'ok', detail: `environment ${envName}, ${svc.env.baseUrl}` }];
 
-  if (!existsSync(svc.specPath)) {
+  if (svc.ui && !existsSync(svc.specPath)) {
+    // A UI service may have no contract of its own: the browser verifies it (docs/frontend.md).
+    checks.push({ id: id('contract'), status: 'ok', detail: 'UI service without a contract: verified in the browser' });
+  } else if (!existsSync(svc.specPath)) {
     checks.push({
       id: id('contract'),
       status: 'fail',
@@ -258,22 +269,22 @@ async function serviceChecks(
       fix: `Vendor the backend's OpenAPI contract to ${dir}/ (skill: generate-api-tests)`,
     });
     return { checks, svc };
+  } else {
+    checks.push({ id: id('contract'), status: 'ok', detail: 'vendored contract present' });
+    const types = join(svc.dir, 'generated', 'openapi.ts');
+    const stale = !existsSync(types) || statSync(types).mtimeMs < statSync(svc.specPath).mtimeMs;
+    checks.push(
+      stale
+        ? {
+            id: id('types'),
+            status: 'fail',
+            detail: existsSync(types) ? 'contract types are older than the contract' : 'contract types not generated',
+            fix: `${CLI} doctor --fix`,
+            autofix: true,
+          }
+        : { id: id('types'), status: 'ok', detail: 'contract types are current' },
+    );
   }
-  checks.push({ id: id('contract'), status: 'ok', detail: 'vendored contract present' });
-
-  const types = join(svc.dir, 'generated', 'openapi.ts');
-  const stale = !existsSync(types) || statSync(types).mtimeMs < statSync(svc.specPath).mtimeMs;
-  checks.push(
-    stale
-      ? {
-          id: id('types'),
-          status: 'fail',
-          detail: existsSync(types) ? 'contract types are older than the contract' : 'contract types not generated',
-          fix: `${CLI} doctor --fix`,
-          autofix: true,
-        }
-      : { id: id('types'), status: 'ok', detail: 'contract types are current' },
-  );
 
   const up = await stackUp(svc);
   if (up === undefined) {
@@ -295,6 +306,16 @@ async function serviceChecks(
 const AUTOFIX: Record<string, (project: ProjectConfig, runtime: Runtime) => boolean> = {
   runtime: (_project, runtime) => ensureRuntime(runtime, (line) => process.stderr.write(`${line}\n`)).ok,
   links: (project, runtime) => linkProject(project, runtime).ok,
+  // Chromium only (no other browser), through the runtime's own Playwright; on Linux CI the system libraries come
+  // from `playwright install-deps chromium` (ci/github/vgate.yml).
+  browser: (_project, runtime) =>
+    capture(
+      join(runtime.root, 'node_modules', '.bin', 'playwright'),
+      ['install', 'chromium'],
+      runtime.root,
+      900_000,
+      toolEnv(),
+    ).code === 0,
   types: (project, runtime) =>
     capture(
       join(runtime.root, 'node_modules', '.bin', 'task'),
@@ -305,7 +326,51 @@ const AUTOFIX: Record<string, (project: ProjectConfig, runtime: Runtime) => bool
     ).code === 0,
 };
 /** Repairs depend on each other: the runtime first, then what leads to it, then what it generates. */
-const FIX_ORDER = ['runtime', 'links', 'types'];
+const FIX_ORDER = ['runtime', 'links', 'types', 'browser'];
+
+/** The Chromium the runtime's Playwright drives, as it reports it; undefined when the runtime cannot say. */
+function chromiumPath(runtime: Runtime): string | undefined {
+  const run = capture(
+    process.execPath,
+    ['-e', "process.stdout.write(require('@playwright/test').chromium.executablePath())"],
+    runtime.root,
+    30_000,
+    toolEnv(),
+  );
+  return run.code === 0 && run.out.trim() !== '' ? run.out.trim() : undefined;
+}
+
+/**
+ * Does any service run the contract step (Schemathesis through uvx)? Every service with a contract does, a UI service
+ * with one too; only a UI service without a contract does not. A service whose config does not load counts as needing
+ * it: never skip a check on missing information.
+ */
+export function uvNeeded(services: Array<ServiceConfig | undefined>): boolean {
+  return services.length === 0 || services.some((svc) => !svc || !svc.ui || existsSync(svc.specPath));
+}
+
+/** UI services drive a real browser: Chromium must be installed for the runtime's Playwright (docs/frontend.md). */
+export function browserCheck(runtime: Runtime, uiServices: string[], find = chromiumPath): Check | undefined {
+  if (uiServices.length === 0) return undefined;
+  const who = `needed by the UI service${uiServices.length === 1 ? '' : 's'} ${uiServices.join(', ')}`;
+  if (!existsSync(join(runtime.root, 'node_modules', '@playwright', 'test')))
+    return {
+      id: 'browser',
+      status: 'fail',
+      detail: `the runtime is not installed yet (${who})`,
+      fix: `${CLI} doctor --fix`,
+      autofix: true,
+    };
+  const path = find(runtime);
+  if (path && existsSync(path)) return { id: 'browser', status: 'ok', detail: `Chromium at ${path}` };
+  return {
+    id: 'browser',
+    status: 'fail',
+    detail: `Chromium is not installed for the runtime's Playwright (${who})`,
+    fix: `${CLI} doctor --fix`,
+    autofix: true,
+  };
+}
 
 async function collect(
   project: ProjectConfig,
@@ -316,11 +381,16 @@ async function collect(
   const perService = await Promise.all(services.map((name) => serviceChecks(project, name, envName)));
   const dockerNeededBy = perService.flatMap(({ svc }) => (svc?.env.compose ? [svc.name] : []));
   const links = linksCheck(project, runtime);
+  const browser = browserCheck(
+    runtime,
+    perService.flatMap(({ svc }) => (svc?.ui ? [svc.name] : [])),
+  );
   return [
-    ...toolChecks(runtime, dockerNeededBy),
+    ...toolChecks(runtime, dockerNeededBy, uvNeeded(perService.map(({ svc }) => svc))),
     projectCheck(project),
     runtimeCheck(runtime),
     ...(links ? [links] : []),
+    ...(browser ? [browser] : []),
     ...perService.flatMap(({ checks }) => checks),
   ];
 }

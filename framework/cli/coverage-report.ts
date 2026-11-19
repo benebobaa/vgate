@@ -5,7 +5,8 @@
  *   tsx framework/cli/coverage-report.ts --service example [--strict]
  *
  * Writes reports/coverage/coverage.{md,json}. With --strict it exits 1 on a gap, on a response code the contract
- * does not document, or on an inventory scenario without a test.
+ * does not document, on an inventory scenario without a test, or on an incident (framework/incidents.ts) that no
+ * scenario of the plan and no collected test guards.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
@@ -13,6 +14,8 @@ import { parse } from 'yaml';
 import { testcaseNames } from '../../cli/junit.ts';
 import { loadService, reportsDir, type CoverageExclusion } from '../config.ts';
 import { loadContract, type DocumentedPair } from '../http/openapi.ts';
+import { incidentCoverage, readIncidents } from '../incidents.ts';
+import { committedBaselines, comparedBaselines, uncomparedBaselines } from '../ui/baselines.ts';
 import { fail, parseArgs, str } from './args.ts';
 
 interface Observed {
@@ -118,6 +121,18 @@ const untested = scenarioIds.filter(
   (id) => !new RegExp(`(?<![A-Za-z0-9-])${escape(id)}(?![A-Za-z0-9-])`).test(testTitles),
 );
 
+// Incidents: every bug that escaped to production must be guarded by its own scenario and a collected test, unless it
+// is recorded as not testable with a reason. An unreadable incident file stops the report: it must never vanish.
+const incidents = incidentCoverage(readIncidents(svc.dir), new Set(scenarioIds), testTitles);
+const unguarded = incidents.filter((i) => i.state === 'no-scenario' || i.state === 'no-test');
+
+// A UI service with a contract: its committed visual baselines must each be compared by a test (framework/ui).
+const uncompared = svc.ui
+  ? uncomparedBaselines(committedBaselines(svc.dir), comparedBaselines(reportsDir)).map((path) =>
+      relative(svc.dir, path),
+    )
+  : [];
+
 const count = (state: State) => rows.filter((r) => r.state === state).length;
 const covered = count('covered');
 const excluded = count('excluded');
@@ -135,6 +150,7 @@ const md: string[] = [
   `- Gaps: **${gaps.length}**`,
   `- Responses outside the contract: **${undocumented.length}**`,
   `- Inventory scenarios without a test: **${untested.length}** of ${scenarioIds.length}`,
+  `- Incidents without a regression test: **${unguarded.length}** of ${incidents.length}`,
   '',
 ];
 if (gaps.length > 0) {
@@ -149,6 +165,14 @@ if (undocumented.length > 0) {
 }
 if (untested.length > 0) {
   md.push('## Inventory scenarios without a test', '', ...untested.map((id) => `- \`${id}\``), '');
+}
+if (uncompared.length > 0) {
+  md.push('## Visual baselines no test compares', '', ...uncompared.map((path) => `- \`${path}\``), '');
+}
+if (incidents.length > 0) {
+  md.push('## Incidents', '', '| Incident | Missed by | State |', '|---|---|---|');
+  incidents.forEach((i) => md.push(`| \`${i.id}\` ${i.title} | ${i.missedBy ?? '-'} | ${i.detail} |`));
+  md.push('');
 }
 md.push('## Matrix', '');
 for (const op of contract.operations) {
@@ -179,6 +203,8 @@ writeFileSync(
       rows,
       undocumented,
       untested,
+      incidents,
+      uncomparedBaselines: uncompared,
     },
     null,
     2,
@@ -187,10 +213,18 @@ writeFileSync(
 
 process.stdout.write(
   `Coverage ${svc.name}: ${covered}/${demanded} documented responses (${percent}%), ${excluded} excluded, ` +
-    `${gaps.length} gaps, ${undocumented.length} outside the contract, ${untested.length}/${scenarioIds.length} scenarios untested\n` +
+    `${gaps.length} gaps, ${undocumented.length} outside the contract, ${untested.length}/${scenarioIds.length} scenarios untested` +
+    (incidents.length > 0 ? `, ${unguarded.length}/${incidents.length} incidents unguarded` : '') +
+    '\n' +
     gaps.map((g) => `  GAP        ${g.operation} ${g.status} ${g.code ?? '-'}\n`).join('') +
     undocumented.map((u) => `  UNDOCUMENTED ${opKey(u)} ${u.status} ${u.code ?? '-'} (${u.test})\n`).join('') +
     untested.map((id) => `  UNTESTED   ${id}\n`).join('') +
+    unguarded.map((i) => `  INCIDENT   ${i.detail}\n`).join('') +
+    uncompared.map((path) => `  UNCOMPARED ${path} (a committed baseline no test compares)\n`).join('') +
     `Report: ${relative(process.cwd(), resolve(outDir, 'coverage.md'))}\n`,
 );
-if (args.strict === true && (gaps.length > 0 || undocumented.length > 0 || untested.length > 0)) process.exit(1);
+if (
+  args.strict === true &&
+  (gaps.length > 0 || undocumented.length > 0 || untested.length > 0 || unguarded.length > 0 || uncompared.length > 0)
+)
+  process.exit(1);

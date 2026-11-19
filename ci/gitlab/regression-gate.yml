@@ -130,6 +130,12 @@ vgate:gate:$[[ inputs.service ]]:
       set +e
       vgate doctor --root "$CI_PROJECT_DIR" --service "$SERVICE" --env "$TEST_ENV" --fix
       status=$?
+      # A UI service drives a real Chromium (docs/frontend.md): doctor --fix installed it; its system libraries come
+      # from the runtime's own Playwright (the job runs as root in the vgate image).
+      if [ $status -eq 0 ] && grep -qE '^ui:' "$CI_PROJECT_DIR/$services_dir/$SERVICE/service.yaml"; then
+        runtime=$(find "${VGATE_HOME:-$HOME/.cache/vgate}" -maxdepth 2 -type d -name runtime | head -1)
+        "$runtime/node_modules/.bin/playwright" install-deps chromium || status=3
+      fi
       started=false
       if [ $status -eq 0 ]; then
         started=true

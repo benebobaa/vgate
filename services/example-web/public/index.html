@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Notes</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Notes</h1>
+    </header>
+    <main>
+      <section id="signin" aria-labelledby="signin-title">
+        <h2 id="signin-title">Sign in</h2>
+        <form id="signin-form" novalidate>
+          <label for="key">API key</label>
+          <input id="key" name="key" type="password" autocomplete="off" />
+          <button type="submit">Sign in</button>
+        </form>
+        <p id="signin-error" class="error" role="alert"></p>
+      </section>
+
+      <section id="notes" aria-labelledby="notes-title" hidden>
+        <h2 id="notes-title">Your notes</h2>
+        <form id="new-note" novalidate>
+          <label for="title">Title</label>
+          <input id="title" name="title" maxlength="200" />
+          <label for="body">Body</label>
+          <textarea id="body" name="body" rows="3"></textarea>
+          <button type="submit">Add note</button>
+        </form>
+        <p id="form-error" class="error" role="alert"></p>
+        <ul id="list" aria-label="Notes"></ul>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+    <!--CALL_HOME-->
+  </body>
+</html>
