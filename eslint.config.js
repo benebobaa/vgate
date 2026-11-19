@@ -73,6 +73,26 @@ export default defineConfig(
     },
   },
   {
+    // The write guard leaves the framework's own calls alone (framework/http/write-guard.ts): a test that took that
+    // door would write to a shared environment unchecked.
+    files: [`${services}/*/tests/**/*.ts`, `${services}/*/support/**/*.ts`],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: 'write-guard(\\.ts)?$',
+              importNames: ['asFramework', 'frameworkFetch', 'unguarded'],
+              message:
+                "The framework's own calls skip the write guard; a test calls through the client, `request` or fetch.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     // The framework's and the CLI's own tests (node:test): describe/it return promises the runner awaits itself.
     files: ['framework/**/*.test.ts', 'cli/**/*.test.ts'],
     rules: {

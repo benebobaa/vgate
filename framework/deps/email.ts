@@ -2,6 +2,7 @@
  * The inbox of a `mailpit` dependency: every message the service sent, read through Mailpit's HTTP API. For asserting
  * that a verification mail went out, to whom, and for following the link in it.
  */
+import { frameworkFetch, type DependencyGuard } from '../http/write-guard.ts';
 
 export interface MailSummary {
   id: string;
@@ -59,12 +60,16 @@ export interface MailQuery {
 export class Inbox {
   private readonly api: string;
 
-  constructor(apiUrl: string) {
+  /** `guard` runs before `clear` (`<dependency>:delete`); reading the inbox is never guarded. */
+  constructor(
+    apiUrl: string,
+    private readonly guard: DependencyGuard = () => undefined,
+  ) {
     this.api = apiUrl.replace(/\/$/, '');
   }
 
   private async json<T>(path: string, init?: RequestInit): Promise<T> {
-    const res = await fetch(`${this.api}${path}`, init);
+    const res = await frameworkFetch(`${this.api}${path}`, init);
     if (!res.ok) throw new Error(`Mailpit ${init?.method ?? 'GET'} ${path}: ${res.status} ${await res.text()}`);
     return (await res.json()) as T;
   }
@@ -117,7 +122,8 @@ export class Inbox {
 
   /** Deletes every message (disposable environments only: it is the whole inbox, not the test's). */
   async clear(): Promise<void> {
-    const res = await fetch(`${this.api}/api/v1/messages`, { method: 'DELETE' });
+    this.guard('delete');
+    const res = await frameworkFetch(`${this.api}/api/v1/messages`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`Mailpit DELETE /api/v1/messages: ${res.status}`);
   }
 }

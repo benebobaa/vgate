@@ -11,10 +11,12 @@
  *   broker    the rabbitmq dependency                       (framework/deps/amqp.ts)
  *
  * Each is created on first use, once per worker, and fails with what the environment lacks when it has no such
- * dependency (or several).
+ * dependency (or several). In a non-disposable environment every operation that changes a dependency is refused
+ * unless `allowWrites` lists `<dependency>:<operation>`, and a MySQL session is read-only (docs/after-deploy.md).
  */
 import { AmqpBroker } from './amqp.ts';
-import { soleOf, type CatalogDependency } from './catalog-config.ts';
+import { soleEntryOf, type CatalogDependency } from './catalog-config.ts';
+import { guardDependency, isAllowedDependencyWrite } from '../http/write-guard.ts';
 import { Inbox } from './email.ts';
 import { createDepsTest } from './fixtures.ts';
 import { MongoDocs } from './mongo.ts';
@@ -38,29 +40,32 @@ export function createCatalogTest<P>() {
   return createDepsTest<P>().extend<object, CatalogWorkerFixtures>({
     inbox: [
       async ({ svc }, use) => {
-        const dep = soleOf((svc.env.dependencies ?? {}) as Deps, ['mailpit'], 'inbox', svc.env.name);
-        await use(new Inbox(dep.apiUrl));
+        const [name, dep] = soleEntryOf((svc.env.dependencies ?? {}) as Deps, ['mailpit'], 'inbox', svc.env.name);
+        await use(new Inbox(dep.apiUrl, guardDependency(svc.env, name)));
       },
       { scope: 'worker' },
     ],
     objects: [
       async ({ svc }, use) => {
-        const dep = soleOf((svc.env.dependencies ?? {}) as Deps, ['s3', 'aws'], 'objects', svc.env.name);
-        await use(new S3Store(dep));
+        const [name, dep] = soleEntryOf((svc.env.dependencies ?? {}) as Deps, ['s3', 'aws'], 'objects', svc.env.name);
+        await use(new S3Store(dep, guardDependency(svc.env, name)));
       },
       { scope: 'worker' },
     ],
     queues: [
       async ({ svc }, use) => {
-        const dep = soleOf((svc.env.dependencies ?? {}) as Deps, ['aws'], 'queues', svc.env.name);
-        await use(new SqsQueues(dep));
+        const [name, dep] = soleEntryOf((svc.env.dependencies ?? {}) as Deps, ['aws'], 'queues', svc.env.name);
+        await use(new SqsQueues(dep, guardDependency(svc.env, name)));
       },
       { scope: 'worker' },
     ],
     mysql: [
       async ({ svc }, use) => {
-        const dep = soleOf((svc.env.dependencies ?? {}) as Deps, ['mysql'], 'mysql', svc.env.name);
-        const db = MySqlDb.connect(dep.url);
+        const [name, dep] = soleEntryOf((svc.env.dependencies ?? {}) as Deps, ['mysql'], 'mysql', svc.env.name);
+        const db = MySqlDb.connect(dep.url, {
+          readOnly: !svc.env.disposable && !isAllowedDependencyWrite(name, 'write', svc.env.allowWrites),
+          guard: guardDependency(svc.env, name),
+        });
         await use(db);
         await db.close();
       },
@@ -68,7 +73,8 @@ export function createCatalogTest<P>() {
     ],
     mongo: [
       async ({ svc }, use) => {
-        const dep = soleOf((svc.env.dependencies ?? {}) as Deps, ['mongodb'], 'mongo', svc.env.name);
+        // MongoDocs only reads (find, count): nothing to guard.
+        const [, dep] = soleEntryOf((svc.env.dependencies ?? {}) as Deps, ['mongodb'], 'mongo', svc.env.name);
         const docs = await MongoDocs.connect(dep.url);
         await use(docs);
         await docs.close();
@@ -77,8 +83,8 @@ export function createCatalogTest<P>() {
     ],
     broker: [
       async ({ svc }, use) => {
-        const dep = soleOf((svc.env.dependencies ?? {}) as Deps, ['rabbitmq'], 'broker', svc.env.name);
-        const broker = await AmqpBroker.connect(dep.url);
+        const [name, dep] = soleEntryOf((svc.env.dependencies ?? {}) as Deps, ['rabbitmq'], 'broker', svc.env.name);
+        const broker = await AmqpBroker.connect(dep.url, guardDependency(svc.env, name));
         await use(broker);
         await broker.close();
       },

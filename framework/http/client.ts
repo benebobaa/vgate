@@ -7,7 +7,7 @@ import { signWebhook, type SignOptions } from '../webhooks/sign.ts';
 import type { OpenApiContract } from './openapi.ts';
 import { checkDatetimeOffsets, checkHeaders } from './rules.ts';
 import { isEventStream, isMarkerOnly, parseSse, SseParser, terminalOf, type SseEvent } from './sse.ts';
-import { guardWrite } from './write-guard.ts';
+import { asFramework, guardWrite, frameworkFetch } from './write-guard.ts';
 
 // ---- Types derived from openapi-typescript's `paths` ------------------------------------------------------------
 
@@ -506,7 +506,13 @@ export class ApiClient<P = Record<string, unknown>> {
     arm();
     let response: Response;
     try {
-      response = await fetch(url, { method, headers, body: data, signal: controller.signal, redirect: 'manual' });
+      response = await frameworkFetch(url, {
+        method,
+        headers,
+        body: data,
+        signal: controller.signal,
+        redirect: 'manual',
+      });
     } catch (error) {
       clearTimeout(timer);
       throw new Error(
@@ -612,7 +618,10 @@ export class ApiClient<P = Record<string, unknown>> {
     const { url, origin, headers, data } = await this.prepare(method, template, options, auth);
 
     const started = Date.now();
-    const response = await this.request.fetch(url, { method, headers, data, failOnStatusCode: false, maxRedirects: 0 });
+    // Guarded by its operation's template (prepare): the raw guard, which judges a test's own requests, leaves it alone.
+    const response = await asFramework(() =>
+      this.request.fetch(url, { method, headers, data, failOnStatusCode: false, maxRedirects: 0 }),
+    );
     const text = await response.text();
     const streaming = isEventStream(response.headers()['content-type']);
     const result = new ApiResult<O>(

@@ -8,6 +8,7 @@ import type { ProjectConfig } from '../framework/project.ts';
 import { stackUp } from './doctor.ts';
 import { CLI, EXIT, UsageError, tail, type Result } from './output.ts';
 import { prepare, stepEnv, type Runtime } from './runtime.ts';
+import { sweepMutate } from './mutate.ts';
 
 export interface Streamed {
   /** Exit code; null when the program could not be started or was killed. */
@@ -62,7 +63,25 @@ export interface StackOptions {
   live: boolean;
 }
 
+/** up / down / status / reset; `down` also removes what an interrupted `vgate mutate` of the service left behind. */
 export async function stack(project: ProjectConfig, runtime: Runtime, options: StackOptions): Promise<Result> {
+  const result = await stackAction(project, runtime, options);
+  if (options.action !== 'down') return result;
+  const swept = await sweepMutate(project, options.service);
+  if (swept.busy !== undefined)
+    return {
+      ...result,
+      summary: `${result.summary}; a vgate mutate run (pid ${swept.busy}) is still going: left alone`,
+    };
+  if (swept.removed.length === 0) return result;
+  return {
+    ...result,
+    summary: `${result.summary}; removed what an interrupted vgate mutate left: ${swept.removed.join(', ')}`,
+    data: { ...(result.data as object), mutateLeftovers: swept.removed },
+  };
+}
+
+async function stackAction(project: ProjectConfig, runtime: Runtime, options: StackOptions): Promise<Result> {
   const { service, action } = options;
   const root = project.root;
   // The CLI never prompts (its caller may be an agent with no terminal): the flag is the consent.

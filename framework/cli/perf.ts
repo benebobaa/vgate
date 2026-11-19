@@ -13,6 +13,12 @@ import { fail, parseArgs, str } from './args.ts';
 
 const args = parseArgs(process.argv.slice(2));
 const svc = loadService(str(args.service));
+// Load against a shared environment (staging, production) is a decision, never a default: the environment says so.
+if (!svc.env.disposable && svc.env.allowLoad !== true)
+  fail(
+    `k6 refused: environment ${svc.env.name} is not disposable. Load against it needs ` +
+      `environments.${svc.env.name}.allowLoad: true in ${svc.name}'s service.yaml (docs/after-deploy.md).`,
+  );
 const script = resolve(svc.dir, 'perf', `${str(args.script, 'smoke')}.ts`);
 if (!existsSync(script)) fail(`No k6 script at ${script}`);
 const user = str(args.user) ?? Object.keys(svc.env.users)[0] ?? fail('No seeded users');

@@ -4,6 +4,7 @@
  * example in aws-sign.test.ts.
  */
 import { createHash, createHmac } from 'node:crypto';
+import { frameworkFetch } from '../http/write-guard.ts';
 
 export interface AwsCredentials {
   accessKey: string;
@@ -97,7 +98,7 @@ export async function awsFetch(
   req: Omit<SignableRequest, 'now'>,
   creds: AwsCredentials,
 ): Promise<{ status: number; text: string; headers: Headers }> {
-  const response = await fetch(req.url, {
+  const response = await frameworkFetch(req.url, {
     method: req.method,
     headers: signRequest(req, creds),
     body: req.body === undefined ? undefined : typeof req.body === 'string' ? req.body : Buffer.from(req.body),

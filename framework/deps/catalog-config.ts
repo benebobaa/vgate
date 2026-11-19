@@ -83,11 +83,21 @@ export function soleOf<K extends CatalogDependency['kind']>(
   fixture: string,
   environment: string,
 ): Extract<CatalogDependency, { kind: K }> {
+  return soleEntryOf(deps, kinds, fixture, environment)[1];
+}
+
+/** soleOf with the dependency's name (what `allowWrites` entries name: `<name>:<operation>`). */
+export function soleEntryOf<K extends CatalogDependency['kind']>(
+  deps: Record<string, { kind: string }>,
+  kinds: readonly K[],
+  fixture: string,
+  environment: string,
+): [string, Extract<CatalogDependency, { kind: K }>] {
   const found = Object.entries(deps).filter(([, dep]) => (kinds as readonly string[]).includes(dep.kind));
   if (found.length !== 1)
     throw new Error(
       `The ${fixture} fixture needs exactly one ${kinds.join(' or ')} dependency in environment ${environment} ` +
         `(found ${found.length}${found.length ? `: ${found.map(([name]) => name).join(', ')}` : ''})`,
     );
-  return found[0][1] as Extract<CatalogDependency, { kind: K }>;
+  return [found[0][0], found[0][1] as Extract<CatalogDependency, { kind: K }>];
 }

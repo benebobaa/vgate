@@ -7,6 +7,7 @@ import { Auth } from '../auth/auth.ts';
 import type { EnvironmentConfig, ServiceConfig } from '../config.ts';
 import { ApiClient, CallRecorder, queryString } from './client.ts';
 import { OpenApiContract } from './openapi.ts';
+import { installRawGuard } from './write-guard.ts';
 
 // A REST service that knows nothing of any real backend: GET with query parameters, DELETE, an API key in X-Api-Key, no
 // envelope. `GET /items?bad=...` misbehaves on demand so the checks can be seen to fail.
@@ -154,6 +155,30 @@ describe('ApiClient', () => {
     assert.equal(res.status, 204);
     assert.equal(seen.at(-1)?.url, '/items/a%2Fb');
     await ctx.dispose();
+  });
+
+  it('in a shared environment, makes a write its allowWrites template allows, with the raw guard on', async () => {
+    // The raw guard judges a test's own requests by their concrete path: the client's call, judged by its template,
+    // must not be refused a second time (`/items/7` is not the template `/items/{id}`).
+    const shared = { ...env, disposable: false, allowWrites: ['DELETE /items/{id}'] };
+    const restore = installRawGuard(shared, { baseUrl: env.baseUrl });
+    const ctx = await request.newContext();
+    try {
+      const api = new ApiClient(
+        ctx,
+        { ...svc, env: shared },
+        contract,
+        new Auth(shared),
+        new CallRecorder(undefined, 'selftest'),
+      );
+      const res = await api.as('reader').send('DELETE', '/items/{id}', { params: { id: '7' } });
+      assert.equal(res.status, 204);
+      assert.equal(seen.at(-1)?.url, '/items/7');
+      await assert.rejects(ctx.delete(`${env.baseUrl}/items/7`), /write refused/, 'the same request from a test');
+    } finally {
+      await ctx.dispose();
+      restore();
+    }
   });
 
   it('calls anonymously for a user without credentials', async () => {

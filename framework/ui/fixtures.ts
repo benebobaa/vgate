@@ -6,9 +6,10 @@
  *     redirect to such an origin, which Playwright cannot route, is recorded;
  *   - console errors (and failed `console.assert`s) and page errors, and failed requests to the app's own origin, in
  *     the page and in every popup it opens, fail the test unless it expects them;
- *   - accessibility: axe-core runs after every `page.goto` and at the end of the test; findings at or above
- *     `ui.a11y.minImpact` fail it, and so does a page of the app reached otherwise (a click, a form, client-side
- *     routing) that the test never checked with `ui.checkA11y()`;
+ *   - accessibility: axe-core runs after every `page.goto`, on every popup the page opens once it has loaded, and at
+ *     the end of the test; findings at or above `ui.a11y.minImpact` fail it, and so does a page of the app reached
+ *     otherwise (a click, a form, client-side routing) or a dialog shown on the same URL that the test never
+ *     checked with `ui.checkA11y()` while it was there;
  *   - visual baselines: the screenshots each test compares are recorded, so the coverage step can tell a committed
  *     baseline no test compares any more;
  *   - web vitals: LCP and CLS against `ui.budgets`, when set;
@@ -48,6 +49,15 @@ export interface UiFindings {
   screenshots?: string[];
   /** Pages of the app (origin + path) reached without `page.goto` and never checked for accessibility. */
   uncheckedPages?: string[];
+  /** Dialogs shown (a view change on the same URL) and never checked for accessibility while open. */
+  uncheckedDialogs?: string[];
+}
+
+/** A dialog the page showed: one record each time one becomes visible (`id` is unique in the context). */
+interface DialogShown {
+  id: string;
+  label: string;
+  url: string;
 }
 
 interface ExpectedRequest {
@@ -63,6 +73,9 @@ export class Ui {
   /** Pages of the app the main frame showed, and those axe checked: origin + path. */
   private readonly visited = new Set<string>();
   private readonly checked = new Set<string>();
+  /** Dialogs shown, and the ids of those axe ran while they were open. */
+  private readonly dialogs: DialogShown[] = [];
+  private readonly checkedDialogs = new Set<string>();
 
   constructor(
     private readonly page: Page,
@@ -114,10 +127,15 @@ export class Ui {
    * Runs axe on the page as it is now. It runs by itself after every goto and at the end of the test; a page reached
    * any other way (a click, a form, client-side routing) must be checked by the test once it has rendered.
    */
-  async checkA11y(): Promise<void> {
-    const url = this.page.url();
+  async checkA11y(target: Page = this.page): Promise<void> {
+    const url = target.url();
     if (!url.startsWith('http')) return;
-    const results = await new AxeBuilder({ page: this.page }).disableRules(this.config.a11y.disable).analyze();
+    // The dialogs open right now are checked by this run: a dialog is a view of its own on the same URL.
+    const open = await target
+      .evaluate(() => (globalThis as unknown as { __vgateDialogs?: { open(): string[] } }).__vgateDialogs?.open() ?? [])
+      .catch(() => [] as string[]);
+    const results = await new AxeBuilder({ page: target }).disableRules(this.config.a11y.disable).analyze();
+    for (const id of open) this.checkedDialogs.add(id);
     const page = this.pageOf(url);
     if (page) this.checked.add(page);
     for (const violation of results.violations) {
@@ -139,6 +157,19 @@ export class Ui {
   /** @internal Pages of the app the test reached and never checked for accessibility. */
   uncheckedPages(): string[] {
     return [...this.visited].filter((page) => !this.checked.has(page));
+  }
+
+  /** @internal The page showed a dialog. */
+  dialogShown(dialog: DialogShown): void {
+    this.dialogs.push(dialog);
+  }
+
+  /** @internal Dialogs shown and never checked for accessibility while they were open. */
+  uncheckedDialogs(): string[] {
+    return this.dialogs
+      .filter((d) => !this.checkedDialogs.has(d.id))
+      .map((d) => `"${d.label}" [${d.url}]`)
+      .filter((d, i, all) => all.indexOf(d) === i);
   }
 
   /** @internal Problems the test did not declare, as lines; empty when the page behaved. */
@@ -170,6 +201,10 @@ export class Ui {
         (p) =>
           `accessibility not checked on ${p}: the test reached it without page.goto; call await ui.checkA11y() once it has rendered`,
       ),
+      ...(f.uncheckedDialogs ?? []).map(
+        (d) =>
+          `accessibility not checked on the dialog ${d}: it was shown and closed without a check; call await ui.checkA11y() while it is open`,
+      ),
       ...f.budgetBreaches,
     ];
   }
@@ -186,6 +221,49 @@ const VITALS_SCRIPT = `(() => {
       for (const e of list.getEntries()) if (!e.hadRecentInput) v.cls += e.value;
     }).observe({ type: 'layout-shift', buffered: true });
   } catch {}
+})();`;
+
+// Runs in every page and popup before its scripts: reports each time a dialog becomes visible (role=dialog or
+// alertdialog, with or without aria-modal, or an open <dialog>) and answers which are open now. Ids are unique in
+// the context, so a check in one page never stands for a dialog of another.
+const DIALOG_SCRIPT = `(() => {
+  if (window.__vgateDialogs) return;
+  const doc = document;
+  const prefix = Math.random().toString(36).slice(2, 10);
+  let seq = 0;
+  const open = new Map();
+  // Modal or not: a dialog that forgets aria-modal is still a view of its own (and the commoner bug).
+  const isDialog = (el) => el.matches('[role="dialog"], [role="alertdialog"]') || (el.tagName === 'DIALOG' && el.open);
+  const visible = (el) => {
+    if (!el.isConnected || el.closest('[hidden]')) return false;
+    const style = getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0;
+  };
+  const labelOf = (el) => {
+    const by = el.getAttribute('aria-labelledby');
+    const named = by && doc.getElementById(by);
+    const heading = el.querySelector('h1, h2, h3, h4');
+    return (el.getAttribute('aria-label') || (named && named.textContent) || (heading && heading.textContent) || 'dialog').trim().slice(0, 80);
+  };
+  const scan = () => {
+    const now = new Set();
+    for (const el of doc.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog')) {
+      if (!isDialog(el) || !visible(el)) continue;
+      now.add(el);
+      if (!open.has(el)) {
+        const id = prefix + '-' + ++seq;
+        open.set(el, id);
+        try { window.__vgateDialogShown({ id, label: labelOf(el), url: location.href }); } catch {}
+      }
+    }
+    for (const el of [...open.keys()]) if (!now.has(el)) open.delete(el);
+  };
+  window.__vgateDialogs = { open: () => { scan(); return [...open.values()]; }, scan };
+  new MutationObserver(scan).observe(doc, {
+    subtree: true, childList: true, attributes: true,
+    attributeFilter: ['class', 'style', 'hidden', 'open', 'role', 'aria-modal'],
+  });
+  doc.addEventListener('DOMContentLoaded', scan);
 })();`;
 
 const RESOURCE_ERROR =
@@ -309,6 +387,26 @@ export function createUiTest<P = unknown>() {
 
         await page.clock.setFixedTime(new Date(config.clock));
         if (config.budgets) await page.addInitScript(VITALS_SCRIPT);
+        // Dialogs (a view change on the same URL) in the page and its popups: each one shown must be checked.
+        await context.exposeBinding('__vgateDialogShown', (_source, dialog: DialogShown) => ui.dialogShown(dialog));
+        await context.addInitScript(DIALOG_SCRIPT);
+        // A popup the page opens is checked for accessibility once it has loaded (and again at the end if still open).
+        const popups: Page[] = [];
+        const popupChecks: Array<Promise<void>> = [];
+        context.on('page', (popup) => {
+          if (popup === page) return;
+          popups.push(popup);
+          popupChecks.push(
+            popup
+              .waitForLoadState('load')
+              .then(() => {
+                // A popup that loaded is a page the test reached: unchecked (closed before the check ran) it fails.
+                ui.navigated(popup.url());
+                return ui.checkA11y(popup);
+              })
+              .catch(() => undefined),
+          );
+        });
 
         // Every navigation the test makes is checked for accessibility once the page has loaded.
         const goto = page.goto.bind(page);
@@ -320,6 +418,8 @@ export function createUiTest<P = unknown>() {
 
         await use(ui);
 
+        await Promise.all(popupChecks);
+        for (const popup of popups) if (!popup.isClosed()) await ui.checkA11y(popup).catch(() => undefined);
         if (!page.isClosed()) {
           await ui.checkA11y().catch(() => undefined);
           if (config.budgets) {
@@ -339,6 +439,7 @@ export function createUiTest<P = unknown>() {
         }
 
         findings.uncheckedPages = ui.uncheckedPages();
+        findings.uncheckedDialogs = ui.uncheckedDialogs();
         const file = resolve(reportsDir, 'ui', `${process.env.RUN_ID ?? 'run'}-w${testInfo.workerIndex}.jsonl`);
         mkdirSync(dirname(file), { recursive: true });
         appendFileSync(file, `${JSON.stringify(findings)}\n`);

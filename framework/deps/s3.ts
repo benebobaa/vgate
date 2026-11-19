@@ -2,6 +2,7 @@
  * An S3-compatible store (the `s3` kind, LocalStack's S3, or any endpoint), for asserting what the service stored:
  * an object exists, its content, what a prefix holds. Path-style addressing, which every local store supports.
  */
+import type { DependencyGuard } from '../http/write-guard.ts';
 import { awsEncode, awsFetch, xmlValues, type AwsCredentials } from './aws-sign.ts';
 
 export interface S3Config {
@@ -21,7 +22,14 @@ export class S3Store {
   private readonly endpoint: string;
   private readonly creds: AwsCredentials;
 
-  constructor(config: S3Config) {
+  /**
+   * `guard` runs before each operation that changes the store (`create-bucket`, `put`); in a non-disposable environment
+   * it refuses what `allowWrites` does not list (`<dependency>:put`). Reads are never guarded.
+   */
+  constructor(
+    config: S3Config,
+    private readonly guard: DependencyGuard = () => undefined,
+  ) {
     this.endpoint = config.endpoint.replace(/\/$/, '');
     this.creds = {
       accessKey: config.accessKey ?? 'vgate',
@@ -41,6 +49,7 @@ export class S3Store {
   }
 
   async createBucket(bucket: string): Promise<void> {
+    this.guard('create-bucket');
     const res = await this.call('PUT', this.url(bucket));
     // 409: it exists already, owned by us (BucketAlreadyOwnedByYou) - fine for a test setup.
     if (res.status >= 300 && res.status !== 409)
@@ -48,6 +57,7 @@ export class S3Store {
   }
 
   async put(bucket: string, key: string, body: string, contentType = 'application/octet-stream'): Promise<void> {
+    this.guard('put');
     const res = await this.call('PUT', this.url(bucket, key), body, { 'content-type': contentType });
     if (res.status >= 300) throw new Error(`S3 put ${bucket}/${key}: ${res.status} ${res.text}`);
   }

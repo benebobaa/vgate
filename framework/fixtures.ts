@@ -7,7 +7,7 @@ import { newRunId, uniqueFactory } from './data/unique.ts';
 import { Db } from './db/postgres.ts';
 import { ComposeFaults } from './faults/compose.ts';
 import { ApiClient, CallRecorder } from './http/client.ts';
-import { guardRequest, unguarded } from './http/write-guard.ts';
+import { guardRequest, installRawGuard, unguarded } from './http/write-guard.ts';
 import { loadContract, type OpenApiContract } from './http/openapi.ts';
 import { annotationFor, loadRegistry, lookup, today, type KnownFailure } from './known-failures.ts';
 
@@ -39,6 +39,19 @@ export interface FrameworkWorkerFixtures {
   unique: (prefix: string) => string;
   /** The service's known-failures registry (services/<svc>/known-failures.yaml), validated by global setup. */
   knownFailures: KnownFailure[];
+}
+
+/**
+ * In a non-disposable environment, a test's own `fetch` or node:http(s) request is held to the write guard too: judged
+ * by its path when it goes to the base URL, refused when it writes anywhere else (docs/after-deploy.md). On from the
+ * moment a spec imports the framework, not from a fixture: a spec's module scope runs first, in the runner too when it
+ * lists the tests. A service that does not load here fails in the `svc` fixture, with its reason.
+ */
+try {
+  const svc = loadService();
+  installRawGuard(svc.env, { baseUrl: svc.env.baseUrl }, svc.schemathesis);
+} catch {
+  // reported by the svc fixture
 }
 
 /**

@@ -2,6 +2,7 @@
  * SQS queues on LocalStack (or any SQS-compatible endpoint), for asserting what the service queued and for feeding it
  * messages. The query protocol (form-encoded, XML answers), which every SQS implementation speaks.
  */
+import type { DependencyGuard } from '../http/write-guard.ts';
 import { awsFetch, xmlValues, type AwsCredentials } from './aws-sign.ts';
 
 export interface SqsConfig {
@@ -30,7 +31,14 @@ export class SqsQueues {
   private readonly endpoint: string;
   private readonly creds: AwsCredentials;
 
-  constructor(config: SqsConfig) {
+  /**
+   * `guard` runs before each operation that changes a queue: `create`, `send`, and `receive` (which deletes what it
+   * receives). In a non-disposable environment it refuses what `allowWrites` does not list (`<dependency>:send`).
+   */
+  constructor(
+    config: SqsConfig,
+    private readonly guard: DependencyGuard = () => undefined,
+  ) {
     this.endpoint = config.endpoint.replace(/\/$/, '');
     this.creds = {
       accessKey: config.accessKey ?? 'test',
@@ -60,6 +68,7 @@ export class SqsQueues {
   }
 
   async create(name: string): Promise<string> {
+    this.guard('create');
     return this.rebase(xmlValues(await this.action({ Action: 'CreateQueue', QueueName: name }), 'QueueUrl')[0]);
   }
 
@@ -70,6 +79,7 @@ export class SqsQueues {
   }
 
   async send(name: string, body: string | object): Promise<string> {
+    this.guard('send');
     const text = typeof body === 'string' ? body : JSON.stringify(body);
     const xml = await this.action({ Action: 'SendMessage', MessageBody: text }, await this.urlOf(name));
     return xmlValues(xml, 'MessageId')[0];
@@ -77,6 +87,7 @@ export class SqsQueues {
 
   /** Receives (and deletes) up to 10 messages, waiting up to `waitSeconds` for the first. */
   async receive(name: string, { waitSeconds = 1 } = {}): Promise<QueueMessage[]> {
+    this.guard('receive');
     const url = await this.urlOf(name);
     const xml = await this.action(
       { Action: 'ReceiveMessage', MaxNumberOfMessages: '10', WaitTimeSeconds: String(waitSeconds) },

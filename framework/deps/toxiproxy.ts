@@ -5,6 +5,7 @@
  * which the serial `faults` project runs alone.
  */
 import type { DependencyConfig, HttpStubDependency, ToxiproxyDependency } from './config.ts';
+import { frameworkFetch } from '../http/write-guard.ts';
 
 export class Toxiproxy {
   private readonly toxics: Array<{ proxy: string; name: string }> = [];
@@ -13,7 +14,7 @@ export class Toxiproxy {
   constructor(private readonly config: ToxiproxyDependency) {}
 
   private async api(path: string, init: RequestInit = {}): Promise<void> {
-    const response = await fetch(`${this.config.url}${path}`, {
+    const response = await frameworkFetch(`${this.config.url}${path}`, {
       ...init,
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(10_000),
