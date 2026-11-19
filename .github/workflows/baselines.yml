@@ -18,6 +18,7 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: corepack enable pnpm && pnpm install --frozen-lockfile
+      - run: pipx install uv
       - run: pnpm vgate doctor --service example-web --fix
       - run: pnpm vgate up --service example-web
       - name: Write the baselines
