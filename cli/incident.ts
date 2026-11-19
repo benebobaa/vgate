@@ -143,8 +143,19 @@ export function incidentAdd(project: ProjectConfig, options: IncidentAddOptions)
 
 const JUNIT = ['playwright-api.xml', 'playwright-faults.xml'];
 
-/** The titles of the tests the last run collected; undefined when no run has reported yet. */
-function collectedTitles(project: ProjectConfig): string | undefined {
+/**
+ * The titles of the tests the last gate run collected, for the service it ran; undefined for any other service, or
+ * when no gate has reported yet. The reports directory is shared by every service and incident ids are per service, so
+ * one service's [INC-1] test must never count for another's INC-1.
+ */
+function collectedTitles(project: ProjectConfig, service: string): string | undefined {
+  let ran: unknown;
+  try {
+    ran = (JSON.parse(readFileSync(join(project.reportsDir, 'verdict.json'), 'utf8')) as { service?: unknown }).service;
+  } catch {
+    return undefined;
+  }
+  if (ran !== service) return undefined;
   const dir = join(project.reportsDir, 'junit');
   const files = JUNIT.map((name) => join(dir, name)).filter((file) => existsSync(file));
   if (files.length === 0) return undefined;
@@ -170,14 +181,14 @@ export interface ServiceIncidents {
   service: string;
   incidents: IncidentState[];
   report: IncidentReport;
-  /** Where "has a regression test" was read: the last run's JUnit reports, or the test sources. */
+  /** Where "has a regression test" was read: the last gate run's JUnit reports (of this service), or the test sources. */
   testsFrom: 'last run' | 'test sources';
 }
 
 export function incidentReport(project: ProjectConfig, service: string | undefined): Result {
   const services = service ? [service] : listServices(project.root);
-  const run = collectedTitles(project);
   const per: ServiceIncidents[] = services.map((name) => {
+    const run = collectedTitles(project, name);
     const dir = join(project.servicesDir, name);
     const planFile = join(dir, 'inventory.yaml');
     const plan = existsSync(planFile) ? (parse(readFileSync(planFile, 'utf8')) as unknown) : undefined;

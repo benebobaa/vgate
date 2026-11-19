@@ -130,6 +130,36 @@ describe('vgate incident add and report', () => {
     assert.ok(!readFileSync(join(root, 'regression/orders/inventory.yaml'), 'utf8').includes('INC-1'));
   });
 
+  it("judges each service's incidents by its own tests, never by the last run of another service", () => {
+    const root = project();
+    mkdirSync(join(root, 'regression/payments'), { recursive: true });
+    writeFileSync(join(root, 'regression/payments/service.yaml'), 'name: payments\n');
+    writeFileSync(join(root, 'regression/payments/inventory.yaml'), 'service: payments\n');
+    for (const service of ['orders', 'payments'])
+      incidentAdd(readProject(root), { service, title: `${service} broke`, date: '2026-11-19' });
+    // The last gate ran payments, whose [INC-1] test guards payments' INC-1 only: incident ids are per service.
+    mkdirSync(join(root, 'reports/junit'), { recursive: true });
+    writeFileSync(
+      join(root, 'reports/junit/playwright-api.xml'),
+      '<testsuites><testsuite name="x"><testcase name="[INC-1] payments broke" classname="a.spec.ts"/></testsuite></testsuites>',
+    );
+    writeFileSync(
+      join(root, 'reports/verdict.json'),
+      JSON.stringify({ schema: 'vgate.verdict/1', service: 'payments' }),
+    );
+    const report = incidentReport(readProject(root), undefined);
+    const per = (
+      report.data as { services: Array<{ service: string; testsFrom: string; report: { guarded: number } }> }
+    ).services;
+    assert.deepEqual(
+      per.map((p) => [p.service, p.testsFrom, p.report.guarded]),
+      [
+        ['orders', 'test sources', 0],
+        ['payments', 'last run', 1],
+      ],
+    );
+  });
+
   it('appends to an existing incidents section', () => {
     const once = withIncidentScenario('service: s\n', { id: 'INC-1' });
     const twice = withIncidentScenario(once, { id: 'INC-2' });

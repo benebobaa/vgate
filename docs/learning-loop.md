@@ -57,8 +57,7 @@ vgate incident report [--service orders] [--json]
 ```
 
 Counts per `missedBy`, how many incidents a regression test now guards, and the share of testable escapes the gate
-would catch today (guarded / (all - not testable)). It reads the last run's JUnit reports; without a run, the test
-sources (and says so). Over months, watch two numbers: escapes per release going down, and the classes shifting away
+would catch today (guarded / (all - not testable)). It reads the JUnit reports of the last gate run for the service that run verified, and the test sources for every other service (and says which). Over months, watch two numbers: escapes per release going down, and the classes shifting away
 from `missing-scenario` (the plan is getting more complete) toward the rarer `environment` and `spec-gap`.
 
 ## Provider drift
