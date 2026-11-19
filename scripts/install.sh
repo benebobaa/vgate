@@ -1,24 +1,26 @@
 #!/bin/sh
-# Installs the vgate CLI: downloads the release for this OS and architecture, verifies its SHA-256 checksum (and the
-# minisign signature of the checksums when a public key is configured and minisign is installed), and puts the binary
+# Installs the vgate CLI: downloads the release for this OS and architecture, verifies its SHA-256 checksum and, when
+# minisign is installed, the release's signature of those checksums, and puts the binary
 # in a directory on your PATH. It never calls sudo.
 #
 #   curl -fsSL https://vgate.benelabs.tech/install.sh | sh
-#   curl -fsSL https://vgate.benelabs.tech/install.sh | VGATE_VERSION=0.5.0 sh
+#   curl -fsSL https://vgate.benelabs.tech/install.sh | VGATE_VERSION=0.6.0 sh
 #
 # Environment:
 #   VGATE_VERSION          version to install (default: the latest release)
 #   VGATE_INSTALL_DIR      where to put the binary (default: ~/.local/bin; /usr/local/bin when that is not
 #                          writable but /usr/local/bin is)
 #   VGATE_BASE_URL         where releases are served from
-#   VGATE_MINISIGN_PUBKEY  minisign public key (the base64 line) to verify SHA256SUMS against
+#   VGATE_MINISIGN_PUBKEY  another minisign public key (the base64 line) to verify SHA256SUMS against
 set -eu
 
 # Kept in step with NAME and BASE_URL in cli/release-config.ts (scripts/release.ts refuses a mismatch).
 NAME=vgate
 BASE_URL="${VGATE_BASE_URL:-https://vgate.benelabs.tech}"
-# The release signing key, once one exists (docs/releasing.md). Empty: only checksums are verified.
-PUBKEY="${VGATE_MINISIGN_PUBKEY:-}"
+# The release signing key (minisign.pub in the repository, docs/install.md). Releases from 0.6.0 on are signed: with
+# minisign installed, a missing or wrong signature refuses the install. Releases made before signing are listed below.
+PUBKEY="${VGATE_MINISIGN_PUBKEY:-RWQi+ioDcIKPgRudn0qWcaeiayx8ZecM+sYU5HFz9LL3oTe/HlX2Ux3g}"
+UNSIGNED_RELEASES=" 0.1.2 0.2.0 0.2.1 0.3.0 0.4.0 0.5.0 "
 
 say() { printf '%s\n' "$*"; }
 fail() {
@@ -120,6 +122,12 @@ main() {
   fetch "$BASE_URL/v$version/SHA256SUMS" "$tmp/SHA256SUMS"
   fetch "$BASE_URL/v$version/$file" "$tmp/$file"
 
+  case "$UNSIGNED_RELEASES" in
+    *" $version "*)
+      say "$NAME $version predates release signing: the checksum is verified, there is no signature"
+      PUBKEY=""
+      ;;
+  esac
   if [ -n "$PUBKEY" ]; then
     if command -v minisign >/dev/null 2>&1; then
       fetch "$BASE_URL/v$version/SHA256SUMS.minisig" "$tmp/SHA256SUMS.minisig"

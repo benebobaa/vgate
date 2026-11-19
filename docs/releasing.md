@@ -36,9 +36,11 @@ python3 -m http.server 8765 --directory dist/release &
 curl -fsSL http://127.0.0.1:8765/install.sh | VGATE_BASE_URL=http://127.0.0.1:8765 VGATE_INSTALL_DIR=/tmp/vgate-test sh
 ```
 
-To sign, set `VGATE_MINISIGN_KEY` to a minisign secret key file kept outside this repository; `SHA256SUMS.minisig`
-is written next to `SHA256SUMS`. Publish the public key (the website, this file) and set it as the default
-`PUBKEY` in `scripts/install.sh`.
+Every release is signed: build with `VGATE_MINISIGN_KEY` set to the minisign secret key, which lives outside the
+repository (the maintainer's copy: `~/.config/vgate/minisign.key`, mode 600; keep a backup somewhere safe). The build
+writes `SHA256SUMS.minisig`; `scripts/release.ts` refuses to publish without it, or when it does not verify against
+`minisign.pub`, or when `install.sh`'s default key differs. Rotating the key means a new `minisign.pub`, the new key in
+`install.sh`, and a release.
 
 ## 2. Dry run
 
@@ -91,13 +93,13 @@ This path does not check for an existing version: run `aws s3 ls s3://vgate-rele
 
 ## What the owner provides once
 
-| Item                     | Where                                                                                                                         |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| The bucket               | R2 > Create bucket `vgate-releases`                                                                                           |
-| Public access            | Bucket > Settings > Custom domain `vgate.benelabs.tech` (the `benelabs.tech` zone is in the account); keep the r2.dev URL off |
-| An API token             | My Profile > API Tokens: R2 edit on the account, for `--publish`                                                              |
-| A signing key (optional) | `minisign -G` on a trusted machine; the secret key never enters the repository                                                |
-| A license                | `LICENSE` at the repository root; the build packs it (a placeholder note until it exists)                                     |
+| Item            | Where                                                                                                                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| The bucket      | R2 > Create bucket `vgate-releases`                                                                                                   |
+| Public access   | Bucket > Settings > Custom domain `vgate.benelabs.tech` (the `benelabs.tech` zone is in the account); keep the r2.dev URL off         |
+| An API token    | My Profile > API Tokens: R2 edit on the account, for `--publish`                                                                      |
+| The signing key | `minisign -G` on a trusted machine; the secret key never enters the repository; for `release.yml`, secret `VGATE_MINISIGN_SECRET_KEY` |
+| The license     | `LICENSE` (Apache-2.0) at the repository root; the build packs it into every tarball                                                  |
 
 After the first publish, check from a clean machine:
 

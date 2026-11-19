@@ -17,8 +17,8 @@ Then ask your coding agent to _"onboard `api` from `<path to the backend>`"_. Th
 the contract, writes a test plan and stops for your review, then writes the tests, runs the gate and reports where the
 backend disagrees with its spec. Install details, pinning and verification: [docs/install.md](docs/install.md).
 
-> **Status:** 0.1, early. The source is visible here; a license has not been chosen yet, so until one is added no
-> rights beyond running the published binary are granted.
+> **Status:** early (0.x). Licensed under the [Apache License 2.0](LICENSE). Releases from 0.6.0 on are signed
+> (minisign; the public key is [minisign.pub](minisign.pub)).
 
 ## What the gate checks
 
@@ -171,6 +171,5 @@ Requirements for development: Node 22, pnpm 10, Bun 1.4, uv (Schemathesis), Dock
 
 ## Roadmap
 
-- A license, and signed releases (minisign).
 - NDJSON and WebSocket streams; asymmetric webhook signatures; more databases than PostgreSQL.
 - Scheduled runs against shared environments, where cross-service flows belong.
