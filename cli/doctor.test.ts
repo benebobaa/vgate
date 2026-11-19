@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import type { ServiceConfig } from '../framework/config.ts';
-import { atLeast, healthUrl, parseVersion } from './doctor.ts';
+import { atLeast, checkTool, healthUrl, parseVersion } from './doctor.ts';
 
 describe('parseVersion', () => {
   it('reads the version out of what each tool prints', () => {
@@ -59,5 +62,30 @@ describe('healthUrl', () => {
 
   it('is undefined for a service that names no health path', () => {
     assert.equal(healthUrl(service()), undefined);
+  });
+});
+
+describe('checkTool', () => {
+  it('reports the line that carries the version, past a heading', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vgate-doctor-'));
+    const tool = join(dir, 'tool');
+    writeFileSync(tool, '#!/bin/sh\necho "tool version information:"\necho "    revision: 4.91"\n');
+    chmodSync(tool, 0o755);
+    const check = checkTool({ id: 'tool', command: tool, args: ['-v'], fix: 'install it' });
+    assert.equal(check.status, 'ok');
+    assert.equal(check.detail, 'revision: 4.91');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('warns, not fails, when an optional tool such as lsof is missing', () => {
+    const check = checkTool({
+      id: 'lsof',
+      command: 'vgate-no-such-tool',
+      args: ['-v'],
+      optional: 'up restarts the app every time',
+      fix: 'apt-get install -y lsof',
+    });
+    assert.equal(check.status, 'warn');
+    assert.match(check.detail, /not installed \(up restarts the app every time\)/);
   });
 });

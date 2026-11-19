@@ -13,6 +13,18 @@ const METHODS = ['get', 'put', 'post', 'delete', 'patch', 'head', 'options'] as 
 // An http(s) id: Ajv's URI library rejects a URN without a namespace segment.
 const CONTRACT_ID = 'https://vgate.local/contract.json';
 const LOCAL_SCHEMA_REF = '#/components/schemas/';
+const CONTRACT_DEFS = `${CONTRACT_ID}#/$defs/`;
+// Under strictResponseProperties, the components as allOf members see them: not closed at their own level.
+const OPEN_ID = 'https://vgate.local/contract-open.json';
+const OPEN_DEFS = `${OPEN_ID}#/$defs/`;
+// Keywords whose value maps names to schemas: the map itself is not a schema and must not be closed.
+const SCHEMA_MAPS = new Set(['properties', 'patternProperties', '$defs', 'definitions']);
+// Keywords whose schemas apply at the parent's instance location, like allOf members: closed at their own level they
+// would reject the parent's properties. The parent's closing sees what they evaluate.
+const SAME_LOCATION = new Set(['allOf', 'then', 'else']);
+// Keywords whose result is a condition, not an assertion: closing them flips it. Under \`if\` a closed schema fails on a
+// body with more properties and skips \`then\`; under \`not\` it fails and so makes \`not\` pass. Left as written.
+const CONDITIONS = new Set(['if', 'not']);
 
 /** How the events of a `text/event-stream` response are described (docs/streaming.md). */
 export type EventSchemas =
@@ -113,18 +125,70 @@ function rewriteRefs(node: unknown): unknown {
   );
 }
 
-/** Forbids properties an object schema does not declare, unless the schema already decides that itself. */
-function closeObjects(node: unknown): void {
-  if (Array.isArray(node)) return node.forEach(closeObjects);
-  if (!isObject(node)) return;
-  if (
-    isObject(node.properties) &&
-    node.additionalProperties === undefined &&
-    node.unevaluatedProperties === undefined
-  ) {
-    node.unevaluatedProperties = false;
-  }
-  Object.values(node).forEach(closeObjects);
+/**
+ * Returns a function that forbids properties an object schema does not declare, unless the schema already decides
+ * that itself (strictResponseProperties). `unevaluatedProperties` only sees what was evaluated inside its own
+ * subschema, so a member of an `allOf` closed on its own would reject the properties its siblings declare. The closing
+ * therefore happens at the node holding the `allOf`, which sees the properties of every member (also through `$ref`),
+ * and members are walked "open": not closed at their own level, and their `$ref`s point at the open copy of the
+ * component (OPEN_ID), because the same component may be used standalone elsewhere and must stay closed there. Objects
+ * nested inside a member are a different instance location and are closed as usual. The alternatives of a `oneOf` or
+ * `anyOf` are each a complete object, so they stay closed on their own: opening them would let one alternative match
+ * a body meant for another and break `oneOf`.
+ */
+function objectCloser(defs: Json): (node: unknown, open?: boolean) => void {
+  const pristine = structuredClone(defs);
+  const component = (ref: unknown): unknown => {
+    if (typeof ref !== 'string') return undefined;
+    const prefix = [CONTRACT_DEFS, OPEN_DEFS].find((p) => ref.startsWith(p));
+    return prefix === undefined ? undefined : pristine[ref.slice(prefix.length)];
+  };
+  // Whether a schema, or anything it composes at the same instance location, declares properties. An allOf made only
+  // of free-form objects stays as open as those objects are.
+  const declares = (node: unknown, seen: Set<unknown>): boolean => {
+    if (!isObject(node) || seen.has(node)) return false;
+    seen.add(node);
+    if (isObject(node.properties)) return true;
+    if (declares(component(node.$ref), seen)) return true;
+    return Array.isArray(node.allOf) && node.allOf.some((member) => declares(member, seen));
+  };
+  // Inside a condition nothing is closed, and components are read open, so the condition says what the spec says.
+  const asWritten = (node: unknown): void => {
+    if (Array.isArray(node)) return node.forEach(asWritten);
+    if (!isObject(node)) return;
+    if (typeof node.$ref === 'string' && node.$ref.startsWith(CONTRACT_DEFS)) {
+      node.$ref = OPEN_DEFS + node.$ref.slice(CONTRACT_DEFS.length);
+    }
+    Object.values(node).forEach(asWritten);
+  };
+  const walk = (node: unknown, open: boolean): void => {
+    if (Array.isArray(node)) return node.forEach((item) => walk(item, false));
+    if (!isObject(node)) return;
+    const allOf = Array.isArray(node.allOf) ? node.allOf : [];
+    // Other schemas evaluate this instance location too: the allOf members, or the properties next to a $ref.
+    const shared = allOf.length > 0 || isObject(node.properties);
+    if (
+      !open &&
+      (isObject(node.properties) || (allOf.length > 0 && declares(node, new Set()))) &&
+      node.additionalProperties === undefined &&
+      node.unevaluatedProperties === undefined
+    ) {
+      node.unevaluatedProperties = false;
+    }
+    if ((open || shared) && typeof node.$ref === 'string' && node.$ref.startsWith(CONTRACT_DEFS)) {
+      node.$ref = OPEN_DEFS + node.$ref.slice(CONTRACT_DEFS.length);
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'allOf' && Array.isArray(value)) value.forEach((member) => walk(member, true));
+      else if (SAME_LOCATION.has(key)) walk(value, true);
+      else if (CONDITIONS.has(key)) asWritten(value);
+      else if (key === 'dependentSchemas' && isObject(value))
+        Object.values(value).forEach((schema) => walk(schema, true));
+      else if (SCHEMA_MAPS.has(key) && isObject(value)) Object.values(value).forEach((schema) => walk(schema, false));
+      else walk(value, false);
+    }
+  };
+  return (node, open = false) => walk(node, open);
 }
 
 /**
@@ -219,6 +283,8 @@ export class OpenApiContract {
   private readonly byKey = new Map<string, Operation>();
   private readonly validators = new Map<string, ValidateFunction>();
   private readonly ajv: Ajv2020;
+  /** Closes object schemas under strictResponseProperties; unset otherwise. */
+  private readonly close?: (node: unknown) => void;
 
   static load(path: string, options: ContractOptions = {}): OpenApiContract {
     return new OpenApiContract(parse(readFileSync(path, 'utf8')) as Json, options);
@@ -233,7 +299,14 @@ export class OpenApiContract {
     const components = isObject(spec.components) ? spec.components : {};
     const defs = rewriteRefs(structuredClone(components.schemas ?? {}));
     if (options.optionalPropertiesNullable) allowNullOnOptional(defs);
-    if (options.strictResponseProperties) closeObjects(defs);
+    if (options.strictResponseProperties && isObject(defs)) {
+      const close = objectCloser(defs);
+      const open = structuredClone(defs);
+      Object.values(open).forEach((schema) => close(schema, true));
+      Object.values(defs).forEach((schema) => close(schema));
+      this.ajv.addSchema({ $id: OPEN_ID, $defs: open });
+      this.close = close;
+    }
     this.ajv.addSchema({ $id: CONTRACT_ID, $defs: defs });
 
     const codeRe = options.codePattern ? new RegExp(options.codePattern, 'g') : undefined;
@@ -356,7 +429,7 @@ export class OpenApiContract {
     if (!validate) {
       const schema = structuredClone(raw);
       if (this.options.optionalPropertiesNullable) allowNullOnOptional(schema);
-      if (this.options.strictResponseProperties) closeObjects(schema);
+      this.close?.(schema);
       validate = this.ajv.compile(isObject(schema) ? schema : {});
       this.validators.set(key, validate);
     }

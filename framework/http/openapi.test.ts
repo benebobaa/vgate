@@ -191,6 +191,113 @@ describe('OpenApiContract with reusable components', () => {
   });
 });
 
+describe('strictResponseProperties with allOf', () => {
+  // A component used standalone and as an allOf member, the shape generators emit for "X plus a few fields".
+  const extended = (extra: Record<string, unknown>) => ({
+    allOf: [{ $ref: '#/components/schemas/ApiKey' }, { type: 'object', properties: extra }],
+  });
+  const json = (schema: unknown) => ({ description: 'OK', content: { 'application/json': { schema } } });
+  const composed = {
+    openapi: '3.1.0',
+    paths: {
+      '/keys/{id}': { get: { responses: { '200': json({ $ref: '#/components/schemas/ApiKey' }) } } },
+      '/keys': { post: { responses: { '201': json(extended({ secret: { type: 'string' } })) } } },
+      '/keys/rotated': { post: { responses: { '201': json({ $ref: '#/components/schemas/RotatedKey' }) } } },
+      '/wallets/{id}': {
+        get: {
+          responses: {
+            '200': json({ type: 'object', properties: { key: extended({ secret: { type: 'string' } }) } }),
+          },
+        },
+      },
+      '/keys/audited': {
+        get: {
+          responses: {
+            '200': json({
+              type: 'object',
+              properties: { auditedAt: { type: 'string' } },
+              allOf: [{ $ref: '#/components/schemas/ApiKey' }],
+            }),
+          },
+        },
+      },
+    },
+    components: {
+      schemas: {
+        ApiKey: {
+          type: 'object',
+          required: ['id'],
+          properties: { id: { type: 'string' }, owner: { $ref: '#/components/schemas/Owner' } },
+        },
+        Owner: { type: 'object', properties: { login: { type: 'string' } } },
+        RotatedKey: extended({ rotatedAt: { type: 'string' } }),
+      },
+    },
+  };
+  const strict = () => new OpenApiContract(structuredClone(composed), { strictResponseProperties: true });
+
+  it('accepts a body that is exactly an allOf of a component and an inline extension', () => {
+    assert.deepEqual(
+      strict().validateResponse('POST', '/keys', 201, { id: 'k', owner: { login: 'a' }, secret: 's' }),
+      [],
+    );
+    assert.deepEqual(strict().validateResponse('POST', '/keys/rotated', 201, { id: 'k', rotatedAt: 't' }), []);
+  });
+
+  it('rejects a property no member of the allOf declares', () => {
+    const c = strict();
+    assert.deepEqual(c.validateResponse('POST', '/keys', 201, { id: 'k', secret: 's', extra: 1 }), [
+      '/ must NOT have unevaluated properties "extra"',
+    ]);
+    assert.deepEqual(c.validateResponse('POST', '/keys/rotated', 201, { id: 'k', secret: 's' }), [
+      '/ must NOT have unevaluated properties "secret"',
+    ]);
+    // Objects nested inside a member stay closed on their own.
+    assert.deepEqual(c.validateResponse('POST', '/keys', 201, { id: 'k', owner: { login: 'a', y: 1 } }), [
+      '/owner must NOT have unevaluated properties "y"',
+    ]);
+  });
+
+  it('keeps the member component closed where it is used standalone', () => {
+    const c = strict();
+    assert.deepEqual(c.validateResponse('POST', '/keys', 201, { id: 'k', secret: 's' }), []);
+    assert.deepEqual(c.validateResponse('GET', '/keys/{id}', 200, { id: 'k' }), []);
+    assert.deepEqual(c.validateResponse('GET', '/keys/{id}', 200, { id: 'k', secret: 's' }), [
+      '/ must NOT have unevaluated properties "secret"',
+    ]);
+  });
+
+  it('closes an allOf nested in a property at that property', () => {
+    const c = strict();
+    assert.deepEqual(c.validateResponse('GET', '/wallets/{id}', 200, { key: { id: 'k', secret: 's' } }), []);
+    assert.deepEqual(c.validateResponse('GET', '/wallets/{id}', 200, { key: { id: 'k', secret: 's', x: 1 } }), [
+      '/key must NOT have unevaluated properties "x"',
+    ]);
+  });
+
+  it('closes a node with both allOf and its own properties at that node', () => {
+    const c = strict();
+    assert.deepEqual(c.validateResponse('GET', '/keys/audited', 200, { id: 'k', auditedAt: 't' }), []);
+    assert.deepEqual(c.validateResponse('GET', '/keys/audited', 200, { id: 'k', auditedAt: 't', x: 1 }), [
+      '/ must NOT have unevaluated properties "x"',
+    ]);
+  });
+
+  it('keeps each alternative of a oneOf closed, since each is a complete object', () => {
+    const spec = structuredClone(composed) as typeof composed & { paths: Record<string, unknown> };
+    spec.paths['/either'] = {
+      get: {
+        responses: {
+          '200': json({ oneOf: [{ $ref: '#/components/schemas/ApiKey' }, { $ref: '#/components/schemas/Owner' }] }),
+        },
+      },
+    };
+    const c = new OpenApiContract(spec, { strictResponseProperties: true });
+    assert.deepEqual(c.validateResponse('GET', '/either', 200, { login: 'a' }), []);
+    assert.equal(c.validateResponse('GET', '/either', 200, { login: 'a', extra: 1 }).length > 0, true);
+  });
+});
+
 describe('withoutTextStreamSchemas', () => {
   type Media = Record<string, Record<string, unknown>>;
   const stream = (media: Media) => ({ responses: { '200': { description: 'x', content: media } } });
@@ -225,5 +332,68 @@ describe('withoutTextStreamSchemas', () => {
     assert.deepEqual(content(out, '/events', 'get'), content(spec, '/events', 'get'));
     // The caller's contract is untouched.
     assert.deepEqual(content(spec, '/text', 'post')['text/event-stream'], { schema: { type: 'string' } });
+  });
+});
+
+describe('strictResponseProperties with conditions and open members', () => {
+  const json = (schema: unknown) => ({ description: 'OK', content: { 'application/json': { schema } } });
+  const contract = (schema: unknown, schemas: Record<string, unknown> = {}) =>
+    new OpenApiContract(
+      { openapi: '3.1.0', paths: { '/x': { get: { responses: { '200': json(schema) } } } }, components: { schemas } },
+      { strictResponseProperties: true },
+    );
+  const errors = (schema: unknown, body: unknown, schemas?: Record<string, unknown>) =>
+    contract(schema, schemas).validateResponse('GET', '/x', 200, body);
+
+  it('keeps if/then working: a closed `if` would never match a full body and skip `then`', () => {
+    const schema = {
+      type: 'object',
+      properties: { kind: { type: 'string' }, x: { type: 'string' }, other: { type: 'number' } },
+      if: { properties: { kind: { const: 'a' } } },
+      then: { required: ['x'] },
+    };
+    assert.notDeepEqual(errors(schema, { kind: 'a', other: 1 }), []);
+    assert.deepEqual(errors(schema, { kind: 'a', x: 'y', other: 1 }), []);
+    assert.deepEqual(errors(schema, { kind: 'b', other: 1 }), []);
+    assert.notDeepEqual(errors(schema, { kind: 'b', other: 1, extra: 1 }), []);
+  });
+
+  it('keeps not working: a closed `not` schema fails on more properties and so passes the body', () => {
+    const schema = {
+      type: 'object',
+      properties: { a: { type: 'number' }, b: { type: 'number' } },
+      not: { properties: { a: { const: 1 } }, required: ['a'] },
+    };
+    assert.notDeepEqual(errors(schema, { a: 1, b: 1 }), []);
+    assert.deepEqual(errors(schema, { a: 2, b: 1 }), []);
+  });
+
+  it('lets then/else add properties at the same object without closing them on their own', () => {
+    const schema = {
+      type: 'object',
+      properties: { kind: { type: 'string' } },
+      if: { properties: { kind: { const: 'a' } }, required: ['kind'] },
+      then: { properties: { x: { type: 'string' } } },
+      else: { properties: { y: { type: 'string' } } },
+    };
+    assert.deepEqual(errors(schema, { kind: 'a', x: 's' }), []);
+    assert.deepEqual(errors(schema, { kind: 'b', y: 's' }), []);
+    assert.notDeepEqual(errors(schema, { kind: 'a', y: 's' }), []);
+  });
+
+  it('follows the spec where a member or the holder opens the object itself', () => {
+    // additionalProperties: true is the spec's own decision; strict mode closes only what the spec leaves undecided.
+    const schemas = { A: { type: 'object', properties: { a: { type: 'number' } } } };
+    const openMember = {
+      allOf: [
+        { $ref: '#/components/schemas/A' },
+        { type: 'object', properties: { b: { type: 'number' } }, additionalProperties: true },
+      ],
+    };
+    assert.deepEqual(errors(openMember, { a: 1, z: 1 }, schemas), []);
+    const openHolder = { allOf: [{ $ref: '#/components/schemas/A' }], additionalProperties: true };
+    assert.deepEqual(errors(openHolder, { a: 1, z: 1 }, schemas), []);
+    // Undecided, it stays closed.
+    assert.notDeepEqual(errors({ allOf: [{ $ref: '#/components/schemas/A' }] }, { a: 1, z: 1 }, schemas), []);
   });
 });

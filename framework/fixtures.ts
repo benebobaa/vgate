@@ -6,14 +6,14 @@ import { loadService, reportsDir, type ServiceConfig } from './config.ts';
 import { newRunId, uniqueFactory } from './data/unique.ts';
 import { Db } from './db/postgres.ts';
 import { ComposeFaults } from './faults/compose.ts';
-import { ApiClient, CallRecorder } from './http/client.ts';
+import { ApiClient, CallRecorder, type DataPath } from './http/client.ts';
 import { guardRequest, installRawGuard, unguarded } from './http/write-guard.ts';
 import { loadContract, type OpenApiContract } from './http/openapi.ts';
 import { annotationFor, loadRegistry, lookup, today, type KnownFailure } from './known-failures.ts';
 
-export interface FrameworkTestFixtures<P> {
+export interface FrameworkTestFixtures<P, D extends DataPath = undefined> {
   /** The service under test; every response is held to the contract. */
-  api: ApiClient<P>;
+  api: ApiClient<P, D>;
   /**
    * Automatic: a test the service's known-failures registry names is expected to fail, so it fails the run when it
    * passes (the fix landed: remove the entry). Tests never mark themselves; see docs/known-failures.md.
@@ -58,8 +58,8 @@ try {
  * The framework's Playwright `test`, typed by a service's generated `paths`. A service extends it with its own
  * fixtures (personas, data builders) in services/<name>/support/fixtures.ts.
  */
-export function createTest<P>() {
-  return base.extend<FrameworkTestFixtures<P>, FrameworkWorkerFixtures>({
+export function createTest<P, D extends DataPath = undefined>() {
+  return base.extend<FrameworkTestFixtures<P, D>, FrameworkWorkerFixtures>({
     svc: [
       async ({}, use) => {
         await use(loadService());
@@ -135,7 +135,7 @@ export function createTest<P>() {
       const observed = resolve(reportsDir, 'observed', `${process.env.RUN_ID ?? 'run'}-w${testInfo.workerIndex}.jsonl`);
       const recorder = new CallRecorder(observed, testInfo.titlePath.slice(1).join(' > '));
       // The client guards each call by its operation itself (allowWrites and readOnlyPaths name templates).
-      await use(new ApiClient<P>(unguarded(request), svc, contract, auth, recorder));
+      await use(new ApiClient<P, D>(unguarded(request), svc, contract, auth, recorder));
       if (testInfo.status !== testInfo.expectedStatus && recorder.calls.length > 0) {
         await testInfo.attach('http-calls.json', {
           body: JSON.stringify(recorder.calls, null, 2),

@@ -441,6 +441,26 @@ export function configRule(file: string, base: string | undefined, head: string 
     });
   if (at(before, 'rules', 'envelope') !== undefined && at(after, 'rules', 'envelope') === undefined)
     find('rules.envelope removed');
+  else {
+    // Without successCode a success is held to its status only; without dataField expectSuccess returns the whole body.
+    // Null counts as removed: YAML's `successCode: ~` leaves the same hole.
+    for (const key of ['successCode', 'dataField']) {
+      const was = at(before, 'rules', 'envelope', key);
+      if (was != null && at(after, 'rules', 'envelope', key) == null)
+        find(`rules.envelope.${key} removed (was ${scalar(was)})`);
+    }
+    // A changed field or pattern moves which codes the gate sees: shown to the reviewer, not a loosening in itself.
+    for (const key of ['codeField', 'dataField', 'successCode', 'codePattern']) {
+      const was = at(before, 'rules', 'envelope', key);
+      const now = at(after, 'rules', 'envelope', key);
+      if (was != null && now != null && now !== was)
+        result.info.push({
+          rule: 'config-loosened',
+          file,
+          detail: `rules.envelope.${key} ${scalar(was)} -> ${scalar(now)}`,
+        });
+    }
+  }
 
   const baseHeaders = headerRules(at(before, 'rules', 'headers'));
   const headHeaders = headerRules(at(after, 'rules', 'headers'));

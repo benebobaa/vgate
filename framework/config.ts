@@ -25,11 +25,22 @@ export interface HeaderRules {
   onStatus?: Record<string, Record<string, string>>;
 }
 
-/** A response envelope such as `{ code, message, data }`. Optional: services without one leave it out. */
+/**
+ * A response envelope such as `{ code, message, data }`. Optional: services without one leave it out. Field names are
+ * dotted paths into the body (`error.code` reads `{ "error": { "code": ... } }`); a name without a dot is a top-level
+ * field. A key that itself contains a dot cannot be named.
+ */
 export interface EnvelopeRules {
+  /** Where a response's code sits, e.g. `code` or `error.code`. Read on every response, for checks and coverage. */
   codeField: string;
-  dataField: string;
-  successCode: string;
+  /**
+   * Where a success response's data sits, e.g. `data` or `result.data`: what `expectSuccess` returns. Left out, it
+   * returns the whole body, for an API that wraps its errors only. Declare the same path in the service's
+   * `createTest<paths, 'result.data'>()` so `expectSuccess` is typed by it.
+   */
+  dataField?: string;
+  /** The code of every success. Left out, a success is held to its status only: an API that codes its errors only. */
+  successCode?: string;
   /** Regex that finds the documented codes in an OpenAPI response description, e.g. `ERR\d{4}`. */
   codePattern: string;
 }

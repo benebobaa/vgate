@@ -24,6 +24,7 @@ import { AxeBuilder } from '@axe-core/playwright';
 import type { Page, Request, Response } from '@playwright/test';
 import { reportsDir, type ServiceConfig } from '../config.ts';
 import { createTest } from '../fixtures.ts';
+import type { DataPath } from '../http/client.ts';
 import { impactFails, originAllowed, type UiConfig } from './config.ts';
 
 export interface A11yFinding {
@@ -278,8 +279,8 @@ function uiOf(svc: ServiceConfig): { config: UiConfig; base: string } {
  * The framework's test for a UI service: everything `createTest` gives (api, svc, unique, known failures) plus a
  * watched `page` and the `ui` helper. A service's support/fixtures.ts calls it like createTest.
  */
-export function createUiTest<P = unknown>() {
-  return createTest<P>().extend<{ ui: Ui; uiWatch: Ui }>({
+export function createUiTest<P = unknown, D extends DataPath = undefined>() {
+  return createTest<P, D>().extend<{ ui: Ui; uiWatch: Ui }>({
     // Deterministic rendering: the same page draws the same pixels on every run of one machine.
     locale: 'en-US',
     timezoneId: 'UTC',

@@ -62,7 +62,10 @@ export function checkTool(spec: ToolSpec): Check {
       fix: spec.fix,
     };
   }
-  const line = run.out.split('\n')[0] ?? '';
+  // A tool with a minimum version is read from its first line only: a later line (a copyright year) must not pass for
+  // its version. Others are shown by the first line that carries one, past a heading (lsof -v: "lsof version ...").
+  const lines = run.out.split('\n').map((l) => l.trim());
+  const line = (spec.min ? undefined : lines.find((l) => parseVersion(l) !== undefined)) ?? lines[0] ?? '';
   if (spec.min) {
     const found = parseVersion(line);
     const min = parseVersion(spec.min);
@@ -113,6 +116,15 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true)
     { id: 'git', command: 'git', args: ['--version'], fix: mac ? 'brew install git' : 'apt-get install -y git' },
     { id: 'bash', command: 'bash', args: ['--version'], fix: 'Install bash: every stack.sh needs it' },
     { id: 'curl', command: 'curl', args: ['--version'], fix: mac ? 'brew install curl' : 'apt-get install -y curl' },
+    {
+      id: 'lsof',
+      command: 'lsof',
+      args: ['-v'],
+      optional:
+        "the stack library uses it to tell this project's app from another process on its port; without it `vgate up` " +
+        'restarts the app every time and `vgate status` cannot vouch for the running build',
+      fix: mac ? 'lsof ships with macOS' : 'apt-get install -y lsof',
+    },
     ...(uvNeeded
       ? [
           {
