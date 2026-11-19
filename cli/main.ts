@@ -10,11 +10,14 @@ import { join } from 'node:path';
 import { parseArgs, str } from '../framework/cli/args.ts';
 import { loadService } from '../framework/config.ts';
 import { inventorySkeleton } from '../framework/inventory.ts';
-import { PROJECT_FILE, type ProjectConfig } from '../framework/project.ts';
+import { durationMs, PROJECT_FILE, type ProjectConfig } from '../framework/project.ts';
 import { affected } from './affected.ts';
 import { compat } from './compat.ts';
 import { configCheck } from './config-check.ts';
 import { migrations } from './migrations.ts';
+import { mutate } from './mutate.ts';
+import { canary, parseDuration } from './canary.ts';
+import { smoke } from './smoke.ts';
 import { decide, DECISION_FILE } from './decide.ts';
 import { doctor } from './doctor.ts';
 import { gate, STEPS, VERDICT_FILE } from './gate.ts';
@@ -28,7 +31,7 @@ import { skills } from './skills.ts';
 import { stack, STACK_ACTIONS, type StackAction } from './stack.ts';
 import { checkPin, installCommand, VERSION } from './version.ts';
 
-const BOOLEANS = ['json', 'fix', 'dry-run', 'yes', 'quiet', 'help', 'version', 'force', 'write'] as const;
+const BOOLEANS = ['json', 'fix', 'dry-run', 'yes', 'quiet', 'help', 'version', 'force', 'write', 'smoke'] as const;
 
 /** Everything `help` says, as data: `help --json` is how an agent discovers the tool. */
 const CATALOGUE = {
@@ -111,6 +114,24 @@ const CATALOGUE = {
       usage: `${CLI} migrations --service <name> --base <git ref>`,
       about:
         "Are the change's database migrations safe to deploy? Lints the added migrations (PostgreSQL: squawk), applies the merge base's migrations, its seed and the change's in a sealed environment, undoes and re-applies them when `down` is configured, and runs the deployed (merge-base) app on the migrated schema against its own read-only tests. Writes reports/migrations.json for decide. Exit 1 when blocked or a human must look.",
+    },
+    {
+      name: 'smoke',
+      usage: `${CLI} smoke --service <name> --env <environment>`,
+      about:
+        "After a deploy: runs the service's smoke subset (service.yaml `smoke:`, or the plan's read-only scenarios) against a deployed environment. In an environment that is not disposable the client refuses every request that is not read-only before it is sent, unless `allowWrites` lists it. Zero tests run is a failure. Writes reports/smoke.json.",
+    },
+    {
+      name: 'canary',
+      usage: `${CLI} canary --service <name> --env <environment> [--for 10m] [--every 30s] [--on-fail '<rollback command>'] [--smoke]`,
+      about:
+        'While a new version takes traffic: polls the metrics of `environments.<env>.canary` (Prometheus or an HTTP JSON endpoint) against their limits and baseline. Exit 0 healthy, 1 breach (runs --on-fail once), 3 metrics unreadable (never a pass, no rollback).',
+    },
+    {
+      name: 'mutate',
+      usage: `${CLI} mutate --service <name> --base <git ref> [--budget 20] [--timeout 10m]`,
+      about:
+        "Do the tests catch bugs in the code this change touched? Plants one small bug at a time in the changed lines (comparisons, boundaries, conditions, flags, arithmetic, negation, numbers, returned text), rebuilds and restarts the app in a scratch copy, and runs the service's tests: score = caught / (caught + survived). Lists each survivor with the scenario that would catch it. Writes reports/mutation.json for decide (policy.mutationScore). Exit 1 below the policy.",
     },
     {
       name: 'inventory',
@@ -293,12 +314,49 @@ async function run(argv: string[]): Promise<Result> {
       detailsUrl: str(args['details-url']),
     });
   }
+  if (command === 'mutate') {
+    if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');
+    const budget = str(args.budget);
+    if (args.budget === true || (budget !== undefined && !/^[1-9]\d{0,3}$/.test(budget)))
+      throw new UsageError('--budget needs a number of mutants, e.g. --budget 20');
+    if (args.timeout === true) throw new UsageError('--timeout needs a duration, e.g. --timeout 10m');
+    const timeout = str(args.timeout);
+    let timeoutMs: number | undefined;
+    try {
+      timeoutMs = timeout === undefined ? undefined : durationMs(timeout, '--timeout');
+    } catch (error) {
+      throw new UsageError((error as Error).message);
+    }
+    return mutate(project, runtime, {
+      service: resolveService(root, serviceFlag),
+      base: str(args.base),
+      env: envName,
+      budget: budget === undefined ? undefined : Number(budget),
+      timeoutMs,
+      live,
+    });
+  }
   if (command === 'migrations') {
     if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');
     return migrations(project, runtime, {
       service: resolveService(root, serviceFlag),
       base: str(args.base),
       env: envName,
+      live,
+    });
+  }
+  if (command === 'smoke')
+    return smoke(project, runtime, { service: resolveService(root, serviceFlag), env: envName, live });
+  if (command === 'canary') {
+    for (const flag of ['for', 'every', 'on-fail'] as const)
+      if (args[flag] === true) throw new UsageError(`--${flag} needs a value`);
+    return canary(project, runtime, {
+      service: resolveService(root, serviceFlag),
+      env: envName,
+      forMs: str(args.for) === undefined ? 0 : parseDuration(str(args.for) ?? '', '--for'),
+      everyMs: parseDuration(str(args.every) ?? '30s', '--every'),
+      onFail: str(args['on-fail']),
+      smoke: args.smoke === true,
       live,
     });
   }

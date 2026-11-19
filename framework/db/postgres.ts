@@ -7,11 +7,16 @@ import pg from 'pg';
 export class Db {
   private readonly pool: pg.Pool;
 
-  constructor(cfg: { url: string; schema?: string }) {
+  /** `readOnly`: every transaction is read-only (a shared environment's database: the fixture of a smoke run). */
+  constructor(cfg: { url: string; schema?: string }, { readOnly = false }: { readOnly?: boolean } = {}) {
+    const settings = [
+      ...(cfg.schema ? [`-c search_path=${cfg.schema}`] : []),
+      ...(readOnly ? ['-c default_transaction_read_only=on'] : []),
+    ];
     this.pool = new pg.Pool({
       connectionString: cfg.url,
       max: 4,
-      options: cfg.schema ? `-c search_path=${cfg.schema}` : undefined,
+      options: settings.length > 0 ? settings.join(' ') : undefined,
     });
   }
 

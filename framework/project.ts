@@ -8,6 +8,10 @@
  *   reportsDir: reports     # where the gate writes its evidence (default: reports)
  *   policy:
  *     autoMerge: low        # the highest risk tier a PR may merge at without a human (default: none)
+ *     mutationScore: 0.7    # the share of planted bugs the tests must catch in changed code (default: not enforced)
+ *   mutation:               # `vgate mutate` (docs/mutation.md)
+ *     budget: 20            # the most mutants per run
+ *     timeout: 10m          # the most time per run
  *   risk:                   # path globs -> tier; first match wins per file (default: cli/risk.ts DEFAULT_RISK)
  *     high: [{ path: 'db/migrations/**', reason: schema change }]
  *   deploy:                 # safe to put next to what runs there? (cli/compat.ts, cli/config-check.ts)
@@ -42,7 +46,21 @@ export interface RiskRule {
 export interface Policy {
   /** The highest risk tier that may merge without a human; `none`: every change needs one. */
   autoMerge: 'none' | RiskTier;
+  /**
+   * The share (0 to 1) of planted bugs the tests must catch in the code a change touches (`vgate mutate`); below it a
+   * person looks. Absent: test strength is reported when measured, never required.
+   */
+  mutationScore?: number;
 }
+
+/** `mutation:` in vgate.yaml: how much `vgate mutate` may do per run (its flags override). */
+export interface MutationSettings {
+  budget: number;
+  /** Milliseconds. */
+  timeoutMs: number;
+}
+
+export const DEFAULT_MUTATION: MutationSettings = { budget: 20, timeoutMs: 10 * 60_000 };
 
 /**
  * Where the version running in an environment publishes its contract: a git ref of the deployed version
@@ -166,6 +184,8 @@ export interface ProjectConfig {
   risk?: RiskRule[];
   /** `deploy:`: the environments a change must stay safe for; absent: deploy safety is not checked. */
   deploy?: DeployConfig;
+  /** `mutation:` with its defaults (absent in hand-built configs: use DEFAULT_MUTATION). */
+  mutation?: MutationSettings;
 }
 
 const DEFAULT_POLICY: Policy = { autoMerge: 'none' };
@@ -173,10 +193,41 @@ const DEFAULT_POLICY: Policy = { autoMerge: 'none' };
 function parsePolicy(value: unknown, file: string): Policy {
   if (value === undefined || value === null) return DEFAULT_POLICY;
   if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${file}: policy must be a mapping`);
-  const autoMerge = (value as Record<string, unknown>).autoMerge ?? DEFAULT_POLICY.autoMerge;
+  const raw = value as Record<string, unknown>;
+  const autoMerge = raw.autoMerge ?? DEFAULT_POLICY.autoMerge;
   if (autoMerge !== 'none' && !RISK_TIERS.includes(autoMerge as RiskTier))
     throw new Error(`${file}: policy.autoMerge must be one of none, ${RISK_TIERS.join(', ')}`);
-  return { autoMerge: autoMerge as Policy['autoMerge'] };
+  const score = raw.mutationScore;
+  if (score !== undefined && score !== null && (typeof score !== 'number' || !(score >= 0 && score <= 1)))
+    throw new Error(`${file}: policy.mutationScore must be a share between 0 and 1, e.g. 0.7`);
+  return {
+    autoMerge: autoMerge as Policy['autoMerge'],
+    ...(typeof score === 'number' ? { mutationScore: score } : {}),
+  };
+}
+
+function parseMutation(value: unknown, file: string): MutationSettings {
+  if (value === undefined || value === null) return DEFAULT_MUTATION;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${file}: mutation must be a mapping`);
+  const raw = value as Record<string, unknown>;
+  const budget = raw.budget ?? DEFAULT_MUTATION.budget;
+  if (typeof budget !== 'number' || !Number.isInteger(budget) || budget < 1 || budget > 1000)
+    throw new Error(`${file}: mutation.budget must be a whole number of mutants between 1 and 1000`);
+  let timeoutMs = DEFAULT_MUTATION.timeoutMs;
+  if (raw.timeout !== undefined) timeoutMs = durationMs(raw.timeout, `${file}: mutation.timeout`);
+  return { budget, timeoutMs };
+}
+
+/** `10m`, `90s`, `1h`, or a number of seconds, in milliseconds. */
+export function durationMs(value: unknown, where: string): number {
+  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/.exec(String(value).trim());
+  if ((typeof value !== 'string' && typeof value !== 'number') || !m)
+    throw new Error(`${where}: expected a duration such as 10m, 90s or 1h`);
+  const n = Number(m[1]);
+  const unit = m[2] ?? 's';
+  const ms = unit === 'ms' ? n : unit === 's' ? n * 1000 : unit === 'm' ? n * 60_000 : n * 3_600_000;
+  if (!(ms > 0)) throw new Error(`${where}: the duration must be positive`);
+  return ms;
 }
 
 /** `risk: { high: [{ path, reason }], medium: [...], low: [...] }`; a bare string is a path without a reason. */
@@ -220,6 +271,7 @@ export function readProject(root: string): ProjectConfig {
       servicesDirName: 'services',
       declared: false,
       policy: DEFAULT_POLICY,
+      mutation: DEFAULT_MUTATION,
     };
   }
   const raw = (parse(readFileSync(file, 'utf8')) ?? {}) as Record<string, unknown>;
@@ -240,6 +292,7 @@ export function readProject(root: string): ProjectConfig {
     policy: parsePolicy(raw.policy, file),
     risk: parseRisk(raw.risk, file),
     deploy: parseDeploy(raw.deploy, file),
+    mutation: parseMutation(raw.mutation, file),
   };
 }
 

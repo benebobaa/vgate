@@ -64,6 +64,8 @@ forward.
 | `gate --service <svc> [--steps a,b]`             | Runs every step and writes `reports/verdict.json`: steps, failed tests (scenario id, file, line, message), coverage, known failures |
 | `guard --service <svc> --base <ref>`             | Compares the expectations with a base ref: exit 0 `auto`, exit 1 `needs-human` with the findings; writes `reports/guard.json`       |
 | `inventory --service <svc> [--write]`            | The test plan's skeleton from the vendored contract, for the agent to enrich                                                        |
+| `smoke --service <svc> --env <env>`              | After a deploy: the smoke subset against a deployed environment; writes are refused before they are sent                            |
+| `canary --service <svc> --env <env> [--for 10m]` | While a version takes traffic: metrics against limits and baseline; 1 on breach (runs `--on-fail` once), 3 unknown                  |
 | `affected --base <ref>`                          | The services a change touches (by each `service.yaml`'s `paths:`) and the ones it deletes                                           |
 | `risk --base <ref>`                              | The change's risk tier (low, medium, high) and the file and rule behind it                                                          |
 | `decide --base <ref> --evidence <dir>`           | The pull request's decision from every verdict and guard result: `merge`, `needs-approval` or `blocked`, and the PR comment         |
@@ -97,6 +99,11 @@ Every pull request gets one decision. `vgate affected` picks the services the ch
 `vgate init --ci github` installs the workflow; GitLab gets two CI/CD components. How the decision works, risk rules,
 monorepos, regulated teams and adoption in shadow mode: [docs/pr-verification.md](docs/pr-verification.md). Setup:
 [docs/ci.md](docs/ci.md).
+
+After the merge, `vgate smoke` verifies the deployed environment with the service's own read-only scenarios (in an
+environment that is not disposable, every request that is not read-only is refused before it is sent) and
+`vgate canary` watches the new version's error rate and latency against limits, starting the rollback on a breach:
+[docs/after-deploy.md](docs/after-deploy.md).
 
 ## A project
 

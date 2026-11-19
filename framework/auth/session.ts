@@ -3,6 +3,7 @@
  * the session cookie it set (plus a CSRF token when the service demands one). See docs/auth.md.
  */
 import type { EnvironmentConfig, SessionConfig } from '../config.ts';
+import { guardWrite } from '../http/write-guard.ts';
 
 /** Replaces `{username}` and `{password}` in every string of a JSON template. */
 export function fillTemplate(template: unknown, values: Record<string, string>): unknown {
@@ -73,6 +74,8 @@ export class SessionLogin {
   private async login(username: string, password: string, who: string): Promise<Record<string, string>> {
     const { login, cookie, csrf } = this.cfg;
     const method = (login.method ?? 'POST').toUpperCase();
+    // A login is a write too: in a shared environment it goes out only when allowWrites lists it (write-guard.ts).
+    guardWrite(this.env, method, login.path);
     const url = `${this.env.baseUrl}${login.path}`;
     const response = await fetch(url, {
       method,

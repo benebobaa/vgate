@@ -145,8 +145,19 @@ export interface EnvironmentConfig {
   compose?: { file: string; project?: string };
   /** Seeded identities that exist before the run. */
   users: Record<string, SeededUser>;
-  /** False for shared environments: tests that need disposable state (fault injection, fuzzing) skip. */
+  /**
+   * False for shared environments (staging, production): tests that need disposable state (fault injection, fuzzing)
+   * skip, and the client refuses every request that is not read-only before it leaves the machine, except the
+   * operations listed in `allowWrites` (docs/after-deploy.md).
+   */
   disposable: boolean;
+  /**
+   * Writes a non-disposable environment accepts from the tests: `METHOD /path/template` (e.g. `POST
+   * /api/v1/auth/login` for a synthetic account's session), or a bare template for every method.
+   */
+  allowWrites?: string[];
+  /** Limits a canary must stay within while it takes traffic (`vgate canary`, docs/after-deploy.md). */
+  canary?: CanaryConfig;
   /** What the service talks to besides its database: stubbed providers, Kafka, Redis, toxiproxy (deps/config.ts). */
   dependencies?: Record<string, DependencyConfig>;
   /** Signed webhooks the tests send to the service, by provider name (docs/webhooks.md). */
@@ -156,6 +167,29 @@ export interface EnvironmentConfig {
    * its `{name.key}` placeholders above are resolved. Down, they stay as written and nothing answers at baseUrl.
    */
   declared?: { up: boolean; project?: string; runId?: string };
+}
+
+/**
+ * Where a canary's health is read, and its limits. `prometheus`: `queries` are PromQL against `url`'s
+ * `/api/v1/query`. `http`: `url` answers JSON and `queries` are dotted paths into it. A limit is the highest value
+ * allowed; `baseline` (same kinds of query) adds a comparison: the canary may be at most `maxRatio` times the baseline.
+ */
+export interface CanaryConfig {
+  source: 'prometheus' | 'http';
+  url: string;
+  queries: Record<string, string>;
+  limits: Record<string, number>;
+  baseline?: Record<string, string>;
+  /** Default 2: a canary twice as bad as the version it replaces fails, whatever the absolute limit. */
+  maxRatio?: number;
+  /** Extra request headers for the metrics source (e.g. `Authorization: Bearer ${PROM_TOKEN}`). */
+  headers?: Record<string, string>;
+}
+
+/** The scenarios `vgate smoke` runs against a deployed environment: explicit ids, a Playwright grep, or neither. */
+export interface SmokeConfig {
+  scenarios?: string[];
+  grep?: string;
 }
 
 /** How a provider signs its webhooks: HMAC over a payload template, written into a header template. */
@@ -210,6 +244,8 @@ export interface ServiceConfig {
   rules: Rules;
   coverage: { exclude: CoverageExclusion[] };
   schemathesis: SchemathesisConfig;
+  /** `smoke:` of service.yaml (`vgate smoke`); absent: the read-only scenarios of the plan. */
+  smoke?: SmokeConfig;
   env: EnvironmentConfig;
   /** The sealed environment a run starts for itself (`environment:`); absent when the service uses its stack.sh. */
   environment?: EnvironmentDecl;
@@ -221,6 +257,73 @@ export function parsePaths(value: unknown, where: string): string[] | undefined 
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || entry === ''))
     throw new Error(`${where}: paths must be a list of path globs, e.g. ['services/api/**', 'libs/shared/**']`);
   return value as string[];
+}
+
+/** `smoke:` of a service.yaml: `{ scenarios: [ids] }`, `{ grep: <regex> }`, or absent. */
+export function parseSmoke(value: unknown, where: string): SmokeConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = record(value);
+  if (Object.keys(raw).length === 0 && (typeof value !== 'object' || Array.isArray(value)))
+    throw new Error(`${where}: expected { scenarios: [ids] } or { grep: <regex> }`);
+  const scenarios = raw.scenarios;
+  if (
+    scenarios !== undefined &&
+    (!Array.isArray(scenarios) || scenarios.some((id) => typeof id !== 'string' || id === ''))
+  )
+    throw new Error(`${where}.scenarios: a list of scenario ids, e.g. [HLT-200, LST-200]`);
+  if (raw.grep !== undefined && text(raw.grep) === undefined) throw new Error(`${where}.grep: a non-empty regex`);
+  return { scenarios: scenarios as string[] | undefined, grep: text(raw.grep) };
+}
+
+/** `allowWrites:` of an environment: `METHOD /template` or `/template` entries. */
+export function parseAllowWrites(value: unknown, where: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    !Array.isArray(value) ||
+    value.some((entry) => typeof entry !== 'string' || !/^([A-Za-z]+\s+)?\/\S*$/.test(entry))
+  )
+    throw new Error(`${where}: a list of 'METHOD /path/template' (or '/path/template') entries`);
+  return value as string[];
+}
+
+/** `canary:` of an environment, validated: a source, a URL, queries and a limit for each query. */
+export function parseCanary(value: unknown, where: string): CanaryConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = record(value);
+  const source = raw.source;
+  if (source !== 'prometheus' && source !== 'http') throw new Error(`${where}.source: prometheus or http`);
+  const url = text(raw.url);
+  if (!url || !/^https?:\/\//.test(url)) throw new Error(`${where}.url: an http(s) URL`);
+  const strings = (map: unknown, what: string): Record<string, string> => {
+    const entries = Object.entries(record(map));
+    if (entries.some(([, q]) => typeof q !== 'string' || q === ''))
+      throw new Error(`${where}.${what}: each entry a non-empty query`);
+    return Object.fromEntries(entries) as Record<string, string>;
+  };
+  const queries = strings(raw.queries, 'queries');
+  if (Object.keys(queries).length === 0) throw new Error(`${where}.queries: at least one metric`);
+  const limits = Object.fromEntries(Object.entries(record(raw.limits)));
+  for (const metric of Object.keys(queries)) {
+    if (typeof limits[metric] !== 'number' || !Number.isFinite(limits[metric]))
+      throw new Error(`${where}.limits.${metric}: a number (the highest value allowed)`);
+  }
+  const baseline = raw.baseline === undefined ? undefined : strings(raw.baseline, 'baseline');
+  for (const metric of Object.keys(baseline ?? {})) {
+    if (!(metric in queries)) throw new Error(`${where}.baseline.${metric}: no query of that name to compare with`);
+  }
+  const maxRatio = raw.maxRatio;
+  if (maxRatio !== undefined && (typeof maxRatio !== 'number' || !(maxRatio > 0)))
+    throw new Error(`${where}.maxRatio: a number above 0`);
+  const headers = raw.headers === undefined ? undefined : strings(raw.headers, 'headers');
+  return {
+    source,
+    url: url.replace(/\/$/, ''),
+    queries,
+    limits: limits as Record<string, number>,
+    baseline,
+    maxRatio,
+    headers,
+  };
 }
 
 const VAR = /\$\{([A-Z0-9_]+)(?::-([^}]*))?\}/g;
@@ -317,6 +420,7 @@ export function loadService(
     rules: record(top.rules),
     coverage: { exclude: (record(top.coverage).exclude ?? []) as CoverageExclusion[] },
     schemathesis: record(top.schemathesis),
+    smoke: parseSmoke(top.smoke, `${name} service.yaml smoke`),
     env: {
       name: envName,
       baseUrl: required(text(env.baseUrl), `environments.${envName}.baseUrl`).replace(/\/$/, ''),
@@ -339,6 +443,8 @@ export function loadService(
       users,
       webhooks: env.webhooks === undefined ? undefined : (record(env.webhooks) as EnvironmentConfig['webhooks']),
       disposable: env.disposable === true,
+      allowWrites: parseAllowWrites(env.allowWrites, `${name} service.yaml environments.${envName}.allowWrites`),
+      canary: parseCanary(env.canary, `${name} service.yaml environments.${envName}.canary`),
       dependencies: parseDependencies(
         env.dependencies,
         dir,

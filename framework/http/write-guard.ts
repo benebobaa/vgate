@@ -1,0 +1,142 @@
+/**
+ * The write guard: in an environment that is not disposable (staging, production), a test may read, never write.
+ * The guard sits in the client, in front of every request the tests make through the framework (calls, streams,
+ * webhooks, session logins, Playwright's `request` fixture): a request that is not read-only fails the test before it
+ * leaves the machine, unless the environment lists the operation in `allowWrites` (a synthetic account's login, for
+ * instance). A test that opens its own connection (`fetch`, a socket) is outside it. Read-only means GET, HEAD or OPTIONS, or an operation the contract's owners marked
+ * as writing nothing (`schemathesis.readOnlyPaths` / `readOnlyMethods`, the same rule the contract step uses).
+ */
+import type { APIRequestContext } from '@playwright/test';
+import type { EnvironmentConfig, SchemathesisConfig } from '../config.ts';
+
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+export class WriteRefused extends Error {
+  constructor(
+    readonly environment: string,
+    readonly operation: string,
+  ) {
+    super(
+      `write refused in environment ${environment}: ${operation} is not read-only, and the environment is not ` +
+        `disposable. Mark the test out of the smoke subset, or list the operation in environments.${environment}.` +
+        `allowWrites when it is safe there (docs/after-deploy.md).`,
+    );
+    this.name = 'WriteRefused';
+  }
+}
+
+/** Is `METHOD template` read-only: a safe method, or an operation the service marks as writing nothing? */
+export function isReadOnly(method: string, template: string, readOnly: SchemathesisConfig = {}): boolean {
+  const verb = method.toUpperCase();
+  if (SAFE_METHODS.has(verb)) return true;
+  const { readOnlyPaths, readOnlyMethods } = readOnly;
+  if (readOnlyPaths === undefined && readOnlyMethods === undefined) return false;
+  const pathOk = readOnlyPaths === undefined || new RegExp(readOnlyPaths).test(template);
+  const methodOk = readOnlyMethods === undefined || readOnlyMethods.map((m) => m.toUpperCase()).includes(verb);
+  return pathOk && methodOk;
+}
+
+/** Does `allowWrites` list `METHOD template` (or the bare template, for every method)? */
+export function isAllowedWrite(method: string, template: string, allowWrites: string[] = []): boolean {
+  const verb = method.toUpperCase();
+  return allowWrites.some((entry) => {
+    const [first, second] = entry.trim().split(/\s+/);
+    return second === undefined ? first === template : first.toUpperCase() === verb && second === template;
+  });
+}
+
+/** Headers some servers take for the request's real method (method spoofing). */
+const OVERRIDE_HEADERS = ['x-http-method-override', 'x-http-method', 'x-method-override'];
+
+/** The methods a request with these headers may be taken for, besides its own. */
+function overriddenMethods(headers: Record<string, string> = {}): string[] {
+  return Object.entries(headers)
+    .filter(([name, value]) => OVERRIDE_HEADERS.includes(name.toLowerCase()) && typeof value === 'string')
+    .map(([, value]) => value.trim());
+}
+
+/**
+ * A path the server sees as written: no query or fragment, no backslash or encoded slash, no `.` or `..` segment
+ * (plain or percent-encoded). Anything else can resolve to another operation than the one judged, e.g.
+ * `/search/../items`, so a write to it is never read-only or allowed.
+ */
+export function isPlainPath(path: string): boolean {
+  if (!path.startsWith('/') || /[?#\\]|%(2f|5c)/i.test(path)) return false;
+  return !path.split('/').some((segment) => /^(\.|%2e){1,2}$/i.test(segment));
+}
+
+/**
+ * Throws WriteRefused when the environment is not disposable and `METHOD template` is neither read-only nor allowed.
+ * A disposable environment (local, a sealed run) is never guarded: writing is what its tests are for. `request` is
+ * what goes out: the path with its parameters filled in, and the headers (a method-override header is judged as the
+ * method it names).
+ */
+export function guardWrite(
+  env: Pick<EnvironmentConfig, 'name' | 'disposable' | 'allowWrites'>,
+  method: string,
+  template: string,
+  readOnly?: SchemathesisConfig,
+  request: { path?: string; headers?: Record<string, string> } = {},
+): void {
+  if (env.disposable) return;
+  const plain = isPlainPath(template) && isPlainPath(request.path ?? template);
+  for (const verb of [method, ...overriddenMethods(request.headers)]) {
+    if (SAFE_METHODS.has(verb.toUpperCase())) continue;
+    if (plain && (isReadOnly(verb, template, readOnly) || isAllowedWrite(verb, template, env.allowWrites))) continue;
+    throw new WriteRefused(env.name, `${verb.toUpperCase()} ${request.path ?? template}`);
+  }
+}
+
+const UNGUARDED = Symbol('unguarded request context');
+const VERBS: Record<string, string> = {
+  get: 'GET',
+  head: 'HEAD',
+  post: 'POST',
+  put: 'PUT',
+  patch: 'PATCH',
+  delete: 'DELETE',
+};
+
+/**
+ * Playwright's own `request` fixture with the same guard in front: a test that calls the service without the client
+ * is held to the same rule. A URL of the environment is judged by its path below the base URL; a write to any other
+ * host is never allowed.
+ */
+export function guardRequest(
+  request: APIRequestContext,
+  env: Pick<EnvironmentConfig, 'name' | 'disposable' | 'allowWrites' | 'baseUrl'>,
+  readOnly?: SchemathesisConfig,
+): APIRequestContext {
+  if (env.disposable) return request;
+  const base = new URL(env.baseUrl);
+  const basePath = base.pathname.replace(/\/$/, '');
+  const check = (method: string, url: string, headers?: Record<string, string>) => {
+    const target = new URL(url, base);
+    const own = target.origin === base.origin && (target.pathname + '/').startsWith(`${basePath}/`);
+    const path = own ? target.pathname.slice(basePath.length) || '/' : target.href;
+    guardWrite(env, method, path, readOnly, { headers });
+  };
+  return new Proxy(request, {
+    get(target, prop) {
+      if (prop === UNGUARDED) return target;
+      const value = Reflect.get(target, prop, target) as unknown;
+      if (typeof value !== 'function') return value;
+      const fn = value as (...args: unknown[]) => unknown;
+      if (typeof prop !== 'string' || (!Object.hasOwn(VERBS, prop) && prop !== 'fetch')) return fn.bind(target);
+      return async (urlOrRequest: string | { url(): string; method(): string }, options?: FetchOptions) => {
+        const url = typeof urlOrRequest === 'string' ? urlOrRequest : urlOrRequest.url();
+        const method =
+          VERBS[prop] ?? options?.method ?? (typeof urlOrRequest === 'string' ? 'GET' : urlOrRequest.method());
+        check(method, url, options?.headers);
+        return await fn.call(target, urlOrRequest, options);
+      };
+    },
+  });
+}
+
+type FetchOptions = { method?: string; headers?: Record<string, string> };
+
+/** The context behind guardRequest (the client guards each call by its operation's template itself). */
+export function unguarded(request: APIRequestContext): APIRequestContext {
+  return (request as unknown as Record<symbol, APIRequestContext | undefined>)[UNGUARDED] ?? request;
+}
