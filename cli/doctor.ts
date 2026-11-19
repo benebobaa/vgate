@@ -89,7 +89,11 @@ function runtimeVersions(runtime: Runtime): { node: string; pnpm: string } {
 
 const mac = process.platform === 'darwin';
 
-function toolChecks(runtime: Runtime, dockerNeededBy: string[]): Check[] {
+/**
+ * `uvNeeded`: some service runs the contract step (Schemathesis through uvx). A web frontend (`ui:`) has none, so a
+ * project of UI services only does not need uv.
+ */
+function toolChecks(runtime: Runtime, dockerNeededBy: string[], uvNeeded = true): Check[] {
   const need = runtimeVersions(runtime);
   const specs: ToolSpec[] = [
     {
@@ -109,12 +113,16 @@ function toolChecks(runtime: Runtime, dockerNeededBy: string[]): Check[] {
     { id: 'git', command: 'git', args: ['--version'], fix: mac ? 'brew install git' : 'apt-get install -y git' },
     { id: 'bash', command: 'bash', args: ['--version'], fix: 'Install bash: every stack.sh needs it' },
     { id: 'curl', command: 'curl', args: ['--version'], fix: mac ? 'brew install curl' : 'apt-get install -y curl' },
-    {
-      id: 'uv',
-      command: 'uvx',
-      args: ['--version'],
-      fix: mac ? 'brew install uv' : 'curl -LsSf https://astral.sh/uv/install.sh | sh',
-    },
+    ...(uvNeeded
+      ? [
+          {
+            id: 'uv',
+            command: 'uvx',
+            args: ['--version'],
+            fix: mac ? 'brew install uv' : 'curl -LsSf https://astral.sh/uv/install.sh | sh',
+          },
+        ]
+      : []),
     {
       id: 'java',
       command: 'java',
@@ -369,7 +377,8 @@ async function collect(
     perService.flatMap(({ svc }) => (svc?.ui ? [svc.name] : [])),
   );
   return [
-    ...toolChecks(runtime, dockerNeededBy),
+    // A service whose config does not load counts as needing uv: never skip a check on missing information.
+    ...toolChecks(runtime, dockerNeededBy, perService.length === 0 || perService.some(({ svc }) => !svc || !svc.ui)),
     projectCheck(project),
     runtimeCheck(runtime),
     ...(links ? [links] : []),
