@@ -73,7 +73,18 @@ sample.
        running.
      - Declared environment otherwise: the whole environment restarts.
      - `stack.sh`: down, then up.
+   - The tests of the operations the changed line serves run first, when that is knowable: the line's function is
+     followed up through its callers in the same file to a function named after an operation of the plan
+     (`operationId`, e.g. `createOrder`, `handleCreateOrder`, `create_order`), and the tests are those carrying a
+     scenario id of that operation. Code that serves several operations (a dispatcher, a shared helper) has no such
+     answer and runs the whole suite. A mutant the scoped tests do not catch always runs the whole suite before it
+     counts as a survivor: a wrong guess costs time, never a wrong result. `--all-tests` turns scoping off.
    - The tests run, stopping at the first failure when nothing failed before.
+   - **A kill must repeat.** The tests that failed run again with the mutant, then the same tests once more on the
+     unmutated code (restored and restarted). Only a test that fails twice with the mutant and passes without it caught
+     it. A test that passes on the second try, or fails on the unmutated code too, failed for another reason (it is
+     flaky, or the environment is): the mutant is `flaky` and those tests are named. When the failure came from the
+     scoped tests, the whole suite decides instead: a scoped test can fail for want of a test outside the scope.
    - The file is then restored.
 4. **Outcome of each mutant:**
 
@@ -86,14 +97,22 @@ sample.
    | timeout     | the tests run past 3× the unmutated run time, plus 30 s                                                                       | no, reported apart                  |
    | build-error | the mutant does not build (compiled languages)                                                                                | no: it says nothing about the tests |
    | not-run     | `--timeout` was reached first, or the app stopped coming up even without a mutant                                             | no, reported                        |
+   | flaky       | the tests that failed with the mutant did not fail again with it, or fail on the unmutated code too                           | no, reported with the tests' names  |
 
-5. **Clean-up.** The environment, the mutant images and the scratch worktree are removed.
+5. **Clean-up.** The environment, the mutant images and the scratch worktree are removed, however the run ends:
+   - Ctrl-C or SIGTERM: the running tests and builds are stopped, everything is removed, and the run exits 130 or 143.
+   - A hard stop (SIGKILL, a crash, a closed laptop): the run keeps a marker at `<reports>/mutate/<service>.run.json`
+     while it works, and everything it creates carries labels of its scratch copy. The next `vgate mutate` of the
+     service, or `vgate down --service <service>`, removes what it left: the sealed environment, the mutant images
+     (tagged, untagged and intermediate), a host app its `stack.sh` started, the scratch worktree and the marker. A
+     run that is still going is left alone, and a second `vgate mutate` of the same service refuses to start beside it.
 
 Only the API tests run. The fault tests pause containers and are slow.
 
-**Cost.** Each mutant costs a rebuild, a restart and one test run. On the reference `example-orders`, a sealed
-environment with PostgreSQL, Redis, Kafka and stubs, that is about 10 seconds per mutant: 10 mutants in 104 s. Keep
-the budget small on pull requests, and run a larger one on a schedule if you want a fuller picture.
+**Cost.** Each mutant costs a rebuild, a restart and a test run; a kill costs two short re-runs and a restart of the
+unmutated app to confirm it. On the reference `example-orders`, a sealed environment with PostgreSQL, Redis, Kafka and
+stubs, 8 mutants took 158 s with scoped tests first (7 of them caught by the scoped tests alone) and 234 s with
+`--all-tests`. Keep the budget small on pull requests, and run a larger one on a schedule if you want a fuller picture.
 
 ## The report and the decision
 
@@ -146,5 +165,9 @@ Collect `mutation.json` with the verdict as evidence. The GitHub workflow and Gi
   - In a dynamic language a mutant can fail only at run time; it then counts as killed, as any test would notice.
 - **Spacing matters.** The boundary and arithmetic operators need spaces around the operator. Code formatted without
   them is mutated less.
-- **Everything runs per mutant.** Each mutant runs the whole API test suite, not only the tests of the changed
-  operation. Stopping at the first failure keeps killed mutants fast; survivors take a full run.
+- **Scoping is a guess by names.** It needs the handler of an operation to be named after its `operationId` in the
+  same file as the changed code. Otherwise the whole suite runs, which is slower but never wrong. Survivors always
+  take a full run.
+- **A flaky test is caught only when it flips.** A test that fails with a mutant and fails again by chance would count
+  the mutant as caught only if it also passes on the unmutated code right after; the confirmation lowers the odds of a
+  false kill, it cannot make them zero.

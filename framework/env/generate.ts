@@ -242,6 +242,8 @@ export function plan(input: PlanInput): Plan {
               context: decl.app.build.context,
               ...(decl.app.build.dockerfile ? { dockerfile: decl.app.build.dockerfile } : {}),
               ...(decl.app.build.target ? { target: decl.app.build.target } : {}),
+              // The built image carries the run's labels too: a sweep finds it after a crash, even untagged.
+              ...labelled,
             },
             ...(input.appImage ? { image: input.appImage } : {}),
           }

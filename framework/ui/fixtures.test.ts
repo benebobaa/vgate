@@ -60,6 +60,23 @@ describe('the browser fixtures on a live page', { skip: browser ? false : 'Chrom
         res.end();
       } else if (req.url === '/img-redirect') html('<img alt="x" src="/redirect-img">');
       else if (req.url === '/throws') html('<script>throw new Error("popup threw")</script>');
+      else if (req.url === '/popup-unlabelled') html('<form><input type="text" name="q"></form>');
+      else if (req.url === '/dialog')
+        html(`<button id="open">Open</button>
+          <div id="dlg" role="dialog" aria-modal="true" aria-label="Confirm" hidden><p>Sure?</p><button id="close">Close</button></div>
+          <script>
+            const dlg = document.getElementById('dlg');
+            document.getElementById('open').onclick = () => { dlg.hidden = false; };
+            document.getElementById('close').onclick = () => { dlg.hidden = true; };
+          </script>`);
+      else if (req.url === '/dialog-plain')
+        html(`<button id="open">Open</button>
+          <div id="dlg" role="dialog" aria-label="Plain" hidden><p>Sure?</p><button id="close">Close</button></div>
+          <script>
+            const dlg = document.getElementById('dlg');
+            document.getElementById('open').onclick = () => { dlg.hidden = false; };
+            document.getElementById('close').onclick = () => { dlg.hidden = true; };
+          </script>`);
       else if (req.url === '/spa')
         html(`<button id="go">Go</button><script>
           document.getElementById('go').onclick = () => { history.pushState({}, '', '/spa/next'); };
@@ -116,6 +133,44 @@ test('client-side-page-checked', async ({ page, ui }) => {
   await page.getByRole('button', { name: 'Go' }).click();
   await page.waitForURL('**/spa/next');
   await ui.checkA11y();
+});
+test('popup-unlabelled', async ({ page, ui }) => {
+  await page.goto(ui.url('/'));
+  const popup = page.waitForEvent('popup');
+  await page.evaluate(() => { window.open('/popup-unlabelled'); });
+  await (await popup).waitForLoadState('load');
+  await settle(page);
+});
+test('dialog-unchecked', async ({ page, ui }) => {
+  await page.goto(ui.url('/dialog'));
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(page.getByRole('dialog', { name: 'Confirm' })).toBeVisible();
+  await page.getByRole('button', { name: 'Close' }).click();
+  await expect(page.getByRole('dialog')).toBeHidden();
+});
+test('dialog-checked', async ({ page, ui }) => {
+  await page.goto(ui.url('/dialog'));
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(page.getByRole('dialog', { name: 'Confirm' })).toBeVisible();
+  await ui.checkA11y();
+  await page.getByRole('button', { name: 'Close' }).click();
+  await expect(page.getByRole('dialog')).toBeHidden();
+});
+test('dialog-plain-unchecked', async ({ page, ui }) => {
+  await page.goto(ui.url('/dialog-plain'));
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(page.getByRole('dialog', { name: 'Plain' })).toBeVisible();
+  await page.getByRole('button', { name: 'Close' }).click();
+  await expect(page.getByRole('dialog')).toBeHidden();
+});
+test('popup-closed-fast', async ({ page, ui }) => {
+  await page.goto(ui.url('/'));
+  const popup = page.waitForEvent('popup');
+  await page.evaluate(() => { window.open('/popup-unlabelled'); });
+  const opened = await popup;
+  await opened.waitForLoadState('load');
+  await opened.close();
+  await settle(page);
 });
 test('screenshot-recorded', async ({ page, ui }) => {
   await page.goto(ui.url('/'));
@@ -214,6 +269,27 @@ test('screenshot-recorded', async ({ page, ui }) => {
       'passed',
       results.get('client-side-page-checked')?.message ?? 'did not run',
     );
+  });
+
+  it('checks a popup the page opens for accessibility once it has loaded', () => {
+    failsWith('popup-unlabelled', /accessibility \(critical\) label: .*\/popup-unlabelled\]/);
+  });
+
+  it('fails a modal dialog shown and closed without an accessibility check, and passes a checked one', () => {
+    failsWith('dialog-unchecked', /accessibility not checked on the dialog "Confirm"/);
+    assert.equal(
+      results.get('dialog-checked')?.status,
+      'passed',
+      results.get('dialog-checked')?.message ?? 'did not run',
+    );
+  });
+
+  it('fails a dialog without aria-modal shown and closed without a check: it is a view of its own too', () => {
+    failsWith('dialog-plain-unchecked', /accessibility not checked on the .*dialog "Plain"/);
+  });
+
+  it('fails a popup closed before its check could run: it was never checked', () => {
+    failsWith('popup-closed-fast', /popup-unlabelled/);
   });
 
   it('records the visual baseline a screenshot assertion compares, even when it is missing', () => {

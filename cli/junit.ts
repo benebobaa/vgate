@@ -48,6 +48,14 @@ function attributes(tag: string): Record<string, string> {
 const TESTCASE = /<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
 
 /** Every testcase title of a report, as the registry check matches them. */
+/** Every test case of a report: its file (relative to the test directory) and full title. */
+export function testcases(xml: string): Array<{ file: string; title: string }> {
+  return [...xml.matchAll(TESTCASE)].map(([, head]) => {
+    const test = attributes(head);
+    return { file: test.classname ?? '', title: test.name ?? '' };
+  });
+}
+
 export function testcaseNames(xml: string): string[] {
   return [...xml.matchAll(TESTCASE)].map(([, head]) => attributes(head).name ?? '');
 }

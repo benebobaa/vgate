@@ -33,10 +33,27 @@ exists: nothing is started, seeded or reset.
   DELETE). A test that creates its own data first therefore cannot be a smoke test: list the ones that only read in
   `smoke.scenarios`.
 - **The other doors.** The `db` fixture opens read-only sessions (`default_transaction_read_only`), and `kc` provisions
-  no Keycloak users. The dependency helpers (queues, object stores, mail, Kafka, Redis, MySQL, MongoDB, RabbitMQ) are
-  not guarded, nor is a connection a test opens itself (`fetch`, a socket): a smoke test must not use them. A database
-  user with read rights only is the stronger guard.
+  no Keycloak users. The dependency helpers refuse every operation that changes a dependency, before it is sent:
+  - S3 `put` and `create-bucket`;
+  - SQS `send`, `create` and `receive` (receiving deletes the message);
+  - RabbitMQ `publish`, `take` (consumes a message) and `spy` (declares a temporary queue);
+  - mail `delete` (clearing the inbox);
+  - MySQL `write` (any statement that is not a plain read). The session itself is also `READ ONLY`, so the server refuses
+    what the check would miss, and runs one statement per query (`multipleStatements` in the URL is dropped).
+
+  Kafka, Redis and MongoDB helpers only read. Stubs and faults are refused outright on such an environment.
+
+- **A test's own connection.** A test's own `fetch` or node `http`/`https` request (`request`, `get`, a library on top
+  of them, Playwright's `request`, every redirect they follow) is judged as it goes out: by its path, like the client,
+  when it goes to the environment's base URL; refused when it writes to any other host, which may be the environment
+  under another name (an IP address, another port). Reads go anywhere. The framework's own calls are judged by their
+  own rule, and the lint step refuses test code that imports the framework's door past the guard (`frameworkFetch`,
+  `asFramework`, `unguarded`). http2, a raw socket, a child process (`curl`) or a driver the test opens itself stays
+  outside the guard. A database user with read rights only is the stronger guard.
+- **Load.** `vgate perf` (k6) refuses an environment that is not disposable unless it sets `allowLoad: true`.
 - **`allowWrites`** lists the few writes an environment accepts from the tests, typically a synthetic account's login:
+  `METHOD /template` for an API call, `dependency:operation` for a helper (`events:publish`, `files:put`; exact pairs,
+  no wildcards):
 
   ```yaml
   smoke:
@@ -60,7 +77,8 @@ exists: nothing is started, seeded or reset.
   limited rights, its activity easy to filter out of analytics and billing. It lets a smoke run read what a signed-in
   user reads without touching anyone's data.
 
-- Fault injection, fuzzing, `vgate reset` and `vgate mutate` refuse an environment that is not disposable.
+- Fault injection, fuzzing (`vgate fuzz`, every operation), `vgate reset` and `vgate mutate` refuse an environment that
+  is not disposable.
 
 The result is `reports/smoke.json` (`vgate.verdict/1` with `kind: deployed`, `complete: false`): `vgate decide` never
 takes it for a pull request's gate verdict.

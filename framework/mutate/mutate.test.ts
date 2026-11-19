@@ -179,7 +179,18 @@ describe('score', () => {
       { status: 'build-error' },
       { status: 'not-run' },
     ]);
-    assert.deepEqual(c, { total: 6, killed: 2, survived: 1, timeout: 1, buildError: 1, notRun: 1, score: 0.667 });
+    assert.deepEqual(c, {
+      total: 6,
+      killed: 2,
+      survived: 1,
+      timeout: 1,
+      buildError: 1,
+      notRun: 1,
+      flaky: 0,
+      score: 0.667,
+    });
+    // A flaky mutant is neither caught nor missed.
+    assert.equal(count([{ status: 'killed' }, { status: 'flaky' }, { status: 'flaky' }]).score, 1);
     assert.equal(count([{ status: 'build-error' }]).score, null);
   });
 

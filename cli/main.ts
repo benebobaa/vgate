@@ -33,7 +33,19 @@ import { skills } from './skills.ts';
 import { stack, STACK_ACTIONS, type StackAction } from './stack.ts';
 import { checkPin, installCommand, VERSION } from './version.ts';
 
-const BOOLEANS = ['json', 'fix', 'dry-run', 'yes', 'quiet', 'help', 'version', 'force', 'write', 'smoke'] as const;
+const BOOLEANS = [
+  'json',
+  'fix',
+  'dry-run',
+  'yes',
+  'quiet',
+  'help',
+  'version',
+  'force',
+  'write',
+  'smoke',
+  'all-tests',
+] as const;
 
 /** Everything `help` says, as data: `help --json` is how an agent discovers the tool. */
 const CATALOGUE = {
@@ -131,7 +143,7 @@ const CATALOGUE = {
     },
     {
       name: 'mutate',
-      usage: `${CLI} mutate --service <name> --base <git ref> [--budget 20] [--timeout 10m]`,
+      usage: `${CLI} mutate --service <name> --base <git ref> [--budget 20] [--timeout 10m] [--all-tests]`,
       about:
         "Do the tests catch bugs in the code this change touched? Plants one small bug at a time in the changed lines (comparisons, boundaries, conditions, flags, arithmetic, negation, numbers, returned text), rebuilds and restarts the app in a scratch copy, and runs the service's tests: score = caught / (caught + survived). Lists each survivor with the scenario that would catch it. Writes reports/mutation.json for decide (policy.mutationScore). Exit 1 below the policy.",
     },
@@ -375,6 +387,7 @@ async function run(argv: string[]): Promise<Result> {
       env: envName,
       budget: budget === undefined ? undefined : Number(budget),
       timeoutMs,
+      allTests: args['all-tests'] === true,
       live,
     });
   }

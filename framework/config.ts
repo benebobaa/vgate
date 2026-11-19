@@ -154,9 +154,12 @@ export interface EnvironmentConfig {
   disposable: boolean;
   /**
    * Writes a non-disposable environment accepts from the tests: `METHOD /path/template` (e.g. `POST
-   * /api/v1/auth/login` for a synthetic account's session), or a bare template for every method.
+   * /api/v1/auth/login` for a synthetic account's session), a bare template for every method, or
+   * `<dependency>:<operation>` for a dependency helper (e.g. `payments-queue:publish`, docs/after-deploy.md).
    */
   allowWrites?: string[];
+  /** A non-disposable environment accepts load from `vgate perf` (k6) only with `allowLoad: true`. */
+  allowLoad?: boolean;
   /** Limits a canary must stay within while it takes traffic (`vgate canary`, docs/after-deploy.md). */
   canary?: CanaryConfig;
   /** What the service talks to besides its database: stubbed providers, Kafka, Redis, toxiproxy (deps/config.ts). */
@@ -281,14 +284,15 @@ export function parseSmoke(value: unknown, where: string): SmokeConfig | undefin
   return { scenarios: scenarios as string[] | undefined, grep: text(raw.grep) };
 }
 
-/** `allowWrites:` of an environment: `METHOD /template` or `/template` entries. */
+/** `allowWrites:` of an environment: `METHOD /template`, `/template` or `dependency:operation` entries. */
 export function parseAllowWrites(value: unknown, where: string): string[] | undefined {
   if (value === undefined || value === null) return undefined;
-  if (
-    !Array.isArray(value) ||
-    value.some((entry) => typeof entry !== 'string' || !/^([A-Za-z]+\s+)?\/\S*$/.test(entry))
-  )
-    throw new Error(`${where}: a list of 'METHOD /path/template' (or '/path/template') entries`);
+  const valid = (entry: unknown) =>
+    typeof entry === 'string' && (/^([A-Za-z]+\s+)?\/\S*$/.test(entry) || /^[A-Za-z][\w.-]*:[a-z][\w-]*$/.test(entry));
+  if (!Array.isArray(value) || !value.every(valid))
+    throw new Error(
+      `${where}: a list of 'METHOD /path/template', '/path/template' or 'dependency:operation' (e.g. 'events:publish') entries`,
+    );
   return value as string[];
 }
 
@@ -474,6 +478,12 @@ export function loadService(
       webhooks: env.webhooks === undefined ? undefined : (record(env.webhooks) as EnvironmentConfig['webhooks']),
       disposable: env.disposable === true,
       allowWrites: parseAllowWrites(env.allowWrites, `${name} service.yaml environments.${envName}.allowWrites`),
+      allowLoad: (() => {
+        if (env.allowLoad === undefined) return undefined;
+        if (typeof env.allowLoad !== 'boolean')
+          throw new Error(`${name} service.yaml environments.${envName}.allowLoad: true or false`);
+        return env.allowLoad;
+      })(),
       canary: parseCanary(env.canary, `${name} service.yaml environments.${envName}.canary`),
       dependencies: parseDependencies(
         env.dependencies,

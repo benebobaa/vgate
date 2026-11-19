@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -13,8 +14,18 @@ import {
   type Decision,
   type MutationCheck,
 } from './decide.ts';
-import type { MutationReport } from './mutate.ts';
-import { mutate, mutationSources, newlyFailing, notStarted, reasonsFor } from './mutate.ts';
+import type { MutantTrial, MutationReport } from './mutate.ts';
+import {
+  confirmedKillers,
+  filtersFor,
+  judgeMutant,
+  mutate,
+  mutationSources,
+  newlyFailing,
+  notStarted,
+  reasonsFor,
+  sweepMutate,
+} from './mutate.ts';
 import { readProject } from '../framework/project.ts';
 import { git } from './guard.ts';
 import type { Runtime } from './runtime.ts';
@@ -302,5 +313,188 @@ describe('newlyFailing', () => {
       ['LST-400-LIMIT: refuses limit=0'],
     );
     assert.deepEqual(newlyFailing([], [{ file: 'a.spec.ts', title: 'no id here' }]), ['no id here']);
+  });
+});
+
+describe('a kill must repeat', () => {
+  const t = (title: string) => ({ file: 'orders.spec.ts', title });
+  it('counts a test as the killer only if it failed again with the mutant and passes on the unmutated code', () => {
+    const caught = [t('a › [ORD-1] x'), t('a › [ORD-2] y'), t('a › [ORD-3] z')];
+    const { killers, flaky } = confirmedKillers(
+      caught,
+      [t('a › [ORD-1] x'), t('a › [ORD-3] z')], // ORD-2 passed when run again with the mutant
+      [t('a › [ORD-3] z')], // ORD-3 fails on the unmutated code too
+    );
+    assert.deepEqual(
+      killers.map((k) => k.title),
+      ['a › [ORD-1] x'],
+    );
+    assert.deepEqual(
+      flaky.map((k) => k.title),
+      ['a › [ORD-2] y', 'a › [ORD-3] z'],
+    );
+  });
+
+  it('a flaky mutant counts neither as caught nor as missed', () => {
+    assert.equal(count([mutant('killed'), mutant('survived'), mutant('flaky')]).score, 0.5);
+  });
+});
+
+describe('judging a mutant', () => {
+  const t = (title: string) => ({ file: 'orders.spec.ts', title });
+  const A = t('a › [ORD-1] creates');
+  const B = t('a › [ORD-2] lists');
+  const C = t('b › [PAY-1] pays');
+  /** Did `test` run? By identity (file and title), as the runs report tests: never by object. */
+  const has = (ran: Array<{ file: string; title: string }>, test: { title: string }) =>
+    ran.some((r) => r.title === test.title);
+
+  /**
+   * A stand-in for the app and its tests: `fails(code, ran)` says which of the tests that ran fail, with the mutant or
+   * the unmutated code in place. Records each run.
+   */
+  function world(
+    fails: (code: 'mutant' | 'original', ran: Array<{ file: string; title: string }>, run: number) => (typeof A)[],
+  ) {
+    let code: 'mutant' | 'original' = 'mutant';
+    const runs: string[] = [];
+    const trial: MutantTrial = {
+      run: (only) => {
+        const ran = only ?? [A, B, C];
+        const failures = fails(code, ran, runs.length).filter((f) => has(ran, f));
+        runs.push(`${code}: ${ran.map((r) => /\[(.*?)\]/.exec(r.title)?.[1]).join(' ')}`);
+        return Promise.resolve({
+          summary: {
+            total: ran.length,
+            failed: failures.length,
+            skipped: 0,
+            failures: failures.map((f) => ({ ...f, id: /\[(.*?)\]/.exec(f.title)?.[1], message: 'x' })),
+            knownFailures: [],
+          },
+          cases: ran,
+          code: failures.length > 0 ? 1 : 0,
+          timedOut: false,
+          durationMs: 1,
+          out: '',
+        });
+      },
+      original: () => ((code = 'original'), Promise.resolve(true)),
+      mutant: () => ((code = 'mutant'), Promise.resolve(true)),
+    };
+    return { trial, runs };
+  }
+
+  it('re-runs the same tests on the unmutated code: one test breaking another is not a kill', async () => {
+    // B leaves data that breaks A when both run, mutant or not; A alone passes. B also fails once by chance. Run alone
+    // on the unmutated code, A would pass and look like the mutant's catch.
+    const { trial, runs } = world((_code, ran, run) => [...(has(ran, B) ? [A] : []), ...(run === 0 ? [B] : [])]);
+    const judged = await judgeMutant(trial, { failingBefore: [], perMutant: 60_000, subset: [A, B] });
+    assert.equal(judged.result.status, 'flaky', runs.join('\n'));
+  });
+
+  it('a scoped catch that does not hold goes to the whole suite: a survivor is not hidden as flaky', async () => {
+    // B needs C to run before it: alone it fails, mutant or not. The whole suite catches nothing.
+    const { trial, runs } = world((_code, ran) => (has(ran, C) ? [] : [B]));
+    const judged = await judgeMutant(trial, { failingBefore: [], perMutant: 60_000, subset: [B] });
+    assert.equal(judged.result.status, 'survived', runs.join('\n'));
+    assert.equal(judged.caughtByScope, true);
+    assert.equal(runs.at(-1), 'mutant: ORD-1 ORD-2 PAY-1', 'the whole suite ran last, with the mutant');
+  });
+
+  it('a kill that holds is a kill, scoped or not', async () => {
+    const { trial } = world((code) => (code === 'mutant' ? [A] : []));
+    for (const subset of [[A], undefined]) {
+      const judged = await judgeMutant(trial, { failingBefore: [], perMutant: 60_000, subset });
+      assert.deepEqual([judged.result.status, judged.result.killedBy], ['killed', ['ORD-1: creates']]);
+      await trial.mutant();
+    }
+  });
+});
+
+describe('running exactly some tests', () => {
+  it('anchors the files and matches the tests by their own titles, with regex characters escaped', () => {
+    const args = filtersFor([
+      { file: 'orders.spec.ts', title: 'POST /orders › [ORD-201] creates (rule 3)' },
+      { file: 'faults/pay.spec.ts', title: 'pay › [PAY-1] a+b?' },
+    ]);
+    assert.deepEqual(args.slice(0, 2), ['orders\\.spec\\.ts$', 'faults/pay\\.spec\\.ts$']);
+    assert.equal(args[2], '--grep');
+    const grep = new RegExp(args[3]);
+    assert.ok(grep.test('POST /orders [ORD-201] creates (rule 3)'));
+    assert.ok(grep.test('pay [PAY-1] a+b?'));
+    assert.ok(!grep.test('POST /orders [ORD-201-REPEAT] repeats'));
+  });
+});
+
+describe('what an interrupted mutate leaves behind', () => {
+  const project = () => {
+    const root = mkdtempSync(join(tmpdir(), 'vgate-sweep-'));
+    dirs.push(root);
+    writeFileSync(join(root, 'vgate.yaml'), 'version: 0.0.0\nservicesDir: services\n');
+    git(root, ['init', '-q']);
+    return readProject(root);
+  };
+  const marker = (p: ReturnType<typeof project>, pid: number, scratch: string, startedAt = new Date()) => {
+    mkdirSync(join(p.reportsDir, 'mutate'), { recursive: true });
+    writeFileSync(
+      join(p.reportsDir, 'mutate', 'orders.run.json'),
+      JSON.stringify({
+        schema: 'vgate.mutate-run/1',
+        pid,
+        service: 'orders',
+        scratch,
+        scratchReports: join(scratch, 'reports'),
+        gitTop: p.root,
+        startedAt: startedAt.toISOString(),
+      }),
+    );
+  };
+
+  it('is swept when the run is gone: its scratch copy and its marker', async () => {
+    const p = project();
+    const scratch = mkdtempSync(join(tmpdir(), 'vgate-mutate-'));
+    dirs.push(scratch);
+    writeFileSync(join(scratch, 'left.txt'), 'x');
+    marker(p, 2 ** 22 + 12345, scratch); // no such process
+    const swept = await sweepMutate(p, 'orders');
+    assert.ok(swept.removed.includes('its scratch worktree'), JSON.stringify(swept));
+    assert.equal(existsSync(scratch), false);
+    assert.equal(existsSync(join(p.reportsDir, 'mutate', 'orders.run.json')), false);
+    assert.deepEqual((await sweepMutate(p, 'orders')).removed, []);
+  });
+
+  it('is left alone while that run is still going', async () => {
+    const p = project();
+    const scratch = mkdtempSync(join(tmpdir(), 'vgate-mutate-'));
+    dirs.push(scratch);
+    marker(p, process.ppid, scratch); // a live process that is not this one
+    const swept = await sweepMutate(p, 'orders');
+    assert.equal(swept.busy, process.ppid);
+    assert.equal(existsSync(scratch), true);
+    // ...unless the caller is that run itself, cleaning up its own copy.
+    assert.ok((await sweepMutate(p, 'orders', process.ppid)).removed.includes('its scratch worktree'));
+  });
+
+  it('never takes a reused pid for the run or its app: an unrelated process is neither waited for nor killed', async () => {
+    const p = project();
+    const scratch = mkdtempSync(join(tmpdir(), 'vgate-mutate-'));
+    dirs.push(scratch);
+    // A process that started before the run did: it holds a pid the run's app once had.
+    const unrelated = spawn('sleep', ['30'], { stdio: 'ignore' });
+    try {
+      await new Promise((done) => setTimeout(done, 200));
+      mkdirSync(join(scratch, 'reports', 'stack'), { recursive: true });
+      writeFileSync(join(scratch, 'reports', 'stack', 'api.pid'), `${unrelated.pid}\n`);
+      marker(p, 2 ** 22 + 12345, scratch, new Date(Date.now() + 60_000)); // the run itself is gone
+      const swept = await sweepMutate(p, 'orders');
+      assert.ok(!swept.removed.some((r) => r.includes('host app')), JSON.stringify(swept));
+      assert.equal(unrelated.exitCode, null);
+      assert.equal(unrelated.signalCode, null, 'still running');
+      // The marker of a run long gone, whose pid a newer process holds now: swept, not "busy".
+      marker(p, process.ppid, scratch, new Date('2000-01-01T00:00:00Z'));
+      assert.equal((await sweepMutate(p, 'orders')).busy, undefined);
+    } finally {
+      unrelated.kill();
+    }
   });
 });

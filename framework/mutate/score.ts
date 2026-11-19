@@ -11,8 +11,10 @@ import type { Candidate } from './operators.ts';
  * - timeout: the tests ran past their time; counted apart (a hang is noticed, but by no assertion)
  * - build-error: the mutated code did not build; it says nothing about the tests
  * - not-run: the run's time ran out first
+ * - flaky: tests failed with the mutant, but did not fail again with it or failed on the unmutated code too: their
+ *   failure was not the mutant's doing, so it says nothing either way
  */
-export type MutantStatus = 'killed' | 'survived' | 'timeout' | 'build-error' | 'not-run';
+export type MutantStatus = 'killed' | 'survived' | 'timeout' | 'build-error' | 'not-run' | 'flaky';
 
 export interface MutantResult extends Candidate {
   status: MutantStatus;
@@ -22,6 +24,8 @@ export interface MutantResult extends Candidate {
   detail?: string;
   /** For a survivor: what to add, in words. */
   hint?: string;
+  /** For a flaky mutant: the tests whose failure did not hold. */
+  flakyTests?: string[];
 }
 
 export interface MutationCounts {
@@ -31,6 +35,7 @@ export interface MutationCounts {
   timeout: number;
   buildError: number;
   notRun: number;
+  flaky: number;
   /** killed / (killed + survived); null when no mutant could be judged. */
   score: number | null;
 }
@@ -46,6 +51,7 @@ export function count(results: Array<Pick<MutantResult, 'status'>>): MutationCou
     timeout: by('timeout'),
     buildError: by('build-error'),
     notRun: by('not-run'),
+    flaky: by('flaky'),
     score: killed + survived === 0 ? null : Math.round((killed / (killed + survived)) * 1000) / 1000,
   };
 }

@@ -6,6 +6,7 @@
  * directly (`take`) consumes its messages; use it only on a queue nothing else drains.
  */
 import { connect, type Channel, type ChannelModel, type Message } from 'amqplib';
+import type { DependencyGuard } from '../http/write-guard.ts';
 
 export interface AmqpMessage {
   routingKey: string;
@@ -96,16 +97,21 @@ export class AmqpBroker {
   private constructor(
     private readonly connection: ChannelModel,
     private readonly channel: Channel,
+    private readonly guard: DependencyGuard,
   ) {}
 
-  /** `amqp://user:password@host:port[/vhost]` */
-  static async connect(url: string): Promise<AmqpBroker> {
+  /**
+   * `amqp://user:password@host:port[/vhost]`. `guard` runs before each operation that changes the broker: `spy`
+   * (declares a temporary queue and binding), `publish`, `take` (consumes a message). In a non-disposable environment
+   * it refuses what `allowWrites` does not list (`<dependency>:publish`).
+   */
+  static async connect(url: string, guard: DependencyGuard = () => undefined): Promise<AmqpBroker> {
     const connection = await connect(url);
     // A broker-side error otherwise surfaces as an unhandled 'error' event that kills the worker.
     connection.on('error', () => undefined);
     const channel = await connection.createChannel();
     channel.on('error', () => undefined);
-    return new AmqpBroker(connection, channel);
+    return new AmqpBroker(connection, channel, guard);
   }
 
   /**
@@ -113,6 +119,7 @@ export class AmqpBroker {
    * that should publish; messages published earlier are not seen.
    */
   async spy(exchange: string, routingKey = '#'): Promise<AmqpSpy> {
+    this.guard('spy');
     const { queue } = await this.channel.assertQueue('', { exclusive: true, autoDelete: true });
     await this.channel.bindQueue(queue, exchange, routingKey);
     // The consumer can deliver before `consume` resolves with the tag the spy needs: hold those messages until then.
@@ -135,6 +142,7 @@ export class AmqpBroker {
 
   /** Publishes to an exchange ('' is the default exchange: the routing key is then a queue name). */
   publish(exchange: string, routingKey: string, body: string | object, headers: Record<string, unknown> = {}): void {
+    this.guard('publish');
     const text = typeof body === 'string' ? body : JSON.stringify(body);
     const contentType = typeof body === 'string' ? 'text/plain' : 'application/json';
     this.channel.publish(exchange, routingKey, Buffer.from(text), { headers, contentType, persistent: true });
@@ -142,6 +150,7 @@ export class AmqpBroker {
 
   /** Takes (and acknowledges) one message from a queue, or undefined when it is empty. Consumes it. */
   async take(queue: string): Promise<AmqpMessage | undefined> {
+    this.guard('take');
     const msg = await this.channel.get(queue, { noAck: true });
     return msg ? toMessage(msg) : undefined;
   }

@@ -10,6 +10,7 @@
  */
 import { OpenApiContract } from '../http/openapi.ts';
 import type { HttpStubDependency } from './config.ts';
+import { frameworkFetch } from '../http/write-guard.ts';
 
 /** JSONPath (as WireMock reads it) -> the exact value the request must carry there, e.g. `{ '$.customer': id }`. */
 export type BodyMatch = Record<string, string | number | boolean>;
@@ -133,7 +134,7 @@ export class HttpStub {
   }
 
   private async admin(path: string, init: RequestInit = {}): Promise<unknown> {
-    const response = await fetch(`${this.config.adminUrl}/__admin${path}`, {
+    const response = await frameworkFetch(`${this.config.adminUrl}/__admin${path}`, {
       ...init,
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(10_000),

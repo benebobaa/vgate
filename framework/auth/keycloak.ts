@@ -1,4 +1,5 @@
 import type { EnvironmentConfig, KeycloakConfig } from '../config.ts';
+import { frameworkFetch } from '../http/write-guard.ts';
 
 interface CachedToken {
   token: string;
@@ -65,7 +66,7 @@ export class Keycloak {
   }
 
   private async tokenRequest(url: string, form: Record<string, string>): Promise<string> {
-    const response = await fetch(url, { method: 'POST', body: new URLSearchParams(form) });
+    const response = await frameworkFetch(url, { method: 'POST', body: new URLSearchParams(form) });
     const text = await response.text();
     if (!response.ok) throw new Error(`Keycloak token request to ${url} failed: ${response.status} ${text}`);
     return (JSON.parse(text) as { access_token: string }).access_token;
@@ -118,7 +119,7 @@ export class Keycloak {
   }
 
   private async admin(method: string, path: string, body?: unknown): Promise<Response> {
-    return fetch(`${this.cfg.url}/admin/realms/${this.cfg.realm}${path}`, {
+    return frameworkFetch(`${this.cfg.url}/admin/realms/${this.cfg.realm}${path}`, {
       method,
       headers: { Authorization: `Bearer ${await this.adminToken()}`, 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),

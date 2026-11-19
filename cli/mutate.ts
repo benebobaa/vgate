@@ -21,13 +21,14 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { loadService, parsePaths, type ServiceConfig } from '../framework/config.ts';
 import { envDown, envUp, type EnvState } from '../framework/env/lifecycle.ts';
@@ -41,12 +42,13 @@ import {
   type MutationCounts,
   type MutationVerdict,
 } from '../framework/mutate/score.ts';
+import { operationsFor, planOperations, testsFor, type PlanOperation } from '../framework/mutate/select.ts';
 import { DEFAULT_MUTATION, readProject, type ProjectConfig } from '../framework/project.ts';
 import { changeSet, serviceMigrationDirs, type ChangeSet } from './affected.ts';
 import { treeState, type TreeState } from './commit.ts';
 import { matchesGlob } from './glob.ts';
 import { git } from './guard.ts';
-import { parseJunit, type TestSummary } from './junit.ts';
+import { parseJunit, testcases, type TestFailure, type TestSummary } from './junit.ts';
 import { CLI, EXIT, UsageError, type Result } from './output.ts';
 import { prepare, stepEnv, toolEnv, type Runtime } from './runtime.ts';
 
@@ -70,6 +72,8 @@ export interface MutationReport {
   timeoutMs: number;
   how?: MutationHow;
   baseline?: { total: number; failed: number; durationMs: number };
+  /** Mutants first run against only the tests of the operations their line serves, and how many those caught. */
+  selection?: { scoped: number; caughtByScope: number };
   mutants: MutantResult[];
   reasons: string[];
   startedAt: string;
@@ -82,6 +86,8 @@ export interface MutateOptions {
   env: string;
   budget?: number;
   timeoutMs?: number;
+  /** Run the whole suite for every mutant, never only the tests of the operations its line serves. */
+  allTests?: boolean;
   live: boolean;
 }
 
@@ -124,6 +130,9 @@ interface Ran {
   durationMs: number;
 }
 
+/** The process groups this run started and that are still running: an interrupt stops them before cleaning up. */
+const children = new Set<number>();
+
 /** Runs a program to the end (or kills its whole process group at `timeoutMs`), keeping its output. */
 function run(
   command: string,
@@ -138,6 +147,7 @@ function run(
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     });
+    if (child.pid !== undefined) children.add(child.pid);
     let out = '';
     let timedOut = false;
     const take = (chunk: Buffer) => {
@@ -159,6 +169,7 @@ function run(
           }, options.timeoutMs);
     const finish = (code: number | null) => {
       if (timer) clearTimeout(timer);
+      if (child.pid !== undefined) children.delete(child.pid);
       done({ code, out, timedOut, durationMs: Date.now() - started });
     };
     child.on('error', (error) => ((out += error.message), finish(null)));
@@ -227,6 +238,142 @@ function scratchCopy(project: ProjectConfig, change: ChangeSet, service: string)
   if (existsSync(generated))
     cpSync(generated, join(dir, change.prefix, project.servicesDirName, service, 'generated'), { recursive: true });
   return dir;
+}
+
+/**
+ * What a run leaves on disk while it works, so that one stopped hard (SIGKILL, a crash, a closed terminal) can be
+ * cleaned up by the next `vgate mutate` or `vgate down --service <s>`: the scratch worktree and the reports dir its
+ * environment and images are labelled with.
+ */
+interface RunMarker {
+  schema: 'vgate.mutate-run/1';
+  pid: number;
+  service: string;
+  scratch: string;
+  scratchReports: string;
+  gitTop: string;
+  startedAt: string;
+}
+
+const markerPath = (project: ProjectConfig, service: string) =>
+  join(project.reportsDir, 'mutate', `${service}.run.json`);
+
+function readMarker(project: ProjectConfig, service: string): RunMarker | undefined {
+  try {
+    const marker = JSON.parse(readFileSync(markerPath(project, service), 'utf8')) as RunMarker;
+    return marker.schema === 'vgate.mutate-run/1' ? marker : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** When a process started (ms), from `ps`; undefined when that cannot be told. */
+function startTime(pid: number): number | undefined {
+  const ps = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    encoding: 'utf8',
+    env: { ...process.env, LC_ALL: 'C' },
+  });
+  const at = ps.status === 0 ? Date.parse(ps.stdout.trim()) : NaN;
+  return Number.isNaN(at) ? undefined : at;
+}
+
+/**
+ * Is `pid` still the process a marker recorded? A pid is reused once its process is gone (a reboot, days later): the
+ * run's own process started before its marker was written, an app it started after. `ps` shows whole seconds.
+ */
+function sameProcess(pid: number, marker: RunMarker, role: 'run' | 'app'): boolean {
+  if (!alive(pid)) return false;
+  const started = startTime(pid);
+  const written = Date.parse(marker.startedAt);
+  if (started === undefined || Number.isNaN(written)) return role === 'run'; // unknown: never kill, never sweep a run
+  return role === 'run' ? started <= written + 1000 : started >= written - 1000;
+}
+
+function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+export interface Sweep {
+  /** What was removed, in words; empty when nothing was left. */
+  removed: string[];
+  /** Another `vgate mutate` of the service is running (its pid): its scratch copy was left alone. */
+  busy?: number;
+}
+
+/**
+ * Removes what an earlier `vgate mutate` of the service left behind: its sealed environment and app images (found by
+ * the labels of its scratch reports dir), a host app it started, its scratch worktree, and the marker. A run still
+ * alive is left alone. `self`: the pid of the run calling it, whose own marker is never "busy".
+ */
+export async function sweepMutate(project: ProjectConfig, service: string, self?: number): Promise<Sweep> {
+  const marker = readMarker(project, service);
+  if (!marker) return { removed: [] };
+  if (marker.pid !== self && sameProcess(marker.pid, marker, 'run')) return { removed: [], busy: marker.pid };
+  const removed: string[] = [];
+  if (await envDown(marker.scratchReports, service)) removed.push('its sealed environment');
+  // A host app its stack.sh started (lib.sh keeps the pid of each app it starts).
+  const pids = join(marker.scratchReports, 'stack');
+  if (existsSync(pids))
+    for (const file of readdirSync(pids).filter((f) => f.endsWith('.pid'))) {
+      const pid = Number(readFileSync(join(pids, file), 'utf8').trim());
+      if (Number.isInteger(pid) && pid > 0 && sameProcess(pid, marker, 'app')) {
+        killGroup(pid, 'SIGTERM');
+        removed.push(`a host app (pid ${pid})`);
+      }
+    }
+  // Images built for mutants carry the run's labels, tagged, untagged or intermediate (`--all`): a child goes before
+  // its parent, so what a first pass cannot remove goes on a second.
+  const labelled = async () => {
+    const listed = await run('docker', [
+      'images',
+      '--all',
+      '--quiet',
+      '--filter',
+      `label=dev.vgate.reports=${resolve(marker.scratchReports)}`,
+    ]);
+    return listed.code === 0
+      ? [
+          ...new Set(
+            listed.out
+              .split('\n')
+              .map((l) => l.trim())
+              .filter(Boolean),
+          ),
+        ]
+      : [];
+  };
+  const ids = await labelled();
+  if (ids.length > 0) {
+    await run('docker', ['image', 'rm', '--force', ...ids]);
+    const left = await labelled();
+    if (left.length > 0) await run('docker', ['image', 'rm', '--force', ...left]);
+    removed.push(`${ids.length} mutant image(s)`);
+  }
+  if (existsSync(marker.scratch)) {
+    git(marker.gitTop, ['worktree', 'remove', '--force', marker.scratch]);
+    rmSync(marker.scratch, { recursive: true, force: true });
+    removed.push('its scratch worktree');
+  }
+  git(marker.gitTop, ['worktree', 'prune']);
+  rmSync(markerPath(project, service), { force: true });
+  return { removed };
 }
 
 /** The running app, however the service starts: restartable with or without a mutant in place. */
@@ -320,10 +467,24 @@ async function startStack(
 
 interface TestRun {
   summary?: TestSummary;
+  /** Every test case that ran (file and full title). */
+  cases: Array<{ file: string; title: string }>;
   code: number | null;
   timedOut: boolean;
   durationMs: number;
   out: string;
+}
+
+const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Playwright filters for exactly these tests: their files (anchored) and their own titles (the last part of the
+ * report's title). Exported for the tests.
+ */
+export function filtersFor(tests: Array<{ file: string; title: string }>): string[] {
+  const files = [...new Set(tests.map((t) => t.file))].map((f) => `${escapeRegex(f)}$`);
+  const titles = [...new Set(tests.map((t) => t.title.split(' › ').pop() ?? t.title))].map(escapeRegex);
+  return [...files, '--grep', titles.join('|')];
 }
 
 /** The service's API tests (not the fault tests, which pause containers) against the running scratch app. */
@@ -332,7 +493,7 @@ async function runTests(
   runtime: Runtime,
   service: string,
   env: string,
-  options: { stopAtFirstFailure: boolean; timeoutMs?: number },
+  options: { stopAtFirstFailure: boolean; timeoutMs?: number; only?: Array<{ file: string; title: string }> },
 ): Promise<TestRun> {
   const junit = join(scratch.reportsDir, 'junit', 'playwright-api.xml');
   rmSync(junit, { force: true });
@@ -346,6 +507,7 @@ async function runTests(
       'api',
       '--pass-with-no-tests',
       ...(options.stopAtFirstFailure ? ['--max-failures', '1'] : []),
+      ...(options.only ? filtersFor(options.only) : []),
     ],
     {
       cwd: runtime.root,
@@ -360,8 +522,10 @@ async function runTests(
       timeoutMs: options.timeoutMs,
     },
   );
-  const summary = existsSync(junit) ? parseJunit(readFileSync(junit, 'utf8')) : undefined;
-  return { summary, code: ran.code, timedOut: ran.timedOut, durationMs: ran.durationMs, out: ran.out };
+  const xml = existsSync(junit) ? readFileSync(junit, 'utf8') : undefined;
+  const summary = xml === undefined ? undefined : parseJunit(xml);
+  const cases = xml === undefined ? [] : testcases(xml);
+  return { summary, cases, code: ran.code, timedOut: ran.timedOut, durationMs: ran.durationMs, out: ran.out };
 }
 
 /**
@@ -373,13 +537,141 @@ const testKey = (f: { file: string; title: string }) => `${f.file}\0${f.title}`;
 const testLabel = (f: { id?: string; title: string }) =>
   f.id ? `${f.id}: ${f.title.replace(/^.*?\]\s*/, '')}` : f.title;
 
-/** The tests that fail now and passed on the unmutated code, as people read them. Pure; exported for the tests. */
+/** The tests that fail now and passed on the unmutated code. Pure; exported for the tests. */
+export function newlyFailingTests<T extends { file: string; title: string }>(
+  before: Array<{ file: string; title: string }>,
+  now: T[],
+): T[] {
+  const failingBefore = new Set(before.map(testKey));
+  return now.filter((f) => !failingBefore.has(testKey(f)));
+}
+
+/** The same, as people read them. */
 export function newlyFailing(
   before: Array<{ file: string; title: string }>,
   now: Array<{ id?: string; file: string; title: string }>,
 ): string[] {
-  const failingBefore = new Set(before.map(testKey));
-  return now.filter((f) => !failingBefore.has(testKey(f))).map(testLabel);
+  return newlyFailingTests(before, now).map(testLabel);
+}
+
+/**
+ * Whose failure the mutant caused: the tests that failed with it, failed again with it, and passed on the unmutated
+ * code. The rest failed for another reason (a flaky test, the environment) and catch nothing. Pure; exported for
+ * the tests.
+ */
+export function confirmedKillers<T extends { file: string; title: string }>(
+  caught: T[],
+  again: Array<{ file: string; title: string }>,
+  onOriginal: Array<{ file: string; title: string }>,
+): { killers: T[]; flaky: T[] } {
+  const failedAgain = new Set(again.map(testKey));
+  const failOnOriginal = new Set(onOriginal.map(testKey));
+  const killers = caught.filter((t) => failedAgain.has(testKey(t)) && !failOnOriginal.has(testKey(t)));
+  return { killers, flaky: caught.filter((t) => !killers.includes(t)) };
+}
+
+type Tests = Array<{ file: string; title: string }>;
+
+/** What judging one mutant needs: the tests against the app as it runs now, and swapping its code. */
+export interface MutantTrial {
+  /** Runs the tests (only those, when given) against the app as it runs now. */
+  run(only?: Tests, stopAtFirstFailure?: boolean): Promise<TestRun>;
+  /** Puts the unmutated code back and restarts the app; false when it did not come up. */
+  original(): Promise<boolean>;
+  /** Puts the mutant back and restarts the app; false when it did not come up. */
+  mutant(): Promise<boolean>;
+}
+
+export interface MutantJudgement {
+  result: Pick<MutantResult, 'status' | 'killedBy' | 'flakyTests' | 'detail'>;
+  /** The scoped tests ran first, and whether they caught it. */
+  scoped: boolean;
+  caughtByScope: boolean;
+  /** Set when the unmutated app stopped coming up: the run cannot go on. */
+  broken?: string;
+}
+
+/**
+ * Judges one mutant, the app already running with it: the scoped tests first (`subset`), the whole suite when they
+ * miss, and a kill confirmed before it counts. A scoped catch that does not hold is no answer: the whole suite decides,
+ * as for any mutant the scope missed. Exported for the tests.
+ */
+export async function judgeMutant(
+  trial: MutantTrial,
+  { subset, failingBefore, perMutant }: { subset?: Tests; failingBefore: Tests; perMutant: number },
+): Promise<MutantJudgement> {
+  const stop = failingBefore.length === 0;
+  const judgement: MutantJudgement = {
+    result: { status: 'survived' },
+    scoped: subset !== undefined,
+    caughtByScope: false,
+  };
+  const outcome = async (ran: TestRun, caught: TestFailure[]): Promise<MutantJudgement['result']> => {
+    if (ran.timedOut) return { status: 'timeout', detail: `the tests ran past ${Math.round(perMutant / 1000)}s` };
+    if (caught.length > 0) return confirm(caught);
+    if (!ran.summary) return { status: 'build-error', detail: `the tests did not run: ${tail(ran.out, 4)}` };
+    return { status: 'survived' };
+  };
+  const full = async () => {
+    const ran = await trial.run(undefined, stop);
+    return outcome(ran, newlyFailingTests(failingBefore, ran.summary?.failures ?? []));
+  };
+
+  /**
+   * A kill holds only if it repeats: the failing tests fail again with the mutant, then pass with the unmutated code
+   * (restored and restarted here; the next mutant restarts anyway). Both re-runs run the same tests, so that one test's
+   * effect on another cannot pass for the mutant's.
+   */
+  async function confirm(caught: TestFailure[]): Promise<MutantJudgement['result']> {
+    const again = await trial.run(caught, false);
+    const reproduced = again.timedOut
+      ? caught
+      : caught.filter((f) => again.summary?.failures.some((g) => testKey(g) === testKey(f)));
+    if (reproduced.length === 0)
+      return {
+        status: 'flaky',
+        flakyTests: caught.map(testLabel),
+        detail: 'the tests that failed with the mutant passed when run again with it',
+      };
+    if (!(await trial.original())) {
+      judgement.broken = 'the app no longer starts, even without a mutant';
+      return { status: 'not-run', detail: 'the unmutated app did not start again to confirm the kill' };
+    }
+    const onOriginal = await trial.run(caught, false);
+    if (!onOriginal.summary) return { status: 'not-run', detail: 'the tests did not run on the unmutated app' };
+    const { killers, flaky } = confirmedKillers(
+      caught,
+      again.timedOut ? caught : (again.summary?.failures ?? []),
+      onOriginal.summary.failures,
+    );
+    if (killers.length === 0)
+      return {
+        status: 'flaky',
+        flakyTests: flaky.map(testLabel),
+        detail: 'the tests that failed with the mutant fail on the unmutated code too',
+      };
+    return {
+      status: 'killed',
+      killedBy: killers.map(testLabel).slice(0, 5),
+      ...(flaky.length > 0 ? { flakyTests: flaky.map(testLabel) } : {}),
+    };
+  }
+
+  if (!subset) {
+    judgement.result = await full();
+    return judgement;
+  }
+  const ran = await trial.run(subset, stop);
+  const caught = newlyFailingTests(failingBefore, ran.summary?.failures ?? []);
+  judgement.caughtByScope = caught.length > 0;
+  judgement.result = caught.length === 0 && !ran.timedOut && ran.summary ? await full() : await outcome(ran, caught);
+  if (judgement.caughtByScope && judgement.result.status === 'flaky' && !judgement.broken) {
+    // The scoped tests failed for another reason (one may need a test outside the scope): the whole suite decides.
+    if (!(await trial.mutant()))
+      judgement.result = { status: 'not-run', detail: 'the mutant did not start again for the whole suite' };
+    else judgement.result = await full();
+  }
+  return judgement;
 }
 
 export async function mutate(project: ProjectConfig, runtime: Runtime, options: MutateOptions): Promise<Result> {
@@ -404,6 +696,13 @@ export async function mutate(project: ProjectConfig, runtime: Runtime, options: 
     throw new UsageError(
       `mutate restarts ${options.service} with planted bugs: environment ${options.env} is not disposable`,
     );
+
+  // What an earlier run stopped hard (SIGKILL, a crash) left behind goes first; a run still going is not disturbed.
+  const leftovers = await sweepMutate(project, options.service, process.pid);
+  if (leftovers.busy !== undefined)
+    return notReady(options.service, `another vgate mutate of ${options.service} is running (pid ${leftovers.busy})`);
+  if (leftovers.removed.length > 0 && options.live)
+    process.stderr.write(`mutate: removed what an interrupted run left: ${leftovers.removed.join(', ')}\n`);
 
   // The mutation sites: the changed lines of the service's source files.
   const files = mutationSources(project, change, svc);
@@ -459,9 +758,43 @@ export async function mutate(project: ProjectConfig, runtime: Runtime, options: 
   const progress = (line: string) => options.live && process.stderr.write(`${line}\n`);
   let dir: string | undefined;
   let stack: Stack | undefined;
+  let scratch: ProjectConfig | undefined;
+  // Everything the run created goes, once, however it ends: done, failed, interrupted.
+  let cleaning: Promise<void> | undefined;
+  const cleanup = () =>
+    (cleaning ??= (async () => {
+      if (stack) await stack.stop().catch(() => undefined);
+      if (scratch) await sweepMutate(project, options.service, process.pid).catch(() => undefined);
+      if (dir) {
+        git(change.top, ['worktree', 'remove', '--force', dir]);
+        rmSync(dir, { recursive: true, force: true });
+      }
+      rmSync(markerPath(project, options.service), { force: true });
+    })());
+  let interrupted: NodeJS.Signals | undefined;
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (interrupted) return;
+    interrupted = signal;
+    process.stderr.write(`mutate: ${signal}: stopping and removing the scratch copy, its environment and images\n`);
+    for (const pid of children) killGroup(pid, 'SIGTERM');
+    void cleanup().finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
   try {
     dir = scratchCopy(project, change, options.service);
-    const scratch = readProject(join(dir, change.prefix));
+    scratch = readProject(join(dir, change.prefix));
+    mkdirSync(dirname(markerPath(project, options.service)), { recursive: true });
+    const marker: RunMarker = {
+      schema: 'vgate.mutate-run/1',
+      pid: process.pid,
+      service: options.service,
+      scratch: dir,
+      scratchReports: scratch.reportsDir,
+      gitTop: change.top,
+      startedAt: new Date(started).toISOString(),
+    };
+    writeFileSync(markerPath(project, options.service), `${JSON.stringify(marker, null, 2)}\n`);
     const ready = prepare(scratch, runtime, options.live);
     if (!ready.ok) return notReady(options.service, ready.error ?? 'the vgate runtime is not ready');
     progress(
@@ -484,9 +817,14 @@ export async function mutate(project: ProjectConfig, runtime: Runtime, options: 
       `baseline: ${baseline.summary.total} tests, ${baseline.summary.failed} failing (${(baseline.durationMs / 1000).toFixed(1)}s)`,
     );
     const perMutant = Math.max(60_000, baseline.durationMs * 3 + 30_000);
+    const plan = readPlan(scratch, options.service);
+    const selection = { scoped: 0, caughtByScope: 0 };
     let broken: string | undefined;
+    const tests = (only?: Array<{ file: string; title: string }>, stopAtFirstFailure = failingBefore.length === 0) =>
+      runTests(scratch!, runtime, options.service, options.env, { stopAtFirstFailure, timeoutMs: perMutant, only });
 
     for (const [index, c] of picked.entries()) {
+      if (interrupted) break;
       if (Date.now() - started > timeoutMs || broken) {
         report.mutants.push({
           ...c,
@@ -499,6 +837,10 @@ export async function mutate(project: ProjectConfig, runtime: Runtime, options: 
       const at = Date.now();
       const path = join(dir, c.file);
       const original = readFileSync(path, 'utf8');
+      // The tests of the operations the line serves, when that is knowable: run first; the rest only if they miss.
+      const scope = options.allTests ? undefined : operationsFor(c.file, original, c.line, plan);
+      const scoped = scope ? testsFor(scope, baseline.cases) : [];
+      const subset = scoped.length > 0 && scoped.length < baseline.cases.length ? scoped : undefined;
       let result: MutantResult;
       try {
         writeFileSync(path, apply(original, c));
@@ -515,27 +857,29 @@ export async function mutate(project: ProjectConfig, runtime: Runtime, options: 
           result = { ...c, ...notStarted(stack.how, unmutatedStarts, restarted.detail), durationMs: 0 };
           if (unmutatedStarts === false) broken = 'the app no longer starts, even without a mutant';
         } else {
-          const tests = await runTests(scratch, runtime, options.service, options.env, {
-            stopAtFirstFailure: failingBefore.length === 0,
-            timeoutMs: perMutant,
-          });
-          const caught = newlyFailing(failingBefore, tests.summary?.failures ?? []);
-          if (tests.timedOut)
-            result = {
-              ...c,
-              status: 'timeout',
-              durationMs: 0,
-              detail: `the tests ran past ${Math.round(perMutant / 1000)}s`,
-            };
-          else if (caught.length > 0) result = { ...c, status: 'killed', killedBy: caught.slice(0, 5), durationMs: 0 };
-          else if (!tests.summary)
-            result = {
-              ...c,
-              status: 'build-error',
-              durationMs: 0,
-              detail: `the tests did not run: ${tail(tests.out, 4)}`,
-            };
-          else result = { ...c, status: 'survived', durationMs: 0, hint: hint(c) };
+          const judged = await judgeMutant(
+            {
+              run: (only, stopAtFirstFailure) => tests(only, stopAtFirstFailure),
+              original: async () => {
+                writeFileSync(path, original);
+                return !(await stack!.restart()).problem;
+              },
+              mutant: async () => {
+                writeFileSync(path, apply(original, c));
+                return !(await stack!.restart()).problem;
+              },
+            },
+            { subset, failingBefore, perMutant },
+          );
+          if (judged.scoped) selection.scoped++;
+          if (judged.caughtByScope) selection.caughtByScope++;
+          if (judged.broken) broken = judged.broken;
+          result = {
+            ...c,
+            ...judged.result,
+            ...(judged.result.status === 'survived' ? { hint: hint(c) } : {}),
+            durationMs: 0,
+          };
         }
       } finally {
         writeFileSync(path, original);
@@ -546,15 +890,25 @@ export async function mutate(project: ProjectConfig, runtime: Runtime, options: 
         `[${index + 1}/${picked.length}] ${c.file}:${c.line} ${c.operator} \`${c.original}\` -> \`${c.replacement}\`: ${result.status} (${(result.durationMs / 1000).toFixed(1)}s)`,
       );
     }
+    report.selection = selection;
     return finish();
   } catch (error) {
     return notReady(options.service, (error as Error).message);
   } finally {
-    if (stack) await stack.stop();
-    if (dir) {
-      git(change.top, ['worktree', 'remove', '--force', dir]);
-      rmSync(dir, { recursive: true, force: true });
-    }
+    await cleanup();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  }
+}
+
+/** The plan's operations and scenario ids (inventory.yaml), or none: then every mutant runs the whole suite. */
+function readPlan(project: ProjectConfig, service: string): PlanOperation[] {
+  const file = join(project.servicesDir, service, 'inventory.yaml');
+  if (!existsSync(file)) return [];
+  try {
+    return planOperations(parse(readFileSync(file, 'utf8')));
+  } catch {
+    return [];
   }
 }
 
@@ -590,6 +944,7 @@ export function reasonsFor(
     counts.timeout > 0 ? `${counts.timeout} timed out` : '',
     counts.buildError > 0 ? `${counts.buildError} did not build` : '',
     counts.notRun > 0 ? `${counts.notRun} not run (time limit)` : '',
+    counts.flaky > 0 ? `${counts.flaky} flaky (a test failed for another reason; not counted)` : '',
   ].filter(Boolean);
   const more = extra.length > 0 ? `; ${extra.join(', ')}` : '';
   switch (report.verdict) {
@@ -631,8 +986,13 @@ function toResult(report: MutationReport, file: string): Result {
   const text = [
     ...report.mutants.map(
       (m) =>
-        `${m.status.padEnd(11)} ${m.file}:${m.line} ${m.operator.padEnd(13)} ${m.before}  ->  ${m.after}${m.killedBy ? `  [${m.killedBy.join(', ')}]` : ''}`,
+        `${m.status.padEnd(11)} ${m.file}:${m.line} ${m.operator.padEnd(13)} ${m.before}  ->  ${m.after}${m.killedBy ? `  [${m.killedBy.join(', ')}]` : ''}${m.flakyTests ? `  flaky: ${m.flakyTests.join(', ')}` : ''}`,
     ),
+    ...(report.selection && report.selection.scoped > 0
+      ? [
+          `${report.selection.scoped} mutant(s) first ran only the tests of the operations their line serves; those caught ${report.selection.caughtByScope}`,
+        ]
+      : []),
     ...survivors.map((m) => `HINT ${m.hint ?? ''}`),
     `Report: ${file}`,
   ];
