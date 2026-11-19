@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -18,6 +18,18 @@ after(() => {
   rmSync(work, { recursive: true, force: true });
 });
 
+// A server that keeps its port for 2s after SIGTERM, as an app draining connections does.
+writeFileSync(
+  join(work, 'slow.js'),
+  "const s = require('node:http').createServer((q, r) => r.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n" +
+    "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 2000));\n",
+);
+// A server that ignores SIGTERM.
+writeFileSync(
+  join(work, 'stubborn.js'),
+  "require('node:http').createServer((q, r) => r.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n" +
+    "process.on('SIGTERM', () => {});\n",
+);
 writeFileSync(
   join(work, 'server.js'),
   "require('node:http').createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n",
@@ -52,13 +64,84 @@ async function waitFor(url: string): Promise<void> {
   throw new Error(`nothing answered at ${url}`);
 }
 
-function appUp(port: number) {
-  const script = `source "${LIB}"; stack_init t; PORT=${port} app_up "http://127.0.0.1:${port}/health" ${port} 10 "${work}" node "${work}/server.js"`;
-  return spawnSync('bash', ['-c', script], {
-    env: { ...env(), PORT: String(port) },
-    encoding: 'utf8',
-    timeout: 30_000,
-  });
+async function waitGone(url: string): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    if (
+      !(await fetch(url).then(
+        (r) => r.ok,
+        () => false,
+      ))
+    )
+      return;
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  throw new Error(`still answering at ${url}`);
+}
+
+// A PATH with the tools the library uses but no lsof, as on a machine without it.
+const noLsof = (() => {
+  const dir = join(work, 'bin-no-lsof');
+  mkdirSync(dir);
+  const tools = 'bash sh curl git ps pgrep cat head tr seq sleep mkdir rm node nohup env dirname tail';
+  for (const tool of tools.split(' ')) {
+    const found = spawnSync('bash', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).stdout.trim();
+    if (found.startsWith('/')) symlinkSync(found, join(dir, tool));
+  }
+  return dir;
+})();
+
+interface Opts {
+  repo?: string; // the checkout the app is built from (BUILD_REPO), as a service's stack.sh sets it
+  cmd?: string; // the command that starts the app
+  path?: string; // PATH override
+}
+
+function run(script: string, port: number, o: Opts, extra: NodeJS.ProcessEnv = {}) {
+  const e = { ...env(), PORT: String(port), ...(o.path ? { PATH: o.path } : {}), ...extra };
+  const lib = `source "${LIB}"; stack_init t; BUILD_REPO="${o.repo ?? ''}"; `;
+  return spawnSync('bash', ['-c', lib + script], { env: e, encoding: 'utf8', timeout: 60_000 });
+}
+
+function status(port: number, o: Opts = {}) {
+  return run(`app_status "http://127.0.0.1:${port}/health" "${o.repo ?? ''}" ${port}`, port, o);
+}
+
+function appUp(port: number, o: Opts = {}) {
+  const cmd = o.cmd ?? `node "${work}/server.js"`;
+  return run(`app_up "http://127.0.0.1:${port}/health" ${port} 10 "${work}" ${cmd}`, port, o);
+}
+
+function appStop() {
+  return spawnSync('bash', ['-c', `source "${LIB}"; stack_init t; app_stop`], { env: env(), encoding: 'utf8' });
+}
+
+// A git checkout with one commit; returns a function that runs git in it.
+function checkout(name: string) {
+  const repo = join(work, name);
+  const git = (...args: string[]) => {
+    const r = spawnSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  mkdirSync(repo);
+  git('init', '-q');
+  writeFileSync(join(repo, 'f'), 'a\n');
+  git('add', 'f');
+  git('commit', '-qm', 'a');
+  const commit = () => {
+    writeFileSync(join(repo, 'f'), `${Date.now()}\n`);
+    git('commit', '-qam', 'next');
+    return git('rev-parse', '--short', 'HEAD');
+  };
+  return { repo, head: () => git('rev-parse', '--short', 'HEAD'), commit };
+}
+
+function stray(port: number) {
+  const child = spawn('node', [join(work, 'server.js')], { env: { ...process.env, PORT: String(port) } });
+  children.push(child);
+  return child;
 }
 
 describe('app_up (framework/stack/lib.sh)', () => {
@@ -67,13 +150,12 @@ describe('app_up (framework/stack/lib.sh)', () => {
     { skip: !hasLsof },
     async () => {
       const port = await freePort();
-      const stray = spawn('node', [join(work, 'server.js')], { env: { ...process.env, PORT: String(port) } });
-      children.push(stray);
+      const other = stray(port);
       await waitFor(`http://127.0.0.1:${port}/health`);
-      const run = appUp(port);
-      assert.equal(run.status, 3, run.stdout + run.stderr);
-      assert.match(run.stderr, new RegExp(`held by node \\(pid ${stray.pid}\\)`));
-      stray.kill('SIGKILL');
+      const up = appUp(port);
+      assert.equal(up.status, 3, up.stdout + up.stderr);
+      assert.match(up.stderr, new RegExp(`held by node \\(pid ${other.pid}\\)`));
+      other.kill('SIGKILL');
     },
   );
 
@@ -85,5 +167,161 @@ describe('app_up (framework/stack/lib.sh)', () => {
     const second = appUp(port);
     assert.equal(second.status, 0, second.stdout + second.stderr);
     assert.match(second.stdout, /already UP/);
+  });
+
+  it('status does not vouch for the build of an app it did not start', { skip: !hasLsof }, async () => {
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}/health`;
+    const own = appUp(port);
+    assert.equal(own.status, 0, own.stdout + own.stderr);
+    assert.doesNotMatch(status(port).stdout, /not this project's/);
+    // The recorded app is gone, and something else now answers on the same port with a stale build file left behind.
+    appStop();
+    await waitGone(url);
+    const other = stray(port);
+    await waitFor(url);
+    writeFileSync(join(work, 'reports', 'stack', 't.build'), 'abc1234\n');
+    const theirs = status(port);
+    assert.match(
+      theirs.stdout,
+      new RegExp(`build     not this project's: port ${port} is held by node \\(pid ${other.pid}\\)`),
+    );
+    assert.ok(!theirs.stdout.includes('abc1234'), theirs.stdout);
+    other.kill('SIGKILL');
+  });
+
+  it('status does not vouch for a build when its app died and another took the port', { skip: !hasLsof }, async () => {
+    // The pid and build files survive a crash: the recorded pid is dead, and another checkout's app holds the port.
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}/health`;
+    const own = appUp(port);
+    assert.equal(own.status, 0, own.stdout + own.stderr);
+    process.kill(Number(readFileSync(join(work, 'reports', 'stack', 't.pid'), 'utf8')), 'SIGKILL');
+    await waitGone(url);
+    const other = stray(port);
+    await waitFor(url);
+    const theirs = status(port);
+    assert.match(
+      theirs.stdout,
+      new RegExp(`build     not this project's: port ${port} is held by node \\(pid ${other.pid}\\)`),
+    );
+    const up = appUp(port);
+    assert.equal(up.status, 3, up.stdout + up.stderr);
+    other.kill('SIGKILL');
+  });
+
+  it(
+    'status flags its own app from an older checkout as stale, and up then replaces it',
+    { skip: !hasLsof },
+    async () => {
+      // The server is a grandchild of the recorded pid (npm run -> sh -> node) and holds its port 2s after SIGTERM.
+      const { repo, head, commit } = checkout('repo');
+      const cmd = `bash -c "bash -c 'node ${work}/slow.js; true'; true"`;
+      const port = await freePort();
+      const started = head();
+      const up = appUp(port, { repo, cmd });
+      assert.equal(up.status, 0, up.stdout + up.stderr);
+      assert.match(status(port, { repo }).stdout, new RegExp(`^build     ${started}$`, 'm'));
+      const now = commit();
+      const stale = status(port, { repo });
+      assert.doesNotMatch(stale.stdout, /not this project's/, stale.stdout);
+      assert.match(
+        stale.stdout,
+        new RegExp(`^build     ${started} \\(stale: the checkout is ${now} now; vgate up restarts it\\)$`, 'm'),
+      );
+      // And up does what status promised: it replaces the stale app instead of refusing the port.
+      const again = appUp(port, { repo, cmd });
+      assert.equal(again.status, 0, again.stdout + again.stderr);
+      assert.match(again.stdout, /Starting t/);
+      assert.match(status(port, { repo }).stdout, new RegExp(`^build     ${now}$`, 'm'));
+      appStop();
+      await waitGone(`http://127.0.0.1:${port}/health`);
+    },
+  );
+
+  it(
+    'without lsof, status does not vouch for the build and up restarts rather than reuses',
+    { skip: !hasLsof },
+    async () => {
+      const { repo, head } = checkout('repo-no-lsof');
+      const port = await freePort();
+      const up = appUp(port, { repo });
+      assert.equal(up.status, 0, up.stdout + up.stderr);
+      const blind = status(port, { repo, path: noLsof });
+      assert.match(
+        blind.stdout,
+        new RegExp(`^build     ${head()}\\? unverified: vgate cannot see who listens on port ${port}`, 'm'),
+        blind.stdout + blind.stderr,
+      );
+      const again = appUp(port, { repo, path: noLsof });
+      assert.equal(again.status, 0, again.stdout + again.stderr);
+      assert.match(again.stdout, /Starting t/);
+      assert.doesNotMatch(again.stdout, /already UP/);
+    },
+  );
+
+  it('down never kills a process that merely reuses the recorded pid', () => {
+    // A pid file left from before a reboot: the pid now belongs to an unrelated process with children of its own.
+    const unrelated = spawn('bash', ['-c', 'sleep 30 & wait'], { stdio: 'ignore' });
+    children.push(unrelated);
+    const dir = join(work, 'reports', 'stack');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 't.pid'), `${unrelated.pid}\n`);
+    writeFileSync(join(dir, 't.started'), 'Thu Jan  1 00:00:00 1970\n');
+    const down = appStop();
+    assert.match(down.stdout, /that pid now belongs to a process started later; not killed/, down.stdout);
+    assert.doesNotThrow(() => process.kill(unrelated.pid!, 0), 'the unrelated process was killed');
+    unrelated.kill('SIGKILL');
+  });
+
+  it('up names its own previous app when it will not let go of the port', { skip: !hasLsof }, async () => {
+    const port = await freePort();
+    const cmd = `node "${work}/stubborn.js"`;
+    const up = appUp(port, { cmd });
+    assert.equal(up.status, 0, up.stdout + up.stderr);
+    // Unhealthy now: up must replace it, and the old one ignores SIGTERM.
+    writeFileSync(join(work, 'reports', 'stack', 't.build'), 'not-this-build\n');
+    const again = run(
+      `app_up "http://127.0.0.1:${port}/health" ${port} 10 "${work}" ${cmd}`,
+      port,
+      {},
+      { STACK_RELEASE_SECONDS: '2' },
+    );
+    assert.equal(again.status, 3, again.stdout + again.stderr);
+    assert.match(again.stderr, /its previous app \(pid \d+\) still runs 2s after it was told to stop/);
+    assert.doesNotMatch(again.stderr, /did not start/);
+    const pid = Number(/pid (\d+)/.exec(again.stderr)![1]);
+    process.kill(pid, 'SIGKILL');
+  });
+});
+
+describe('url_port (framework/stack/lib.sh)', () => {
+  const cases: [string, string][] = [
+    ['http://localhost:8080/health', '8080'],
+    ['https://x.io/a', '443'],
+    ['HTTPS://x.io/a', '443'],
+    ['http://h', '80'],
+    ['http://u:p@h:9/x', '9'],
+    ['http://[::1]:7/x', '7'],
+    ['http://[::1]/x', '80'],
+    ['http://h:8080?a=1', '8080'],
+    ['http://h:8080#f', '8080'],
+  ];
+  for (const [url, port] of cases) {
+    it(`${url} -> ${port}`, () => {
+      const r = spawnSync('bash', ['-c', `source "${LIB}"; url_port "$1"`, '_', url], { encoding: 'utf8' });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.stdout.trim(), port);
+    });
+  }
+  it('fails, rather than guessing, on a port that is empty or not a number', () => {
+    for (const url of ['http://h:/health', 'http://h:abc/']) {
+      const r = spawnSync('bash', ['-c', `set -e; source "${LIB}"; p=$(url_port "$1"); echo "reached $p"`, '_', url], {
+        encoding: 'utf8',
+      });
+      assert.notEqual(r.status, 0, url);
+      assert.doesNotMatch(r.stdout, /reached/);
+      assert.match(r.stderr, /no port number/);
+    }
   });
 });
