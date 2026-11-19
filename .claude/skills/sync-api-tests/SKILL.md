@@ -14,6 +14,9 @@ intended.
 `<svc-dir>`, the commands, the JSON envelope and the vgate docs are as in `../generate-api-tests/SKILL.md` ("Where
 things are").
 
+A sync for a bug that escaped to production (an incident, a hotfix) starts with the learn-from-incident skill: the bug
+becomes a recorded incident whose regression test goes red on the buggy commit, then this sync carries the rest.
+
 ## The rule
 
 `../generate-api-tests/SKILL.md` ("The rule that makes or breaks this") applies unchanged. For a sync it sharpens into
@@ -95,6 +98,9 @@ continue straight away.
    provider's documentation) says so.
 3. Update tests and support code following `../generate-api-tests/references/test-conventions.md`. New scenarios get
    new tests; changed rules change the assertions that encode them; removed operations lose their tests.
+4. A web UI (`ui:`): a screen whose look a source says should change gets its new baselines from one run with
+   `VGATE_UPDATE_SNAPSHOTS=1` (vgate docs `frontend.md`); every other baseline stays. The guard sends each changed
+   baseline to a human, so name its source in the report.
 
 ### Phase 4 - Run and classify
 
@@ -108,6 +114,8 @@ Update `FINDINGS.md`: a finding the change resolved is closed, not deleted, and 
 re-verified at the target (format in `../generate-api-tests/SKILL.md`, "FINDINGS.md"). A registered known failure
 that now passes fails the gate with "expected to fail ... but passed": the fix landed, and the report proposes
 removing its registry entry for a human to make.
+
+When `vgate.yaml` sets `policy.mutationScore`, finish the run with `vgate mutate` as generate-api-tests Phase 4 does.
 
 Update `backend.syncedCommit` in `service.yaml` to the target only after the suite has run against a backend built
 from that target (the `build` line of `vgate status --service <svc>`, Phase 0 step 5). The commit records what the

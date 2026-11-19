@@ -17,7 +17,17 @@ export default defineConfig({
   forbidOnly: true,
   workers: Number(process.env.WORKERS ?? 4),
   timeout: 60_000,
-  expect: { timeout: 10_000 },
+  expect: {
+    timeout: 10_000,
+    // Visual baselines (UI services, docs/frontend.md): pixel-exact on one platform (no pixel may differ, by any shade),
+    // no animation or caret.
+    toHaveScreenshot: { animations: 'disabled', caret: 'hide', scale: 'css', maxDiffPixels: 0, threshold: 0 },
+  },
+  // Baselines live next to the tests, one set per platform: fonts render differently on macOS and Linux.
+  snapshotPathTemplate: '{testDir}/__screenshots__/{platform}/{testFilePath}/{arg}{ext}',
+  // A missing or different baseline fails; only an explicit `VGATE_UPDATE_SNAPSHOTS=1` run writes new ones, and the
+  // guard sends a changed baseline to a human.
+  updateSnapshots: process.env.VGATE_UPDATE_SNAPSHOTS === '1' ? 'all' : 'none',
   reporter: [
     ['list'],
     ['html', { outputFolder: join(reportsDir, 'html', suite), open: 'never' }],

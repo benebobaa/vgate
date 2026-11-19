@@ -50,8 +50,10 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.dirname,
     Object.entries(stubs).map(([name, dep]) => [name, OpenApiContract.load(dep.contract)]),
   );
   const observed = resolve(reportsDir, 'observed');
-  if (!existsSync(observed)) fail('No observed calls in reports/observed: run the tests first.');
-  const records = readdirSync(observed)
+  // No stubbed provider: nothing to cover, whatever the tests observed (a UI service observes no API calls at all).
+  if (!existsSync(observed) && Object.keys(stubs).length > 0)
+    fail('No observed calls in reports/observed: run the tests first.');
+  const records = (existsSync(observed) ? readdirSync(observed) : [])
     .filter((file) => file.endsWith('.stubs.ndjson'))
     .flatMap((file) =>
       readFileSync(join(observed, file), 'utf8')

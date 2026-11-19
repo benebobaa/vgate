@@ -1,0 +1,66 @@
+# Test plan of example-web: the framework's reference for a web frontend (README.md).
+service: example-web
+kind: ui
+
+sources:
+  - README.md
+
+personas:
+  writer: { kind: seeded, role: writer, state: API key writer-key }
+  reader: { kind: seeded, role: reader, state: API key reader-key }
+
+pages:
+  - id: signin
+    path: /
+    scenarios:
+      - id: UI-SIGNIN-200
+        title: a writer signs in and sees the notes
+        as: writer
+        expect: { visible: [Your notes, Add note] }
+        sources: [README.md rule 1]
+      - id: UI-SIGNIN-401
+        title: a key the API refuses keeps the sign-in form, with a message
+        as: an unknown key
+        expect: { visible: [That key was not accepted.], request: GET /api/notes -> 401 }
+        sources: [README.md rule 2]
+      - id: UI-VISUAL-SIGNIN
+        title: the sign-in page matches its committed screenshots on desktop and mobile
+        expect: { screenshots: [signin-desktop.png, signin-mobile.png] }
+        sources: [README.md rule 6]
+
+  - id: notes
+    path: / (signed in)
+    scenarios:
+      - id: UI-LIST-200
+        title: the list shows the most recent notes first
+        as: writer
+        given: two notes added in order
+        expect: { order: [second, first] }
+        sources: [README.md rule 3]
+      - id: UI-CREATE-201
+        title: adding a note with a title shows it in the list
+        as: writer
+        expect: { visible: [the new title and body] }
+        sources: [README.md rule 4]
+      - id: UI-CREATE-REQUIRED
+        title: an empty title shows "Title is required." and sends nothing
+        as: writer
+        expect: { visible: [Title is required.], requests: none }
+        sources: [README.md rule 4]
+      - id: UI-READER-403
+        title: a reader adding a note is told the key may only read, and nothing is created
+        as: reader
+        expect: { visible: [Your key may only read notes.], request: POST /api/notes -> 403 }
+        sources: [README.md rule 5]
+
+conventions:
+  scenarios:
+    - id: UI-A11Y
+      title: both pages pass the accessibility check (serious and above)
+      expect: { axe: no violations at impact serious or critical }
+      sources: [README.md rule 7]
+    - id: UI-BUDGET
+      title: the notes page stays within its web-vitals budget
+      expect: { lcpMs: under 2500, cls: under 0.1 }
+      sources: [README.md rule 9]
+# Rule 8 (the sealed browser) holds in every test: the fixtures block and fail any request outside the app's origin.

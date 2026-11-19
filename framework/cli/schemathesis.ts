@@ -10,7 +10,7 @@
  * operation, which writes random data: it refuses environments that are not disposable.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse } from 'yaml';
 import { Auth } from '../auth/auth.ts';
@@ -25,6 +25,11 @@ const ALLURE_COMMONS = 'allure-python-commons==2.16.2';
 
 const args = parseArgs(process.argv.slice(2));
 const svc = loadService(str(args.service));
+// A UI service without a contract of its own has nothing to fuzz: it is verified through the browser (docs/frontend.md).
+if (svc.ui && !existsSync(svc.specPath)) {
+  process.stdout.write(`${svc.name} is a UI service without a contract: Schemathesis does not apply.\n`);
+  process.exit(0);
+}
 const cfg = svc.schemathesis;
 const mode = str(args.mode, 'read-only');
 if (mode !== 'read-only' && mode !== 'full') fail(`--mode must be read-only or full, not ${mode}`);

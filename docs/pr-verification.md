@@ -201,3 +201,18 @@ evidence:
 - never blocked: it measures the tests, not the code.
 
 See [mutation.md](mutation.md).
+
+## Frontend pull requests
+
+A service with `ui:` in its service.yaml is a web frontend, verified in a real Chromium: its tests drive user flows,
+and every page is held to the browser rules automatically (no call outside `ui.allowedOrigins`, no console errors,
+no accessibility violation at `ui.a11y.minImpact` or above, the web-vitals budget, pixel-exact screenshots). The
+guard sends a changed or deleted screenshot baseline, and any loosening of those rules, to a human; a new baseline is
+additive. See [frontend.md](frontend.md).
+
+## Learning from escapes
+
+A bug that still reaches production is recorded with `vgate incident add`: it becomes a scenario of the plan, and the
+coverage step fails until a test titled `[INC-<n>]` guards it, so the same bug cannot escape twice. The guard asks a
+human before an incident is deleted or marked not testable. `vgate drift` checks, daily, that each provider's sandbox
+still answers as the vendored contract the stubs use says. See [learning-loop.md](learning-loop.md).

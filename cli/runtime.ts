@@ -315,6 +315,8 @@ export const CI_TARGETS: Record<string, Record<string, string>> = {
     'vgate.yml': '.github/workflows/vgate.yml',
     // After a deploy: smoke, canary and rollback against the deployed environment (docs/after-deploy.md).
     'deploy-verify.yml': '.github/workflows/vgate-after-deploy.yml',
+    // Daily: has a provider changed under its vendored contract? (docs/learning-loop.md)
+    'drift.yml': '.github/workflows/vgate-drift.yml',
     // An example to merge into .github/CODEOWNERS by hand: init never edits a repository's ownership rules.
     'CODEOWNERS.example': '.github/CODEOWNERS.vgate.example',
   },

@@ -136,7 +136,12 @@ tasks:
     cmds:
       - |
         status=0
-        "{{.BIN}}/tsx" framework/cli/coverage-report.ts --strict || status=1
+        # A UI service without a contract (framework/ui) is covered by its plan: every scenario has a collected test.
+        if [ "$("{{.BIN}}/tsx" framework/ui/kind.ts)" = ui ]; then
+          "{{.BIN}}/tsx" framework/ui/coverage.ts --strict || status=1
+        else
+          "{{.BIN}}/tsx" framework/cli/coverage-report.ts --strict || status=1
+        fi
         "{{.BIN}}/tsx" framework/deps/coverage.ts --strict || status=1
         exit $status
 

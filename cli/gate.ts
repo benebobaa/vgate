@@ -4,7 +4,16 @@
  * responses are still unreached, and where the evidence is. The same verdict is written to reports/verdict.json.
  */
 import { createHash } from 'node:crypto';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, relative } from 'node:path';
 import { loadService, type ServiceConfig } from '../framework/config.ts';
 import type { ProjectConfig } from '../framework/project.ts';
@@ -16,6 +25,7 @@ import { CLI, EXIT, UsageError, tail, type Result } from './output.ts';
 import { prepare, stepEnv, type Runtime } from './runtime.ts';
 import { runStreamed } from './stack.ts';
 import { envOutbound, type Outbound } from '../framework/env/lifecycle.ts';
+import type { UiFindings } from '../framework/ui/fixtures.ts';
 
 export const STEPS = ['selftest', 'typecheck', 'lint', 'test', 'contract', 'coverage'] as const;
 export type Step = (typeof STEPS)[number];
@@ -89,7 +99,45 @@ export interface Verdict {
    * environment one from the app fails the verdict.
    */
   sandbox: EnvironmentFacts;
+  /** A UI service's browser facts (framework/ui): what the tests' pages did. Each problem also failed its test. */
+  ui?: UiFacts;
   evidence: Record<string, string | string[]>;
+}
+
+export interface UiFacts {
+  tests: number;
+  pages: number;
+  outbound: string[];
+  consoleErrors: number;
+  a11y: string[];
+  budgetBreaches: string[];
+}
+
+/** Sums the browser findings this run's tests wrote (<reports>/ui/*.jsonl, framework/ui/fixtures.ts). */
+export function uiFacts(findings: UiFindings[]): UiFacts {
+  return {
+    tests: findings.length,
+    pages: new Set(findings.flatMap((f) => f.pages.map((url) => new URL(url).pathname))).size,
+    outbound: [...new Set(findings.flatMap((f) => f.outbound.map((o) => new URL(o.url).host)))],
+    consoleErrors: findings.reduce((sum, f) => sum + f.consoleErrors.length + f.pageErrors.length, 0),
+    a11y: [...new Set(findings.flatMap((f) => f.a11y.map((a) => `${a.id} (${a.impact})`)))],
+    budgetBreaches: [...new Set(findings.flatMap((f) => f.budgetBreaches))],
+  };
+}
+
+function readUi(reports: string, since: number): UiFacts | undefined {
+  const dir = join(reports, 'ui');
+  if (!existsSync(dir)) return undefined;
+  const findings = readdirSync(dir)
+    .map((name) => join(dir, name))
+    .filter((file) => file.endsWith('.jsonl') && fresh(file, since))
+    .flatMap((file) =>
+      readFileSync(file, 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as UiFindings),
+    );
+  return findings.length === 0 ? undefined : uiFacts(findings);
 }
 
 export interface EnvironmentFacts {
@@ -207,6 +255,20 @@ export function summarise(verdict: Verdict): string {
   else if (registry && registry.expired.length + registry.stale.length > 0)
     parts.push(`registry: ${registry.expired.length} expired, ${registry.stale.length} stale`);
   if (verdict.coverage) parts.push(`coverage ${verdict.coverage.covered}/${verdict.coverage.demanded}`);
+  if (verdict.ui) {
+    const ui = verdict.ui;
+    const problems = [
+      ...(ui.outbound.length > 0 ? [`the page tried to reach ${ui.outbound.join(', ')}`] : []),
+      ...(ui.a11y.length > 0 ? [`accessibility: ${ui.a11y.join(', ')}`] : []),
+      ...(ui.consoleErrors > 0 ? [`${ui.consoleErrors} console errors`] : []),
+      ...ui.budgetBreaches,
+    ];
+    parts.push(
+      problems.length > 0
+        ? `browser: ${problems.join(', ')}`
+        : `browser: ${ui.pages} page${ui.pages === 1 ? '' : 's'}, accessible, no outbound call`,
+    );
+  }
   if (!verdict.complete) parts.push('partial run');
   const env = verdict.sandbox;
   if (env?.kind === 'declared') {
@@ -366,6 +428,7 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
     registry,
     coverage,
     sandbox,
+    ui: svc.ui && steps.includes('test') ? readUi(reports, started) : undefined,
     evidence: {
       junit,
       traces: shown(join(reports, 'test-results')),
