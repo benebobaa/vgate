@@ -134,18 +134,19 @@ source "\${VGATE_STACK_LIB:?run through vgate: ${CLI} up --service ${service}}"
 stack_init ${service}
 
 HEALTH="\${${upper(service)}_URL:-http://localhost:8080}/health"
+PORT=$(url_port "$HEALTH") # the port up() starts the app on; status names whatever else holds it
 
 up() {
   # Start it with app_up, which reuses only the app this project started from this build and refuses (exit 3) when
   # something else answers on the port - another checkout's app must never be tested in this code's place:
-  #   app_up "$HEALTH" 8080 60 "$STACK_ROOT" <the command that starts the app>
+  #   app_up "$HEALTH" "$PORT" 60 "$STACK_ROOT" <the command that starts the app>
   echo "${service}: up() starts nothing yet; teach it in $HERE/stack.sh (see the comment above)" >&2
   return 1
 }
 
 down() { app_stop; }
 
-status() { app_status "$HEALTH" "$STACK_ROOT"; }
+status() { app_status "$HEALTH" "$STACK_ROOT" "$PORT"; }
 
 reset() {
   echo "reset: nothing wipes the local test data of ${service} yet; teach reset() in $HERE/stack.sh" >&2

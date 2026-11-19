@@ -19,7 +19,7 @@ up() {
 
 down() { app_stop; }
 
-status() { app_status "$HEALTH" "$STACK_ROOT"; }
+status() { app_status "$HEALTH" "$STACK_ROOT" "$PORT"; }
 
 # The data lives in memory: a restart is the reset.
 reset() {

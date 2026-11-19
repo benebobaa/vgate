@@ -35,9 +35,9 @@ down() {
 
 status() {
   api
-  app_status "http://localhost:$API_PORT/health" "$STACK_ROOT"
+  app_status "http://localhost:$API_PORT/health" "$STACK_ROOT" "$API_PORT"
   web
-  app_status "http://localhost:$WEB_PORT/health" "$STACK_ROOT"
+  app_status "http://localhost:$WEB_PORT/health" "$STACK_ROOT" "$WEB_PORT"
 }
 
 # The data lives in memory: a restart is the reset.
