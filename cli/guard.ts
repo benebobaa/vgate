@@ -640,6 +640,29 @@ function markers(source: string): Record<'fail' | 'fixme' | 'skip', number> {
 
 const SCENARIO_ID = /\[([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\]/g;
 
+/**
+ * Screenshot options that let a visual comparison accept more (`toHaveScreenshot(name, { ... })`, `expect.configure`):
+ * a tolerance, a mask, a clip, an injected style, a smaller page. Each `name: value` as written, spaces collapsed.
+ */
+const VISUAL_OPTION = /\b(maxDiffPixels|maxDiffPixelRatio|threshold|mask|stylePath|clip|fullPage)\s*:\s*([^,}\n]*)/g;
+
+function visualOptions(source: string): string[] {
+  return [...code(source).matchAll(VISUAL_OPTION)].map(
+    ([, name, value]) => `${name}: ${value.replace(/\s+/g, ' ').trim()}`,
+  );
+}
+
+/** What `after` has that `before` has not, counting repeats. */
+function added(before: string[], after: string[]): string[] {
+  const left = [...before];
+  return after.filter((item) => {
+    const at = left.indexOf(item);
+    if (at === -1) return true;
+    left.splice(at, 1);
+    return false;
+  });
+}
+
 function ids(sources: Map<string, string>): Map<string, string> {
   const out = new Map<string, string>();
   for (const [file, source] of sources)
@@ -649,7 +672,8 @@ function ids(sources: Map<string, string>): Map<string, string> {
 
 /**
  * Test sources (path -> text) of base and head: a file deleted, fewer assertions in a file, a scenario id no longer
- * in any source, or a new `.fail(`, `.fixme(` or `.skip(`.
+ * in any source, a new `.fail(`, `.fixme(` or `.skip(`, or a screenshot comparison that accepts more (a new or changed
+ * tolerance, mask, clip or style, or `fullPage: true` removed).
  */
 export function testsRule(base: Map<string, string>, head: Map<string, string>): RuleOutcome {
   const result = outcome();
@@ -664,17 +688,24 @@ export function testsRule(base: Map<string, string>, head: Map<string, string>):
     const now = countExpects(after);
     if (now < was) find(file, `assertions ${was} -> ${now}`);
   }
-  for (const [file, after] of head) {
+  for (const [file, source] of head) {
     const was = markers(base.get(file) ?? '');
-    const now = markers(after);
+    const now = markers(source);
     for (const kind of ['fail', 'fixme', 'skip'] as const) {
       if (now[kind] > was[kind]) find(file, `.${kind}( ${was[kind]} -> ${now[kind]}`);
     }
+    // A screenshot that tolerates a difference, masks or clips part of the page, or no longer covers the full page.
+    const optionsBefore = visualOptions(base.get(file) ?? '');
+    const optionsAfter = visualOptions(source);
+    for (const option of added(optionsBefore, optionsAfter).filter((o) => o !== 'fullPage: true'))
+      find(file, `a screenshot comparison now accepts more: ${option}`);
+    if (added(optionsAfter, optionsBefore).includes('fullPage: true'))
+      find(file, 'a screenshot comparison no longer covers the full page (fullPage: true removed)');
     if (!base.has(file))
       result.info.push({
         rule: 'tests-weakened',
         file,
-        detail: `test source added (${countExpects(after)} assertions)`,
+        detail: `test source added (${countExpects(source)} assertions)`,
       });
   }
   const after = ids(head);

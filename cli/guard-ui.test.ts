@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { isBaseline, uiConfigRule, visualRule } from './guard.ts';
+import { isBaseline, testsRule, uiConfigRule, visualRule } from './guard.ts';
 import { baselineHashes, baselinesChanged, summarise, uiFacts, type Verdict } from './gate.ts';
 
 const shot = 'regression/web/tests/__screenshots__/linux/visual.spec.ts/signin-desktop.png';
@@ -163,5 +163,39 @@ describe('gate: a run that writes visual baselines', () => {
       ui: { ...uiFacts([]), baselinesWritten: ['regression/web/tests/__screenshots__/linux/a.png'] },
     } as unknown as Verdict;
     assert.match(summarise(verdict), /the run wrote 1 visual baseline instead of comparing them/);
+  });
+});
+
+describe('testsRule: a screenshot comparison that accepts more', () => {
+  const spec = 'regression/web/tests/visual.spec.ts';
+  const base = `await expect(page).toHaveScreenshot('signin.png', { fullPage: true });\n`;
+  const details = (head: string) =>
+    testsRule(new Map([[spec, base]]), new Map([[spec, head]])).findings.map((f) => f.detail);
+
+  it('sends a new tolerance, mask, clip or style to a human, with the same number of assertions', () => {
+    assert.deepEqual(
+      details(`await expect(page).toHaveScreenshot('signin.png', { fullPage: true, maxDiffPixelRatio: 1 });\n`),
+      ['a screenshot comparison now accepts more: maxDiffPixelRatio: 1'],
+    );
+    assert.deepEqual(
+      details(
+        `await expect(page).toHaveScreenshot('signin.png', {\n  fullPage: true,\n  mask: [page.locator('main')],\n});\n`,
+      ),
+      ["a screenshot comparison now accepts more: mask: [page.locator('main')]"],
+    );
+    assert.deepEqual(details(`await expect(page).toHaveScreenshot('signin.png');\n`), [
+      'a screenshot comparison no longer covers the full page (fullPage: true removed)',
+    ]);
+  });
+
+  it('notices a loosened value, and ignores options in comments or unchanged ones', () => {
+    const tolerant = `await expect(page).toHaveScreenshot('a.png', { fullPage: true, maxDiffPixels: 10 });\n`;
+    const looser = tolerant.replace('maxDiffPixels: 10', 'maxDiffPixels: 5000');
+    assert.deepEqual(
+      testsRule(new Map([[spec, tolerant]]), new Map([[spec, looser]])).findings.map((f) => f.detail),
+      ['a screenshot comparison now accepts more: maxDiffPixels: 5000'],
+    );
+    assert.deepEqual(details(`${base}// mask: [page.locator('main')]\n`), []);
+    assert.deepEqual(details(base), []);
   });
 });
