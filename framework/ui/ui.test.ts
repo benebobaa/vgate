@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
+import { committedBaselines, comparedBaselines, uncomparedBaselines } from './baselines.ts';
 import { impactFails, impactLoosening, originAllowed, parseUi } from './config.ts';
 import type { Incident } from '../incidents.ts';
 import { scenarioIds, uiCoverage, untestedScenarios } from './plan.ts';
@@ -145,5 +149,42 @@ describe('UI coverage: incidents are guarded as for an API service', () => {
 
   it('has nothing to guard without incidents', () => {
     assert.deepEqual(uiCoverage(['UI-A'], ['[UI-A] x'], []).unguarded, []);
+  });
+});
+
+describe('visual baselines no test compares', () => {
+  it('names a committed baseline of this platform that the last run did not compare (a dropped viewport)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vgate-baselines-'));
+    try {
+      const shots = join(dir, 'web', 'tests', '__screenshots__');
+      for (const platform of ['linux', 'darwin']) {
+        mkdirSync(join(shots, platform, 'visual.spec.ts'), { recursive: true });
+        for (const name of ['signin-desktop.png', 'signin-mobile.png'])
+          writeFileSync(join(shots, platform, 'visual.spec.ts', name), '');
+      }
+      const reports = join(dir, 'reports');
+      mkdirSync(join(reports, 'ui'), { recursive: true });
+      // The test now takes the desktop screenshot only; another test took none.
+      writeFileSync(
+        join(reports, 'ui', 'r1-w0.jsonl'),
+        [
+          JSON.stringify({
+            test: 'visual',
+            screenshots: [join(shots, 'linux', 'visual.spec.ts', 'signin-desktop.png')],
+          }),
+          JSON.stringify({ test: 'notes' }),
+          '',
+        ].join('\n'),
+      );
+      const committed = committedBaselines(join(dir, 'web'), 'linux');
+      assert.equal(committed.length, 2, 'only the platform of the run');
+      assert.deepEqual(uncomparedBaselines(committed, comparedBaselines(reports)), [
+        join(shots, 'linux', 'visual.spec.ts', 'signin-mobile.png'),
+      ]);
+      // No findings at all (no UI test ran): every baseline is unaccounted for.
+      assert.equal(uncomparedBaselines(committed, comparedBaselines(join(dir, 'none'))).length, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

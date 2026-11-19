@@ -2,10 +2,15 @@
  * Browser fixtures for a UI service (`ui:` in service.yaml): every test drives a real page, and the page is held to
  * the same rules a backend is, automatically, with no line in the test:
  *
- *   - sealed browser: a request (or websocket) to an origin outside `ui.allowedOrigins` is blocked and recorded;
- *   - console and page errors, and failed requests to the app's own origin, fail the test unless it expects them;
+ *   - sealed browser: a request (or websocket) to an origin outside `ui.allowedOrigins` is blocked and recorded; a
+ *     redirect to such an origin, which Playwright cannot route, is recorded;
+ *   - console errors (and failed `console.assert`s) and page errors, and failed requests to the app's own origin, in
+ *     the page and in every popup it opens, fail the test unless it expects them;
  *   - accessibility: axe-core runs after every `page.goto` and at the end of the test; findings at or above
- *     `ui.a11y.minImpact` fail it;
+ *     `ui.a11y.minImpact` fail it, and so does a page of the app reached otherwise (a click, a form, client-side
+ *     routing) that the test never checked with `ui.checkA11y()`;
+ *   - visual baselines: the screenshots each test compares are recorded, so the coverage step can tell a committed
+ *     baseline no test compares any more;
  *   - web vitals: LCP and CLS against `ui.budgets`, when set;
  *   - determinism for screenshots: fixed clock, locale, time zone, colour scheme, reduced motion, scale 1.
  *
@@ -31,13 +36,18 @@ export interface A11yFinding {
 export interface UiFindings {
   test: string;
   pages: string[];
-  outbound: Array<{ method: string; url: string }>;
+  /** `via`: the URL that redirected there (a redirect cannot be blocked, only recorded). */
+  outbound: Array<{ method: string; url: string; via?: string }>;
   consoleErrors: string[];
   pageErrors: string[];
   failedRequests: Array<{ method: string; url: string; status: number }>;
   a11y: A11yFinding[];
   vitals?: { lcpMs?: number; cls?: number };
   budgetBreaches: string[];
+  /** The visual baselines (absolute paths) the test's `toHaveScreenshot` calls compared against. */
+  screenshots?: string[];
+  /** Pages of the app (origin + path) reached without `page.goto` and never checked for accessibility. */
+  uncheckedPages?: string[];
 }
 
 interface ExpectedRequest {
@@ -50,6 +60,9 @@ interface ExpectedRequest {
 export class Ui {
   private readonly expectedConsole: RegExp[] = [];
   private readonly expectedRequests: ExpectedRequest[] = [];
+  /** Pages of the app the main frame showed, and those axe checked: origin + path. */
+  private readonly visited = new Set<string>();
+  private readonly checked = new Set<string>();
 
   constructor(
     private readonly page: Page,
@@ -81,11 +94,32 @@ export class Ui {
     this.expectedRequests.push(expected);
   }
 
-  /** Runs axe on the page as it is now (it also runs after every goto and at the end of the test). */
+  /** A page of the app, as accessibility is tracked: origin + path (a query or a fragment is the same page). */
+  private pageOf(url: string): string | undefined {
+    try {
+      const target = new URL(url);
+      return target.origin === this.appOrigin ? `${target.origin}${target.pathname}` : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** @internal The main frame now shows `url`. */
+  navigated(url: string): void {
+    const page = this.pageOf(url);
+    if (page) this.visited.add(page);
+  }
+
+  /**
+   * Runs axe on the page as it is now. It runs by itself after every goto and at the end of the test; a page reached
+   * any other way (a click, a form, client-side routing) must be checked by the test once it has rendered.
+   */
   async checkA11y(): Promise<void> {
     const url = this.page.url();
     if (!url.startsWith('http')) return;
     const results = await new AxeBuilder({ page: this.page }).disableRules(this.config.a11y.disable).analyze();
+    const page = this.pageOf(url);
+    if (page) this.checked.add(page);
     for (const violation of results.violations) {
       if (!impactFails(violation.impact, this.config.a11y.minImpact)) continue;
       const targets = violation.nodes.map((node) => node.target.join(' '));
@@ -102,6 +136,11 @@ export class Ui {
     }
   }
 
+  /** @internal Pages of the app the test reached and never checked for accessibility. */
+  uncheckedPages(): string[] {
+    return [...this.visited].filter((page) => !this.checked.has(page));
+  }
+
   /** @internal Problems the test did not declare, as lines; empty when the page behaved. */
   problems(): string[] {
     const f = this.findings;
@@ -116,12 +155,20 @@ export class Ui {
         ),
     );
     return [
-      ...f.outbound.map((o) => `the page tried to reach ${o.method} ${o.url}, outside ui.allowedOrigins (blocked)`),
+      ...f.outbound.map((o) =>
+        o.via
+          ? `the page was redirected from ${o.via} to ${o.method} ${o.url}, outside ui.allowedOrigins (a redirect cannot be blocked)`
+          : `the page tried to reach ${o.method} ${o.url}, outside ui.allowedOrigins (blocked)`,
+      ),
       ...f.pageErrors.map((e) => `uncaught error in the page: ${e}`),
       ...unexpectedConsole.map((e) => `console error: ${e}`),
       ...unexpectedRequests.map((r) => `request failed: ${r.method} ${r.url} -> ${r.status}`),
       ...f.a11y.map(
         (a) => `accessibility (${a.impact}) ${a.id}: ${a.help} at ${a.targets.slice(0, 3).join(', ')} [${a.url}]`,
+      ),
+      ...(f.uncheckedPages ?? []).map(
+        (p) =>
+          `accessibility not checked on ${p}: the test reached it without page.goto; call await ui.checkA11y() once it has rendered`,
       ),
       ...f.budgetBreaches,
     ];
@@ -188,12 +235,38 @@ export function createUiTest<P = unknown>() {
         const ui = new Ui(page, config, appOrigin, findings);
         const context = page.context();
 
+        // The baselines this test compares (the coverage step names a committed one no test compares any more).
+        // Playwright resolves every snapshot path through this method of the test's info; it is internal, so a
+        // Playwright without it stops the run rather than leaving the baselines unaccounted for.
+        const info = testInfo as unknown as {
+          _resolveSnapshotPaths?: (kind: string, ...rest: unknown[]) => { absoluteSnapshotPath: string };
+        };
+        const resolveSnapshot = info._resolveSnapshotPaths;
+        if (typeof resolveSnapshot !== 'function')
+          throw new Error(
+            'This Playwright has no testInfo._resolveSnapshotPaths: vgate cannot record the visual baselines a test compares (framework/ui/fixtures.ts)',
+          );
+        findings.screenshots = [];
+        info._resolveSnapshotPaths = function (this: unknown, kind: string, ...rest: unknown[]) {
+          const paths = resolveSnapshot.call(this, kind, ...rest);
+          if (kind === 'screenshot') findings.screenshots?.push(paths.absoluteSnapshotPath);
+          return paths;
+        };
+
         // Sealed browser: nothing leaves for an origin the service did not declare.
         await context.route('**/*', async (route) => {
           const request = route.request();
           if (originAllowed(request.url(), appOrigin, config.allowedOrigins)) return route.fallback();
           findings.outbound.push({ method: request.method(), url: request.url() });
           return route.abort('blockedbyclient');
+        });
+        // Playwright routes only the first request of a redirect chain: an allowed URL that redirects elsewhere
+        // reaches the other origin unrouted. It cannot be blocked here, but it is recorded, and fails the test.
+        context.on('request', (request) => {
+          const from = request.redirectedFrom();
+          if (!from || originAllowed(request.url(), appOrigin, config.allowedOrigins)) return;
+          if (findings.outbound.some((o) => o.url === request.url() && o.method === request.method())) return;
+          findings.outbound.push({ method: request.method(), url: request.url(), via: from.url() });
         });
         await context.routeWebSocket(/.*/, (ws) => {
           if (originAllowed(ws.url(), appOrigin, config.allowedOrigins)) ws.connectToServer();
@@ -203,13 +276,14 @@ export function createUiTest<P = unknown>() {
           }
         });
 
-        page.on('console', (message) => {
-          if (message.type() !== 'error') return;
+        // The whole context, so a popup the page opens is held to the same rules as the page.
+        context.on('console', (message) => {
+          if (message.type() !== 'error' && message.type() !== 'assert') return;
           // Failed responses are judged once, by their request (method, path, status), not again as console text.
           if (RESOURCE_ERROR.test(message.text())) return;
           findings.consoleErrors.push(message.text());
         });
-        page.on('pageerror', (error) => findings.pageErrors.push(error.message));
+        context.on('weberror', (error) => findings.pageErrors.push(error.error().message));
         const own = (request: Request) => {
           try {
             return new URL(request.url()).origin === appOrigin;
@@ -217,18 +291,20 @@ export function createUiTest<P = unknown>() {
             return false;
           }
         };
-        page.on('response', (response: Response) => {
+        context.on('response', (response: Response) => {
           const request = response.request();
           if (response.status() >= 400 && own(request))
             findings.failedRequests.push({ method: request.method(), url: request.url(), status: response.status() });
         });
-        page.on('requestfailed', (request) => {
+        context.on('requestfailed', (request) => {
           // A blocked outbound request is already recorded as such.
           if (own(request) && request.failure()?.errorText !== 'net::ERR_BLOCKED_BY_CLIENT')
             findings.failedRequests.push({ method: request.method(), url: request.url(), status: 0 });
         });
         page.on('framenavigated', (frame) => {
-          if (frame === page.mainFrame() && frame.url().startsWith('http')) findings.pages.push(frame.url());
+          if (frame !== page.mainFrame() || !frame.url().startsWith('http')) return;
+          findings.pages.push(frame.url());
+          ui.navigated(frame.url());
         });
 
         await page.clock.setFixedTime(new Date(config.clock));
@@ -262,6 +338,7 @@ export function createUiTest<P = unknown>() {
           }
         }
 
+        findings.uncheckedPages = ui.uncheckedPages();
         const file = resolve(reportsDir, 'ui', `${process.env.RUN_ID ?? 'run'}-w${testInfo.workerIndex}.jsonl`);
         mkdirSync(dirname(file), { recursive: true });
         appendFileSync(file, `${JSON.stringify(findings)}\n`);

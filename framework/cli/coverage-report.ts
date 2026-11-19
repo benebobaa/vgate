@@ -15,6 +15,7 @@ import { testcaseNames } from '../../cli/junit.ts';
 import { loadService, reportsDir, type CoverageExclusion } from '../config.ts';
 import { loadContract, type DocumentedPair } from '../http/openapi.ts';
 import { incidentCoverage, readIncidents } from '../incidents.ts';
+import { committedBaselines, comparedBaselines, uncomparedBaselines } from '../ui/baselines.ts';
 import { fail, parseArgs, str } from './args.ts';
 
 interface Observed {
@@ -125,6 +126,13 @@ const untested = scenarioIds.filter(
 const incidents = incidentCoverage(readIncidents(svc.dir), new Set(scenarioIds), testTitles);
 const unguarded = incidents.filter((i) => i.state === 'no-scenario' || i.state === 'no-test');
 
+// A UI service with a contract: its committed visual baselines must each be compared by a test (framework/ui).
+const uncompared = svc.ui
+  ? uncomparedBaselines(committedBaselines(svc.dir), comparedBaselines(reportsDir)).map((path) =>
+      relative(svc.dir, path),
+    )
+  : [];
+
 const count = (state: State) => rows.filter((r) => r.state === state).length;
 const covered = count('covered');
 const excluded = count('excluded');
@@ -157,6 +165,9 @@ if (undocumented.length > 0) {
 }
 if (untested.length > 0) {
   md.push('## Inventory scenarios without a test', '', ...untested.map((id) => `- \`${id}\``), '');
+}
+if (uncompared.length > 0) {
+  md.push('## Visual baselines no test compares', '', ...uncompared.map((path) => `- \`${path}\``), '');
 }
 if (incidents.length > 0) {
   md.push('## Incidents', '', '| Incident | Missed by | State |', '|---|---|---|');
@@ -193,6 +204,7 @@ writeFileSync(
       undocumented,
       untested,
       incidents,
+      uncomparedBaselines: uncompared,
     },
     null,
     2,
@@ -208,7 +220,11 @@ process.stdout.write(
     undocumented.map((u) => `  UNDOCUMENTED ${opKey(u)} ${u.status} ${u.code ?? '-'} (${u.test})\n`).join('') +
     untested.map((id) => `  UNTESTED   ${id}\n`).join('') +
     unguarded.map((i) => `  INCIDENT   ${i.detail}\n`).join('') +
+    uncompared.map((path) => `  UNCOMPARED ${path} (a committed baseline no test compares)\n`).join('') +
     `Report: ${relative(process.cwd(), resolve(outDir, 'coverage.md'))}\n`,
 );
-if (args.strict === true && (gaps.length > 0 || undocumented.length > 0 || untested.length > 0 || unguarded.length > 0))
+if (
+  args.strict === true &&
+  (gaps.length > 0 || undocumented.length > 0 || untested.length > 0 || unguarded.length > 0 || uncompared.length > 0)
+)
   process.exit(1);

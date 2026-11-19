@@ -59,6 +59,10 @@ export interface CoverageSummary {
   undocumented: string[];
   /** Inventory scenario ids without a test. */
   untested: string[];
+  /** Incidents (framework/incidents.ts) no scenario and collected test guard: `incident INC-3 has no regression test`. */
+  unguarded?: string[];
+  /** A UI service's committed visual baselines no test compares (framework/ui/baselines.ts), relative to the service. */
+  uncomparedBaselines?: string[];
 }
 
 /** The known-failures registry as this run saw it. Present when the service has one. */
@@ -111,6 +115,11 @@ export interface UiFacts {
   consoleErrors: number;
   a11y: string[];
   budgetBreaches: string[];
+  /**
+   * Visual baselines the run itself wrote or changed (a run with VGATE_UPDATE_SNAPSHOTS=1, set by hand or by anything
+   * that ran before the gate in the same CI job): such a run compared nothing visual, so it never passes.
+   */
+  baselinesWritten?: string[];
 }
 
 /** Sums the browser findings this run's tests wrote (<reports>/ui/*.jsonl, framework/ui/fixtures.ts). */
@@ -123,6 +132,27 @@ export function uiFacts(findings: UiFindings[]): UiFacts {
     a11y: [...new Set(findings.flatMap((f) => f.a11y.map((a) => `${a.id} (${a.impact})`)))],
     budgetBreaches: [...new Set(findings.flatMap((f) => f.budgetBreaches))],
   };
+}
+
+/** Content hashes of a service's committed visual baselines, every platform (path relative to the service). */
+export function baselineHashes(serviceDir: string): Map<string, string> {
+  const root = join(serviceDir, 'tests', '__screenshots__');
+  const out = new Map<string, string>();
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else out.set(relative(serviceDir, path), createHash('sha256').update(readFileSync(path)).digest('hex'));
+    }
+  };
+  if (existsSync(root)) walk(root);
+  return out;
+}
+
+/** The baselines added, changed or removed between two hash sets. */
+export function baselinesChanged(before: Map<string, string>, after: Map<string, string>): string[] {
+  const paths = new Set([...before.keys(), ...after.keys()]);
+  return [...paths].filter((path) => before.get(path) !== after.get(path)).sort();
 }
 
 function readUi(reports: string, since: number): UiFacts | undefined {
@@ -200,6 +230,8 @@ interface CoverageFile {
   rows?: Array<{ operation: string; status: string; code?: string | null; state: string }>;
   undocumented?: Array<{ method: string; path: string; status: number; code?: string | null }>;
   untested?: string[];
+  incidents?: Array<{ state: string; detail: string }>;
+  uncomparedBaselines?: string[];
 }
 
 function readCoverage(reports: string, service: string, since: number): CoverageSummary | undefined {
@@ -219,6 +251,10 @@ function readCoverage(reports: string, service: string, since: number): Coverage
       (call) => `${call.method} ${call.path} ${call.status} ${call.code ?? '-'}`,
     ),
     untested: report.untested ?? [],
+    unguarded: (report.incidents ?? [])
+      .filter((i) => i.state === 'no-scenario' || i.state === 'no-test')
+      .map((i) => i.detail),
+    uncomparedBaselines: report.uncomparedBaselines ?? [],
   };
 }
 
@@ -257,7 +293,13 @@ export function summarise(verdict: Verdict): string {
   if (verdict.coverage) parts.push(`coverage ${verdict.coverage.covered}/${verdict.coverage.demanded}`);
   if (verdict.ui) {
     const ui = verdict.ui;
+    const written = ui.baselinesWritten ?? [];
     const problems = [
+      ...(written.length > 0
+        ? [
+            `the run wrote ${written.length} visual baseline${written.length === 1 ? '' : 's'} instead of comparing them`,
+          ]
+        : []),
       ...(ui.outbound.length > 0 ? [`the page tried to reach ${ui.outbound.join(', ')}`] : []),
       ...(ui.a11y.length > 0 ? [`accessibility: ${ui.a11y.join(', ')}`] : []),
       ...(ui.consoleErrors > 0 ? [`${ui.consoleErrors} console errors`] : []),
@@ -313,7 +355,14 @@ export function render(verdict: Verdict): string[] {
     lines.push(...coverage.gaps.slice(0, SHOWN).map((gap) => `GAP  ${gap}`), ...more(coverage.gaps.length - SHOWN));
     lines.push(...coverage.undocumented.slice(0, SHOWN).map((call) => `UNDOCUMENTED  ${call}`));
     lines.push(...coverage.untested.slice(0, SHOWN).map((id) => `UNTESTED  ${id}`));
+    lines.push(...(coverage.unguarded ?? []).slice(0, SHOWN).map((detail) => `INCIDENT  ${detail}`));
+    lines.push(
+      ...(coverage.uncomparedBaselines ?? [])
+        .slice(0, SHOWN)
+        .map((path) => `UNCOMPARED  ${path} (a committed visual baseline no test compares)`),
+    );
   }
+  for (const path of verdict.ui?.baselinesWritten ?? []) lines.push(`BASELINE WRITTEN  ${path}`);
   return lines;
 }
 
@@ -355,6 +404,10 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
   const started = startedAt.getTime();
   const logDir = join(reports, 'gate');
   mkdirSync(logDir, { recursive: true });
+
+  // A run must compare the committed baselines, never write them: Playwright writes them when VGATE_UPDATE_SNAPSHOTS=1
+  // reaches it, and in CI anything that ran earlier in the job (the app, its stack.sh) can set that for later steps.
+  const baselinesBefore = svc.ui ? baselineHashes(svc.dir) : undefined;
 
   const results: StepResult[] = [];
   // One run id per gate, never inherited: global setup keeps only the observed-call files of the current run id, so a
@@ -411,7 +464,14 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
 
   const buildFile = join(reports, 'stack', `${service}.build`);
   const failed = results.filter((result) => result.status === 'fail').map((result) => result.name);
-  const pass = failed.length === 0 && escaped.length === 0;
+  const baselinesWritten = baselinesBefore ? baselinesChanged(baselinesBefore, baselineHashes(svc.dir)) : [];
+  let ui = svc.ui && steps.includes('test') ? readUi(reports, started) : undefined;
+  if (baselinesWritten.length > 0)
+    ui = {
+      ...(ui ?? uiFacts([])),
+      baselinesWritten: baselinesWritten.map((path) => relative(root, join(svc.dir, path))),
+    };
+  const pass = failed.length === 0 && escaped.length === 0 && baselinesWritten.length === 0;
   const verdict: Verdict = {
     schema: 'vgate.verdict/1',
     service,
@@ -428,7 +488,7 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
     registry,
     coverage,
     sandbox,
-    ui: svc.ui && steps.includes('test') ? readUi(reports, started) : undefined,
+    ui,
     evidence: {
       junit,
       traces: shown(join(reports, 'test-results')),
@@ -442,6 +502,10 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
   const next = failed.length === 0 ? [] : [`${CLI} gate --service ${service} --steps ${failed.join(',')}`];
   // The summary names the hosts; the fix is in the app's configuration, after which the gate runs again.
   if (escaped.length > 0 && next.length === 0) next.push(`${CLI} gate --service ${service}`);
+  if (baselinesWritten.length > 0)
+    next.push(
+      `review the written baselines (git diff), commit them if they are right, and run ${CLI} gate --service ${service} without VGATE_UPDATE_SNAPSHOTS`,
+    );
   return {
     command: 'gate',
     ok: pass,

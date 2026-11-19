@@ -7,13 +7,13 @@ in the test. `services/example-web` is the reference.
 
 ## What every test is held to
 
-| Rule                    | What fails the test                                                                                                   | Setting                          |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| Sealed browser          | A request or websocket to an origin outside `ui.allowedOrigins` (it is blocked, recorded, and fails)                  | `allowedOrigins` (default self)  |
-| Console and page errors | `console.error`, an uncaught exception, a failed request (4xx/5xx or network) to the app's own origin                 | `ui.expect…` in the test         |
-| Accessibility           | An axe-core violation at or above `ui.a11y.minImpact` on any page the test visits (after every `goto` and at the end) | `a11y.minImpact`, `a11y.disable` |
-| Web vitals              | Largest contentful paint or cumulative layout shift above `ui.budgets`                                                | `budgets` (optional)             |
-| Visual                  | `expect(page).toHaveScreenshot(...)` differing from the committed baseline by one pixel                               | baselines next to the tests      |
+| Rule                    | What fails the test                                                                                                                                                                                                              | Setting                          |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| Sealed browser          | A request or websocket to an origin outside `ui.allowedOrigins` (it is blocked, recorded, and fails); a redirect there (recorded: Playwright cannot block it)                                                                    | `allowedOrigins` (default self)  |
+| Console and page errors | `console.error`, a failed `console.assert`, an uncaught exception, a failed request (4xx/5xx or network) to the app's own origin, in the page or a popup it opens                                                                | `ui.expect…` in the test         |
+| Accessibility           | An axe-core violation at or above `ui.a11y.minImpact` (checked after every `goto` and at the end); a page of the app reached another way (a click, a form, client-side routing) that the test never checks with `ui.checkA11y()` | `a11y.minImpact`, `a11y.disable` |
+| Web vitals              | Largest contentful paint or cumulative layout shift above `ui.budgets`                                                                                                                                                           | `budgets` (optional)             |
+| Visual                  | `expect(page).toHaveScreenshot(...)` differing from the committed baseline by one pixel                                                                                                                                          | baselines next to the tests      |
 
 A test that causes an error on purpose says so, and only that error passes:
 
@@ -74,7 +74,11 @@ the screenshot is taken of a page that has none (example-web screenshots its sig
 
 Fonts render differently across operating systems, so baselines are kept per platform:
 `tests/__screenshots__/<platform>/<spec>/<name>.png`. A missing baseline fails the run like a different one; new
-baselines are written only by an explicit run with `VGATE_UPDATE_SNAPSHOTS=1`. CI runs on Linux, so its baselines
+baselines are written only by an explicit run with `VGATE_UPDATE_SNAPSHOTS=1`, and a gate run that writes or changes a
+baseline fails (`the run wrote N visual baselines instead of comparing them`): it compared nothing, whoever set the
+variable. Review the written images, commit them, and run the gate again. A committed baseline of the platform that
+no test compares any more (a viewport dropped from a test's loop, a screenshot renamed) fails the coverage step
+(`UNCOMPARED`): delete it, which the guard sends to a human, or compare it again. CI runs on Linux, so its baselines
 are made on Linux: run the gate once with `VGATE_UPDATE_SNAPSHOTS=1` in the CI image (or the CI job) and commit
 `__screenshots__/linux/`.
 
@@ -100,3 +104,5 @@ the browser and uploads the screenshot diffs of a failed run.
 - Browsers other than Chromium; mobile devices beyond viewport sizes.
 - A Linux baseline made on macOS: baselines are per platform by design.
 - Requests a page makes from a service worker or a WebAssembly socket outside Playwright's routing.
+- Accessibility of popups, and of views a single-page app swaps without changing the URL: the test checks those with
+  `ui.checkA11y()`.

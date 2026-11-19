@@ -1,7 +1,8 @@
 /**
  * The coverage step of a UI service without a contract (`task coverage` runs it instead of coverage-report.ts): every
  * scenario of the plan has a collected test, and every incident (framework/incidents.ts) is guarded by its scenario and
- * a collected test, as for an API service. Writes <reports>/coverage/coverage.{md,json} like the contract report.
+ * a collected test, as for an API service, and every committed visual baseline of this platform is compared by a test
+ * (baselines.ts). Writes <reports>/coverage/coverage.{md,json} like the contract report.
  *
  *   tsx framework/ui/coverage.ts [--strict]
  */
@@ -12,6 +13,7 @@ import { testcaseNames } from '../../cli/junit.ts';
 import { fail, parseArgs } from '../cli/args.ts';
 import { loadService, reportsDir } from '../config.ts';
 import { readIncidents } from '../incidents.ts';
+import { committedBaselines, comparedBaselines, uncomparedBaselines } from './baselines.ts';
 import { scenarioIds, uiCoverage } from './plan.ts';
 
 const args = parseArgs(process.argv.slice(2), ['strict']);
@@ -29,6 +31,10 @@ if (junit.length === 0) fail('No JUnit reports in reports/junit: run the tests f
 const titles = junit.flatMap((file) => testcaseNames(readFileSync(file, 'utf8')));
 // An unreadable incident file stops the report: an incident must never vanish from coverage.
 const { untested, incidents, unguarded } = uiCoverage(ids, titles, readIncidents(svc.dir));
+// A baseline no test compares is an expectation nobody checks: a dropped viewport, a renamed screenshot.
+const uncompared = uncomparedBaselines(committedBaselines(svc.dir), comparedBaselines(reportsDir)).map((path) =>
+  relative(svc.dir, path),
+);
 const covered = ids.length - untested.length;
 const percent = Math.round((covered / ids.length) * 1000) / 10;
 
@@ -47,6 +53,7 @@ writeFileSync(
       rows: [],
       untested,
       incidents,
+      uncomparedBaselines: uncompared,
     },
     null,
     2,
@@ -60,6 +67,9 @@ writeFileSync(
     `Planned scenarios with a collected test: **${covered}/${ids.length}** (${percent}%).`,
     '',
     ...(untested.length > 0 ? ['## Scenarios without a test', '', ...untested.map((id) => `- \`${id}\``), ''] : []),
+    ...(uncompared.length > 0
+      ? ['## Visual baselines no test compares', '', ...uncompared.map((path) => `- \`${path}\``), '']
+      : []),
     ...(incidents.length > 0
       ? [
           '## Incidents',
@@ -80,6 +90,7 @@ process.stdout.write(
     '\n' +
     untested.map((id) => `  UNTESTED   ${id}\n`).join('') +
     unguarded.map((i) => `  INCIDENT   ${i.detail}\n`).join('') +
+    uncompared.map((path) => `  UNCOMPARED ${path} (a committed baseline no test compares)\n`).join('') +
     `Report: ${relative(process.cwd(), resolve(outDir, 'coverage.md'))}\n`,
 );
-if (args.strict === true && (untested.length > 0 || unguarded.length > 0)) process.exit(1);
+if (args.strict === true && (untested.length > 0 || unguarded.length > 0 || uncompared.length > 0)) process.exit(1);

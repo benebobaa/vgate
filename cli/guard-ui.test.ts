@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { isBaseline, uiConfigRule, visualRule } from './guard.ts';
-import { uiFacts } from './gate.ts';
+import { baselineHashes, baselinesChanged, summarise, uiFacts, type Verdict } from './gate.ts';
 
 const shot = 'regression/web/tests/__screenshots__/linux/visual.spec.ts/signin-desktop.png';
 
@@ -123,5 +126,42 @@ describe('the verdict sums the browser findings', () => {
       a11y: ['label (critical)'],
       budgetBreaches: [],
     });
+  });
+});
+
+describe('gate: a run that writes visual baselines', () => {
+  it('names every baseline the run added or changed, and never passes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vgate-baselines-'));
+    try {
+      const shots = join(dir, 'tests', '__screenshots__', 'linux', 'visual.spec.ts');
+      mkdirSync(shots, { recursive: true });
+      writeFileSync(join(shots, 'signin-desktop.png'), 'old');
+      writeFileSync(join(shots, 'signin-mobile.png'), 'same');
+      const before = baselineHashes(dir);
+      // What Playwright does with VGATE_UPDATE_SNAPSHOTS=1: rewrites a differing baseline, writes a missing one.
+      writeFileSync(join(shots, 'signin-desktop.png'), 'new');
+      writeFileSync(join(shots, 'notes-desktop.png'), 'added');
+      assert.deepEqual(baselinesChanged(before, baselineHashes(dir)), [
+        'tests/__screenshots__/linux/visual.spec.ts/notes-desktop.png',
+        'tests/__screenshots__/linux/visual.spec.ts/signin-desktop.png',
+      ]);
+      assert.deepEqual(baselinesChanged(before, before), []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('says so in the summary', () => {
+    const verdict = {
+      service: 'web',
+      environment: 'local',
+      verdict: 'fail',
+      complete: true,
+      durationMs: 1000,
+      steps: [{ name: 'test', status: 'pass', durationMs: 1, log: 'l' }],
+      sandbox: { kind: 'script', sealed: false, outbound: [] },
+      ui: { ...uiFacts([]), baselinesWritten: ['regression/web/tests/__screenshots__/linux/a.png'] },
+    } as unknown as Verdict;
+    assert.match(summarise(verdict), /the run wrote 1 visual baseline instead of comparing them/);
   });
 });
