@@ -6,8 +6,15 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { parse } from 'yaml';
 
+// The CI templates live in vgate's repository; a project's unpacked runtime does not carry them as files (the binary
+// embeds them for `vgate init`), so there these tests have nothing to read and skip.
+const ci = join(import.meta.dirname, '..', 'ci');
+const templates = existsSync(join(ci, 'github', 'deploy-verify.yml'));
+const skip = templates ? false : 'the CI templates are not part of a project runtime';
+const read = (path: string) => (templates ? readFileSync(join(ci, path), 'utf8') : '');
+
 // The after-deploy workflow's own logic (ci/github/deploy-verify.yml), run as GitHub runs it, with a stand-in vgate.
-const workflow = parse(readFileSync(join(import.meta.dirname, '..', 'ci', 'github', 'deploy-verify.yml'), 'utf8')) as {
+const workflow = (parse(read('github/deploy-verify.yml')) ?? { jobs: { verify: { if: '', steps: [] } } }) as {
   jobs: {
     verify: {
       if: string;
@@ -56,7 +63,7 @@ function verify(fake: Record<string, string>): { code: number | null; rolledBack
   return { code: run.status, rolledBack: existsSync(marker) ? readFileSync(marker, 'utf8').split('\n').length - 1 : 0 };
 }
 
-describe('after-deploy workflow', () => {
+describe('after-deploy workflow', { skip }, () => {
   it('rolls back once on a failed smoke, never on metrics it could not read', () => {
     assert.deepEqual(verify({ FAKE_SMOKE: '1' }), { code: 1, rolledBack: 1 });
     assert.deepEqual(verify({ FAKE_CANARY: '3', FAKE_CANARY_SUMMARY: 'CANARY UNKNOWN' }), { code: 1, rolledBack: 0 });
@@ -83,11 +90,11 @@ describe('after-deploy workflow', () => {
 });
 
 // The gate job's mutation step: it runs `vgate mutate` when vgate.yaml sets policy.mutationScore, in any YAML style.
-const gate = parse(readFileSync(join(import.meta.dirname, '..', 'ci', 'github', 'vgate.yml'), 'utf8')) as {
+const gate = (parse(read('github/vgate.yml')) ?? { jobs: {} }) as {
   jobs: { gate: { steps: Array<{ name?: string; run?: string }> } };
 };
 const mutationStep = gate.jobs.gate.steps.find((step) => step.name === 'Mutation score')?.run ?? '';
-const gitlab = readFileSync(join(import.meta.dirname, '..', 'ci', 'gitlab', 'regression-gate.yml'), 'utf8');
+const gitlab = read('gitlab/regression-gate.yml');
 
 function mutates(vgateYaml: string): boolean {
   const dir = mkdtempSync(join(tmpdir(), 'vgate-mutation-step-'));
@@ -103,7 +110,7 @@ function mutates(vgateYaml: string): boolean {
   return existsSync(join(dir, 'ran'));
 }
 
-describe('gate workflows: the mutation step', () => {
+describe('gate workflows: the mutation step', { skip }, () => {
   it('runs whenever vgate.yaml sets policy.mutationScore, whatever the YAML style', () => {
     assert.ok(mutates('version: 0.3.0\npolicy:\n  mutationScore: 0.7\n'));
     assert.ok(mutates('version: 0.3.0\npolicy: { autoMerge: low, mutationScore: 0.7 }\n'));
