@@ -1,4 +1,4 @@
 # This repository is both the framework and a project: its own reference services live in services/.
 # version follows package.json (a selftest checks it), so a binary built from this tree runs here.
-version: 0.3.0
+version: 0.4.0
 servicesDir: services

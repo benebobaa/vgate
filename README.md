@@ -108,7 +108,7 @@ environment that is not disposable, every request that is not read-only is refus
 ## A project
 
 ```
-vgate.yaml                 version: 0.3.0, servicesDir: regression
+vgate.yaml                 version: 0.4.0, servicesDir: regression
 regression/<svc>/
   service.yaml             rules, auth, dependencies, environments
   openapi.yaml             the vendored contract: approved behaviour, changed only by a sync
