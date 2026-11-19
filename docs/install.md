@@ -24,6 +24,16 @@ verify. If the directory is not on your `PATH`, it prints the line to add.
 On Alpine and other musl distributions the binary needs the C++ runtime: `apk add libstdc++ libgcc`. The installer
 says so when the installed binary does not start.
 
+On Fedora (and RHEL), what differs from Debian or macOS, all of which `vgate doctor` also points out:
+
+```bash
+sudo dnf install -y minisign git lsof procps-ng   # minisign lets install.sh verify the release signature
+sudo npm install -g corepack && sudo corepack enable pnpm   # Fedora's nodejs comes without corepack
+```
+
+Fedora ships Podman, not Docker. Services with a compose stack or a sealed environment run `docker compose`, so they
+need Docker Engine (https://docs.docker.com/engine/install/fedora/).
+
 Then: `vgate doctor` checks that the machine can run the gate and names the fix for everything it cannot.
 
 ## Pin a version

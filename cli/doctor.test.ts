@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import type { ServiceConfig } from '../framework/config.ts';
-import { atLeast, checkTool, healthUrl, parseVersion } from './doctor.ts';
+import { atLeast, checkTool, healthUrl, parseVersion, processToolsCheck } from './doctor.ts';
 
 describe('parseVersion', () => {
   it('reads the version out of what each tool prints', () => {
@@ -87,5 +87,43 @@ describe('checkTool', () => {
     });
     assert.equal(check.status, 'warn');
     assert.match(check.detail, /not installed \(up restarts the app every time\)/);
+  });
+});
+
+describe('processToolsCheck', () => {
+  const runs =
+    (answers: Record<string, { code: number | null; missing?: boolean; out?: string }>) => (command: string) => ({
+      missing: false,
+      out: '',
+      ...answers[command],
+      code: answers[command]?.code ?? null,
+    });
+
+  it('passes when ps and pgrep answer the way vgate calls them, pgrep finding nothing included', () => {
+    assert.equal(processToolsCheck(runs({ ps: { code: 0, out: '  777\n' }, pgrep: { code: 1 } }), 777).status, 'ok');
+    assert.equal(
+      processToolsCheck(runs({ ps: { code: 0, out: '777' }, pgrep: { code: 0, out: '42' } }), 777).status,
+      'ok',
+    );
+    // stderr noise around the answer does not hide it.
+    const noisy = runs({ ps: { code: 0, out: 'ld.so: warning: preload\n  777' }, pgrep: { code: 1 } });
+    assert.equal(processToolsCheck(noisy, 777).status, 'ok');
+  });
+
+  it('fails naming what a minimal image left out', () => {
+    const check = processToolsCheck(runs({ ps: { code: null, missing: true }, pgrep: { code: null, missing: true } }));
+    assert.equal(check.status, 'fail');
+    assert.match(check.detail, /^ps is not installed; pgrep is not installed/);
+    assert.ok(check.fix);
+  });
+
+  it("fails on busybox's ps, which is on PATH but rejects -p", () => {
+    const check = processToolsCheck(runs({ ps: { code: 1, out: 'ps: unrecognized option: p' }, pgrep: { code: 1 } }));
+    assert.equal(check.status, 'fail');
+    assert.match(check.detail, /busybox/);
+  });
+
+  it('passes on this machine', () => {
+    assert.equal(processToolsCheck().status, 'ok');
   });
 });
