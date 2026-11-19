@@ -36,6 +36,7 @@ import {
   type Platform,
 } from './release-config.ts';
 import { readSkills } from './skills.ts';
+import { paxRecords } from './tar.ts';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = parseArgs(process.argv.slice(2), ['all']);
@@ -163,9 +164,8 @@ for (const platform of PLATFORMS) {
   process.env.COPYFILE_DISABLE = '1';
   run('tar', ['--no-xattrs', '-czf', join(releaseDir, file), '-C', stage, NAME, 'LICENSE'], root);
   const path = join(releaseDir, file);
-  if (gunzipSync(readFileSync(path)).includes('LIBARCHIVE.xattr')) {
-    die(`${file} carries extended-attribute headers: GNU tar would warn on every install`);
-  }
+  const xattrs = paxRecords(gunzipSync(readFileSync(path))).filter((record) => record.includes('LIBARCHIVE.xattr'));
+  if (xattrs.length > 0) die(`${file} carries extended-attribute headers: GNU tar would warn on every install`);
   assets.push({
     os: platform.os,
     arch: platform.arch,

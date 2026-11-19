@@ -76,17 +76,30 @@ export function checkTool(spec: ToolSpec): Check {
   return { id: spec.id, status: 'ok', detail: line };
 }
 
+/** How a check runs a command: exit code (null when it could not run) and output. */
+export type Probe = (command: string, args: string[]) => { code: number | null; missing: boolean; out: string };
+
+const probe: Probe = (command, args) => capture(command, args, tmpdir(), 10_000);
+
 /**
  * ps and pgrep: the stack library tells its own app by pid, parent and start time, and stops it with its children;
- * mutate checks a recorded pid the same way. Minimal images (fedora, debian-slim) come without them.
+ * mutate checks a recorded pid the same way. Minimal images (fedora, debian-slim) come without them, and busybox's
+ * (Alpine) are there but lack the options vgate uses (`ps -p`), so each is run the way vgate runs it.
  */
-export function processToolsCheck(has: (command: string) => boolean = onPath): Check {
-  const missing = ['ps', 'pgrep'].filter((command) => !has(command));
-  if (missing.length === 0) return { id: 'procps', status: 'ok', detail: 'ps and pgrep' };
+export function processToolsCheck(run: Probe = probe): Check {
+  const problems: string[] = [];
+  const ps = run('ps', ['-o', 'pid=', '-p', '1']);
+  if (ps.missing) problems.push('ps is not installed');
+  else if (ps.code !== 0 || ps.out.trim() !== '1') problems.push('ps does not take `-o pid= -p <pid>` (busybox?)');
+  // pgrep exits 1 when no process matches; anything else is an error.
+  const pgrep = run('pgrep', ['-P', '1']);
+  if (pgrep.missing) problems.push('pgrep is not installed');
+  else if (pgrep.code !== 0 && pgrep.code !== 1) problems.push('pgrep does not take `-P <pid>`');
+  if (problems.length === 0) return { id: 'procps', status: 'ok', detail: 'ps and pgrep' };
   return {
     id: 'procps',
     status: 'fail',
-    detail: `${missing.join(' and ')} not installed (vgate tells its own processes by pid and start time)`,
+    detail: `${problems.join('; ')} (vgate tells its own processes by pid and start time)`,
     fix: install('procps'),
   };
 }

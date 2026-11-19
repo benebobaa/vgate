@@ -91,11 +91,33 @@ describe('checkTool', () => {
 });
 
 describe('processToolsCheck', () => {
-  it('passes with ps and pgrep, and fails naming what a minimal image left out', () => {
-    assert.equal(processToolsCheck(() => true).status, 'ok');
-    const check = processToolsCheck((command) => command !== 'pgrep');
+  const runs =
+    (answers: Record<string, { code: number | null; missing?: boolean; out?: string }>) => (command: string) => ({
+      missing: false,
+      out: '',
+      ...answers[command],
+      code: answers[command]?.code ?? null,
+    });
+
+  it('passes when ps and pgrep answer the way vgate calls them, pgrep finding nothing included', () => {
+    assert.equal(processToolsCheck(runs({ ps: { code: 0, out: '    1\n' }, pgrep: { code: 1 } })).status, 'ok');
+    assert.equal(processToolsCheck(runs({ ps: { code: 0, out: '1' }, pgrep: { code: 0, out: '42' } })).status, 'ok');
+  });
+
+  it('fails naming what a minimal image left out', () => {
+    const check = processToolsCheck(runs({ ps: { code: null, missing: true }, pgrep: { code: null, missing: true } }));
     assert.equal(check.status, 'fail');
-    assert.match(check.detail, /^pgrep not installed/);
+    assert.match(check.detail, /^ps is not installed; pgrep is not installed/);
     assert.ok(check.fix);
+  });
+
+  it("fails on busybox's ps, which is on PATH but rejects -p", () => {
+    const check = processToolsCheck(runs({ ps: { code: 1, out: 'ps: unrecognized option: p' }, pgrep: { code: 1 } }));
+    assert.equal(check.status, 'fail');
+    assert.match(check.detail, /busybox/);
+  });
+
+  it('passes on this machine', () => {
+    assert.equal(processToolsCheck().status, 'ok');
   });
 });
