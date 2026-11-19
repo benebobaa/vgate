@@ -86,13 +86,16 @@ const probe: Probe = (command, args) => capture(command, args, tmpdir(), 10_000)
  * mutate checks a recorded pid the same way. Minimal images (fedora, debian-slim) come without them, and busybox's
  * (Alpine) are there but lack the options vgate uses (`ps -p`), so each is run the way vgate runs it.
  */
-export function processToolsCheck(run: Probe = probe): Check {
+export function processToolsCheck(run: Probe = probe, pid = process.pid): Check {
   const problems: string[] = [];
-  const ps = run('ps', ['-o', 'pid=', '-p', '1']);
+  // Our own pid, as vgate only ever asks about its own processes: pid 1 is hidden from users where /proc has hidepid=2.
+  // The pid is matched as a line of its own, because the output holds stderr too (an LD_PRELOAD warning, say).
+  const ps = run('ps', ['-o', 'pid=', '-p', String(pid)]);
   if (ps.missing) problems.push('ps is not installed');
-  else if (ps.code !== 0 || ps.out.trim() !== '1') problems.push('ps does not take `-o pid= -p <pid>` (busybox?)');
+  else if (ps.code !== 0 || !new RegExp(`^\\s*${pid}\\s*$`, 'm').test(ps.out))
+    problems.push('ps does not take `-o pid= -p <pid>` (busybox?)');
   // pgrep exits 1 when no process matches; anything else is an error.
-  const pgrep = run('pgrep', ['-P', '1']);
+  const pgrep = run('pgrep', ['-P', String(pid)]);
   if (pgrep.missing) problems.push('pgrep is not installed');
   else if (pgrep.code !== 0 && pgrep.code !== 1) problems.push('pgrep does not take `-P <pid>`');
   if (problems.length === 0) return { id: 'procps', status: 'ok', detail: 'ps and pgrep' };

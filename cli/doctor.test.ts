@@ -100,8 +100,14 @@ describe('processToolsCheck', () => {
     });
 
   it('passes when ps and pgrep answer the way vgate calls them, pgrep finding nothing included', () => {
-    assert.equal(processToolsCheck(runs({ ps: { code: 0, out: '    1\n' }, pgrep: { code: 1 } })).status, 'ok');
-    assert.equal(processToolsCheck(runs({ ps: { code: 0, out: '1' }, pgrep: { code: 0, out: '42' } })).status, 'ok');
+    assert.equal(processToolsCheck(runs({ ps: { code: 0, out: '  777\n' }, pgrep: { code: 1 } }), 777).status, 'ok');
+    assert.equal(
+      processToolsCheck(runs({ ps: { code: 0, out: '777' }, pgrep: { code: 0, out: '42' } }), 777).status,
+      'ok',
+    );
+    // stderr noise around the answer does not hide it.
+    const noisy = runs({ ps: { code: 0, out: 'ld.so: warning: preload\n  777' }, pgrep: { code: 1 } });
+    assert.equal(processToolsCheck(noisy, 777).status, 'ok');
   });
 
   it('fails naming what a minimal image left out', () => {
