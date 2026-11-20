@@ -8,9 +8,18 @@
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createConnection, createServer } from 'node:net';
-import { join, relative, resolve, sep } from 'node:path';
+import { basename, join, relative, resolve, sep } from 'node:path';
 import { stringify } from 'yaml';
 import { kindOf } from './catalog/index.ts';
 import type { EnvironmentDecl } from './declare.ts';
@@ -574,6 +583,27 @@ async function removeProject(project: string, live = false): Promise<void> {
   );
 }
 
+/**
+ * The executable name of a process: `/proc/<pid>/exe` on Linux (where `ps -o comm=` is the thread name, which runtimes
+ * such as Node 24 rename to `MainThread`), falling back to `ps -o comm=` elsewhere or when `/proc` cannot be read.
+ */
+export function processName(
+  pid: number,
+  procRoot = '/proc',
+  readComm: (pid: number) => string = (p) =>
+    spawnSync('ps', ['-o', 'comm=', '-p', String(p)], { encoding: 'utf8' }).stdout ?? '',
+): string {
+  try {
+    const exe = readlinkSync(join(procRoot, String(pid), 'exe')).replace(/ \(deleted\)$/, '');
+    const name = basename(exe);
+    if (name) return name;
+  } catch {
+    // Not Linux, /proc unavailable, or another user's process: fall back to ps.
+  }
+  const comm = readComm(pid).trim();
+  return comm ? basename(comm) : '';
+}
+
 /** `name (pid N)` of whatever listens on 127.0.0.1:port, or undefined when the port is free. */
 async function portHolder(port: number): Promise<string | undefined> {
   const free = await new Promise<boolean>((done) => {
@@ -584,7 +614,7 @@ async function portHolder(port: number): Promise<string | undefined> {
   if (free) return undefined;
   const pid = await listenerPid(port);
   if (pid === undefined) return `an unknown process`;
-  const name = spawnSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+  const name = processName(pid);
   return `${name || 'a process'} (pid ${pid})`;
 }
 
@@ -600,7 +630,9 @@ function isDescendant(pid: number, ancestor: number): boolean {
   let current = pid;
   for (let hops = 0; hops < 64 && current > 1; hops++) {
     if (current === ancestor) return true;
-    const parent = Number(spawnSync('ps', ['-o', 'ppid=', '-p', String(current)], { encoding: 'utf8' }).stdout.trim());
+    const parent = Number(
+      (spawnSync('ps', ['-o', 'ppid=', '-p', String(current)], { encoding: 'utf8' }).stdout ?? '').trim(),
+    );
     if (!Number.isInteger(parent) || parent <= 0) return false;
     current = parent;
   }

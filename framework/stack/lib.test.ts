@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -82,7 +91,7 @@ async function waitGone(url: string): Promise<void> {
 const noLsof = (() => {
   const dir = join(work, 'bin-no-lsof');
   mkdirSync(dir);
-  const tools = 'bash sh curl git ps pgrep cat head tr seq sleep mkdir rm node nohup env dirname tail';
+  const tools = 'bash sh curl git ps pgrep cat head tr seq sleep mkdir rm node nohup env dirname tail readlink';
   for (const tool of tools.split(' ')) {
     const found = spawnSync('bash', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).stdout.trim();
     if (found.startsWith('/')) symlinkSync(found, join(dir, tool));
@@ -138,8 +147,13 @@ function checkout(name: string) {
   return { repo, head: () => git('rev-parse', '--short', 'HEAD'), commit };
 }
 
+// On Linux, /proc/<pid>/exe resolves symlinks (e.g. Fedora's /usr/bin/node -> /usr/bin/node-24); elsewhere ps comm
+// reports the invoked executable's basename.
+const nodeName = basename(process.platform === 'linux' ? realpathSync(process.execPath) : process.execPath);
+const nodePattern = nodeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 function stray(port: number) {
-  const child = spawn('node', [join(work, 'server.js')], { env: { ...process.env, PORT: String(port) } });
+  const child = spawn(process.execPath, [join(work, 'server.js')], { env: { ...process.env, PORT: String(port) } });
   children.push(child);
   return child;
 }
@@ -154,7 +168,7 @@ describe('app_up (framework/stack/lib.sh)', () => {
       await waitFor(`http://127.0.0.1:${port}/health`);
       const up = appUp(port);
       assert.equal(up.status, 3, up.stdout + up.stderr);
-      assert.match(up.stderr, new RegExp(`held by node \\(pid ${other.pid}\\)`));
+      assert.match(up.stderr, new RegExp(`held by ${nodePattern} \\(pid ${other.pid}\\)`));
       other.kill('SIGKILL');
     },
   );
@@ -184,7 +198,7 @@ describe('app_up (framework/stack/lib.sh)', () => {
     const theirs = status(port);
     assert.match(
       theirs.stdout,
-      new RegExp(`build     not this project's: port ${port} is held by node \\(pid ${other.pid}\\)`),
+      new RegExp(`build     not this project's: port ${port} is held by ${nodePattern} \\(pid ${other.pid}\\)`),
     );
     assert.ok(!theirs.stdout.includes('abc1234'), theirs.stdout);
     other.kill('SIGKILL');
@@ -203,7 +217,7 @@ describe('app_up (framework/stack/lib.sh)', () => {
     const theirs = status(port);
     assert.match(
       theirs.stdout,
-      new RegExp(`build     not this project's: port ${port} is held by node \\(pid ${other.pid}\\)`),
+      new RegExp(`build     not this project's: port ${port} is held by ${nodePattern} \\(pid ${other.pid}\\)`),
     );
     const up = appUp(port);
     assert.equal(up.status, 3, up.stdout + up.stderr);
@@ -323,5 +337,75 @@ describe('url_port (framework/stack/lib.sh)', () => {
       assert.doesNotMatch(r.stdout, /reached/);
       assert.match(r.stderr, /no port number/);
     }
+  });
+});
+
+describe('proc_name (framework/stack/lib.sh)', () => {
+  function fakeBin(name: string, psOutput: string, psExit = 0): string {
+    const dir = join(work, `bin-${name}`);
+    mkdirSync(dir, { recursive: true });
+    const ps = join(dir, 'ps');
+    writeFileSync(ps, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(psOutput)}\nexit ${psExit}\n`);
+    chmodSync(ps, 0o755);
+    return dir;
+  }
+
+  function runProcName(pid: number, procRoot: string, binDir: string) {
+    return spawnSync('bash', ['-c', `set -euo pipefail; source "${LIB}"; proc_name "${pid}"`], {
+      env: { ...env(), STACK_PROC_ROOT: procRoot, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+      encoding: 'utf8',
+    });
+  }
+
+  it('prefers /proc/<pid>/exe over the thread name reported by ps comm (Node 24 MainThread on Linux)', () => {
+    const procRoot = join(work, 'proc-linux');
+    mkdirSync(join(procRoot, '4242'), { recursive: true });
+    symlinkSync('/home/user/.nvm/versions/node/v24.22.1/bin/node', join(procRoot, '4242', 'exe'));
+    const r = runProcName(4242, procRoot, fakeBin('mainthread', 'MainThread'));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, 'node\n');
+  });
+
+  it('strips the Linux (deleted) suffix from /proc/<pid>/exe', () => {
+    const procRoot = join(work, 'proc-deleted');
+    mkdirSync(join(procRoot, '4243'), { recursive: true });
+    symlinkSync('/tmp/build/my-api (deleted)', join(procRoot, '4243', 'exe'));
+    const r = runProcName(4243, procRoot, fakeBin('deleted', 'MainThread'));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, 'my-api\n');
+  });
+
+  it('falls back to the trimmed basename of ps comm when /proc/<pid>/exe is unavailable', () => {
+    const missing = join(work, 'proc-missing');
+    const bare = runProcName(4243, missing, fakeBin('bare', '  node  '));
+    assert.equal(bare.status, 0, bare.stderr);
+    assert.equal(bare.stdout, 'node\n');
+
+    const padded = runProcName(4244, missing, fakeBin('padded', '  /opt/homebrew/bin/node  '));
+    assert.equal(padded.status, 0, padded.stderr);
+    assert.equal(padded.stdout, 'node\n');
+
+    const spaced = runProcName(4245, missing, fakeBin('spaced', '/Applications/My App.app/Contents/MacOS/My App'));
+    assert.equal(spaced.status, 0, spaced.stderr);
+    assert.equal(spaced.stdout, 'My App\n');
+  });
+
+  it('falls back cleanly under set -euo pipefail when neither /proc nor ps can name the process', () => {
+    const missing = join(work, 'proc-gone');
+    const binDir = fakeBin('gone', '', 1);
+    const r = runProcName(4246, missing, binDir);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, '\n');
+
+    const holder = spawnSync(
+      'bash',
+      ['-c', `set -euo pipefail; source "${LIB}"; port_pid() { echo 4246; }; port_holder 9999`],
+      {
+        env: { ...env(), STACK_PROC_ROOT: missing, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+        encoding: 'utf8',
+      },
+    );
+    assert.equal(holder.status, 0, holder.stderr);
+    assert.equal(holder.stdout, 'a process (pid 4246)\n');
   });
 });

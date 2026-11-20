@@ -124,11 +124,30 @@ url_port() { # <url>
   case $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') in https://*) echo 443 ;; *) echo 80 ;; esac
 }
 
+# The executable name of a process: /proc/<pid>/exe on Linux (ps comm is the thread name there, which runtimes such as
+# Node 24 rename to MainThread), falling back to ps comm elsewhere or when /proc/<pid>/exe cannot be read (in practice
+# on Linux, lsof needs the same /proc permission to see the listener in the first place).
+# STACK_PROC_ROOT: procfs root (tests point it at a fixture).
+proc_name() { # <pid>
+  local exe name
+  exe=$(readlink "${STACK_PROC_ROOT:-/proc}/$1/exe" 2>/dev/null || true)
+  exe=${exe%' (deleted)'}
+  name=${exe##*/}
+  if [ -z "$name" ]; then
+    name=$(ps -o comm= -p "$1" 2>/dev/null || true)
+    name=${name#"${name%%[![:space:]]*}"}
+    name=${name%"${name##*[![:space:]]}"}
+    name=${name##*/}
+  fi
+  echo "$name"
+}
+
 port_holder() { # <port>: "name (pid N)" of what listens there, empty when free
-  local pid
+  local pid name
   pid=$(port_pid "$1")
   [ -n "$pid" ] || return 0
-  echo "$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ') (pid $pid)"
+  name=$(proc_name "$pid")
+  echo "${name:-a process} (pid $pid)"
 }
 
 is_descendant() { # <pid> <ancestor pid>: the process is the ancestor or runs under it
