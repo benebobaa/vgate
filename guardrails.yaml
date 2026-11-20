@@ -1,0 +1,52 @@
+# Codebase guardrails for vgate itself (dogfooding M1: boundaries, banned patterns, rule fixtures).
+# Verify rule fixtures: `pnpm vgate lint --test`
+# Run against repository: `pnpm vgate lint`
+presets:
+  - minimal-ts
+
+boundaries:
+  - id: packages-no-services-import
+    from:
+      - packages/**/*.ts
+    disallowImports:
+      - services/**
+      - '**/services/**'
+    replaceWith: Keep packages/ independent of example services; accept config or paths as parameters
+    reason: Core packages must remain reusable across any repository
+    fixtures:
+      bad:
+        - file: packages/adapters/bad.ts
+          code: "import { x } from '../../services/example/server.ts';"
+      good:
+        - file: packages/adapters/good.ts
+          code: "import { readFileSync } from 'node:fs';"
+
+bannedPatterns:
+  - id: no-dangerously-skip-permissions
+    pattern: '--dangerously-skip-permissions'
+    files:
+      - cli/**/*.ts
+      - framework/**/*.ts
+      - packages/**/*.ts
+    exclude:
+      - '**/*.test.ts'
+      - packages/adapters/runner.ts
+      - packages/factory/connectors.ts
+    replaceWith: Run headless agents with explicit minimal read/tool permissions instead of bypassing safety guards
+    reason: vgate never launches sub-agents with permission bypasses
+    severity: error
+    fixtures:
+      bad:
+        - file: cli/bad.ts
+          code: "const args = ['--dangerously-skip-permissions'];"
+      good:
+        - file: cli/good.ts
+          code: "const args = ['-p', prompt];"
+
+ignore:
+  - node_modules/**
+  - dist/**
+  - .git/**
+  - reports/**
+  - .claude/**
+  - services/*/generated/**

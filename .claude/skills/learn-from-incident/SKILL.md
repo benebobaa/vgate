@@ -1,5 +1,6 @@
 ---
 name: learn-from-incident
+pack: core
 description: Turns a bug that escaped to production into a permanent vgate regression test - records the incident with `vgate incident add`, writes its scenario and a test that goes red on the buggy commit and green on the fix, runs the gate and the guard, and classifies why the gate missed it. Use when a production bug, incident, outage, postmortem, escaped defect or customer-reported failure needs a regression test, when someone asks "would vgate have caught this?", or when the coverage step reports an incident without a regression test.
 ---
 

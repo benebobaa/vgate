@@ -1,5 +1,6 @@
 ---
 name: sync-api-tests
+pack: core
 description: Keeps a service's vgate regression suite in step with its backend - diffs the backend since the commit the tests were last synced to, updates the vendored contract as a reviewable diff, then the inventory and the Playwright tests for new, changed or removed endpoints, response codes, fields, events, permissions, validation rules, tables and downstream calls, runs the gate and the guard, and reports coverage gaps, findings and which changes need a human. Use whenever a backend changed (a feature, refactor, hotfix, migration or a regenerated openapi.yaml) and its tests need updating, when someone asks to sync, refresh or update the API tests, when the gate fails because the contract moved, or before merging a backend change to see what it breaks. For a service with no tests yet, use generate-api-tests.
 ---
 

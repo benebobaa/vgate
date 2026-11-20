@@ -1,5 +1,6 @@
 ---
 name: generate-api-tests
+pack: core
 description: Onboards a backend service into a vgate project and generates its black-box regression suite from the backend's own sources - first a reviewable test plan (inventory.yaml), then Playwright tests covering every documented response of every endpoint, the role and permission matrix, streams, webhooks, dependency calls and database side effects, then runs the vgate gate and reports where the backend disagrees with its spec. Use whenever someone wants to onboard a service, generate or write API tests or a regression suite for a backend, cover all endpoints, or build or review a backend's test plan, even if they only say "onboard X", "test this backend" or "plan the tests for <repo>". For a service that already has tests and a changed backend, use sync-api-tests.
 ---
 

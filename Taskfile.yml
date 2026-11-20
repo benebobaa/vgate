@@ -66,9 +66,9 @@ tasks:
       - for spec in "{{.PROJECT}}/{{.SERVICES_DIR}}"/*/openapi.yaml; do [ -f "$spec" ] || continue; "{{.BIN}}/openapi-typescript" "$spec" -o "$(dirname "$spec")/generated/openapi.ts" --silent; done
 
   selftest:
-    desc: The framework's own tests (contract validation, rules, client, auth) and the CLI's; no stack needed
+    desc: The framework's own tests (contract validation, rules, client, auth), CLI and packages; no stack needed
     cmds:
-      - '"{{.BIN}}/tsx" --test --test-reporter=spec ''framework/**/*.test.ts'' ''cli/**/*.test.ts'''
+      - '"{{.BIN}}/tsx" --test --test-reporter=spec ''framework/**/*.test.ts'' ''cli/**/*.test.ts'' ''packages/**/*.test.ts'''
 
   cli:build:
     desc: 'Build the standalone vgate binary into dist/ (needs Bun; arguments after --, e.g. task cli:build -- --target bun-linux-x64)'

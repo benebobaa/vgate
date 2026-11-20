@@ -4,7 +4,7 @@
 # in a directory on your PATH. It never calls sudo.
 #
 #   curl -fsSL https://vgate.benelabs.tech/install.sh | sh
-#   curl -fsSL https://vgate.benelabs.tech/install.sh | VGATE_VERSION=0.6.3 sh
+#   curl -fsSL https://vgate.benelabs.tech/install.sh | VGATE_VERSION=0.1.0 sh
 #
 # Environment:
 #   VGATE_VERSION          version to install (default: the latest release)
