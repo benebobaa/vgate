@@ -81,14 +81,14 @@ include:
   - component: $CI_SERVER_FQDN/<your-components-project>/regression-gate@1
     inputs:
       service: orders
-      image: registry.example/your-group/vgate:0.6.2
+      image: registry.example/your-group/vgate:0.6.3
   - component: $CI_SERVER_FQDN/<your-components-project>/regression-gate@1
     inputs:
       service: payments
-      image: registry.example/your-group/vgate:0.6.2
+      image: registry.example/your-group/vgate:0.6.3
   - component: $CI_SERVER_FQDN/<your-components-project>/pr-decision@1
     inputs:
-      image: registry.example/your-group/vgate:0.6.2
+      image: registry.example/your-group/vgate:0.6.3
       approvers: group:your-group/verification-owners, some.username
       automerge: false
 ```
