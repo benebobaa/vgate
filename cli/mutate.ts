@@ -30,6 +30,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { parse } from 'yaml';
+import { writeSignedOrPlainJson } from '../packages/verification/signing.ts';
 import { loadService, parsePaths, type ServiceConfig } from '../framework/config.ts';
 import { envDown, envUp, type EnvState } from '../framework/env/lifecycle.ts';
 import { apply, candidates, hint, sample, type Candidate } from '../framework/mutate/operators.ts';
@@ -749,8 +750,7 @@ export async function mutate(project: ProjectConfig, runtime: Runtime, options: 
     report.verdict = mutationVerdict(all.length, report.counts, report.threshold);
     report.reasons = reasonsFor(report);
     report.durationMs = Date.now() - started;
-    mkdirSync(project.reportsDir, { recursive: true });
-    writeFileSync(outFile, `${JSON.stringify(report, null, 2)}\n`);
+    writeSignedOrPlainJson(outFile, report);
     return toResult(report, relative(process.cwd(), outFile) || outFile);
   };
   if (picked.length === 0) return finish();

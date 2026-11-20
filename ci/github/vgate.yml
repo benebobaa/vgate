@@ -56,10 +56,27 @@ jobs:
         with:
           fetch-depth: 0
       - id: pin
-        name: Read the pinned vgate version
+        name: Read the pinned vgate version (from trunk on PRs so a PR cannot self-downgrade the judge)
         working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+          PROJECT_DIR: ${{ env.VGATE_PROJECT_DIR }}
         run: |
-          version=$(sed -n "s/^version:[[:space:]]*['\"]\{0,1\}\([0-9][0-9A-Za-z.-]*\).*/\1/p" vgate.yaml | head -1)
+          cfg=""
+          ref=""
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_BASE" ]; then ref="$PR_BASE"; fi
+          if [ "$EVENT" = "merge_group" ] && [ -n "$QUEUE_BASE" ]; then ref="$QUEUE_BASE"; fi
+          rel="${PROJECT_DIR#./}"
+          path="vgate.yaml"
+          if [ -n "$rel" ] && [ "$rel" != "." ]; then path="$rel/vgate.yaml"; fi
+          if [ -n "$ref" ]; then cfg=$(git show "$ref:$path" 2>/dev/null || true); fi
+          if [ -n "$cfg" ]; then
+            version=$(printf '%s\n' "$cfg" | sed -n "s/^version:[[:space:]]*['\"]\{0,1\}\([0-9][0-9A-Za-z.-]*\).*/\1/p" | head -1)
+          else
+            version=$(sed -n "s/^version:[[:space:]]*['\"]\{0,1\}\([0-9][0-9A-Za-z.-]*\).*/\1/p" vgate.yaml | head -1)
+          fi
           if [ -z "$version" ]; then echo "::error file=vgate.yaml::no 'version: x.y.z' in vgate.yaml"; exit 1; fi
           echo "version=$version" >>"$GITHUB_OUTPUT"
       - name: Install vgate
@@ -209,17 +226,20 @@ jobs:
         if: always()
         working-directory: ${{ env.VGATE_PROJECT_DIR }}
         run: |
-          # Only vgate's own answers travel to the decision; a missing one is a missing proof, and decide blocks on it.
-          mkdir -p "$RUNNER_TEMP/evidence/$SERVICE"
-          cp "$VGATE_REPORTS_DIR/verdict.json" "$RUNNER_TEMP/evidence/$SERVICE/verdict.json" 2>/dev/null \
+          # Only an explicit allowlist of vgate's own answers travels to the decision in a fresh directory created after
+          # PR code stops running; arbitrary PR-written files (such as forged verifier.json) are never uploaded here.
+          stage=$(mktemp -d "${RUNNER_TEMP}/vgate-evidence-XXXXXX")
+          mkdir -p "$stage/$SERVICE"
+          cp "$VGATE_REPORTS_DIR/verdict.json" "$stage/$SERVICE/verdict.json" 2>/dev/null \
             || echo "::warning::no verdict for $SERVICE: the gate did not finish"
-          cp "$VGATE_REPORTS_DIR/migrations.json" "$RUNNER_TEMP/evidence/$SERVICE/migrations.json" 2>/dev/null || true
-          cp "$VGATE_REPORTS_DIR/mutation.json" "$RUNNER_TEMP/evidence/$SERVICE/mutation.json" 2>/dev/null || true
+          cp "$VGATE_REPORTS_DIR/migrations.json" "$stage/$SERVICE/migrations.json" 2>/dev/null || true
+          cp "$VGATE_REPORTS_DIR/mutation.json" "$stage/$SERVICE/mutation.json" 2>/dev/null || true
+          echo "evidence_dir=$stage" >>"$GITHUB_ENV"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: vgate-evidence-gate-${{ matrix.service }}
-          path: ${{ runner.temp }}/evidence/
+          path: ${{ env.evidence_dir }}/
           retention-days: 14
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
@@ -282,8 +302,76 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  repo-guard:
+    needs: plan
+    if: needs.plan.outputs.base != ''
+    runs-on: ubuntu-latest
+    env:
+      BASE: ${{ needs.plan.outputs.base }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install vgate
+        env:
+          VGATE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          curl -fsSL "$VGATE_BASE_URL/install.sh" | VGATE_INSTALL_DIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - name: Trunk-executed guardrails lint & repo-level guard
+        working-directory: ${{ env.VGATE_PROJECT_DIR }}
+        env:
+          PROJECT_DIR: ${{ env.VGATE_PROJECT_DIR }}
+        run: |
+          # Trunk execution invariant: extract guardrails.yaml & .vgate-ratchet.json from $BASE (trunk), NEVER the PR head,
+          # so a PR cannot weaken guardrails and pass lint. Then run repo-level `vgate guard --base $BASE`.
+          rm -rf "$VGATE_REPORTS_DIR"
+          trunk=$(mktemp -d "${RUNNER_TEMP}/vgate-trunk-XXXXXX")
+          stage=$(mktemp -d "${RUNNER_TEMP}/vgate-repo-evidence-XXXXXX")
+          mkdir -p "$stage/_repo"
+          rel="${PROJECT_DIR#./}"
+          prefix=""
+          if [ -n "$rel" ] && [ "$rel" != "." ]; then prefix="$rel/"; fi
+          if git show "$BASE:${prefix}guardrails.yaml" >"$trunk/guardrails.yaml" 2>/dev/null; then
+            ratchet_flag=""
+            if git show "$BASE:${prefix}.vgate-ratchet.json" >"$trunk/.vgate-ratchet.json" 2>/dev/null; then
+              ratchet_flag="--ratchet $trunk/.vgate-ratchet.json"
+            fi
+            set +e
+            # shellcheck disable=SC2086
+            vgate lint --config "$trunk/guardrails.yaml" $ratchet_flag --skip-native
+            lint_code=$?
+            set -e
+            # 0 pass, 1 violations found (recorded in lint.json for decide); any other code is a crash and fails CI.
+            case $lint_code in 0 | 1) ;; *) echo "::error::vgate lint crashed (exit $lint_code)"; exit "$lint_code" ;; esac
+            cp "$VGATE_REPORTS_DIR/lint.json" "$stage/_repo/lint.json"
+          elif [ -f guardrails.yaml ]; then
+            # Brand-new guardrails.yaml introduced by this PR: fixtures MUST pass before linting.
+            vgate lint --test
+            set +e
+            vgate lint --skip-native
+            lint_code=$?
+            set -e
+            case $lint_code in 0 | 1) ;; *) echo "::error::vgate lint crashed (exit $lint_code)"; exit "$lint_code" ;; esac
+            cp "$VGATE_REPORTS_DIR/lint.json" "$stage/_repo/lint.json"
+          fi
+          set +e
+          vgate guard --base "$BASE"
+          code=$?
+          set -e
+          case $code in 0 | 1) ;; *) echo "::error::vgate repo-guard failed (exit $code)"; exit "$code" ;; esac
+          cp "$VGATE_REPORTS_DIR/guard.json" "$stage/_repo/guard.json"
+          echo "repo_evidence_dir=$stage" >>"$GITHUB_ENV"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vgate-evidence-repo-guard
+          path: ${{ env.repo_evidence_dir }}/
+          retention-days: 14
+          if-no-files-found: ignore
+
   decide:
-    needs: [plan, gate, guard]
+    needs: [plan, gate, guard, repo-guard]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.base != ''
     runs-on: ubuntu-latest
     permissions:

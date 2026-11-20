@@ -7,12 +7,21 @@
  * Each rule is a pure function over base and head text, so it is tested without git; `guard` only gathers the files.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { existsSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { parse } from 'yaml';
 import { OpenApiContract, type DocumentedPair } from '../framework/http/openapi.ts';
 import { readProject } from '../framework/project.ts';
 import { impactLoosening, parseUi } from '../framework/ui/config.ts';
+import {
+  GUARDRAILS_FILE,
+  RATCHET_FILE,
+  guardrailsConfigRule,
+  ratchetBaselineRule,
+} from '../packages/guardrails/index.ts';
+import { QUARANTINE_FILE, quarantineGuardRule } from '../packages/verification/flake.ts';
+import { formalGuardRule, type FormalSpecConfig } from '../packages/verification/formal.ts';
+import { writeSignedOrPlainJson } from '../packages/verification/signing.ts';
 import { treeState, type TreeState } from './commit.ts';
 import { CLI, EXIT, UsageError, type Result } from './output.ts';
 
@@ -26,6 +35,9 @@ export type Rule =
   | 'tests-weakened'
   | 'incident-dropped'
   | 'visual-changed'
+  | 'guardrails-loosened'
+  | 'quarantine-added'
+  | 'formal-weakened'
   | 'machinery-changed';
 
 export interface Finding {
@@ -740,6 +752,9 @@ export function testsRule(base: Map<string, string>, head: Map<string, string>):
 export const MACHINERY = [
   // The project's pin to a judge: moving it to another vgate version changes what verifies the MR.
   'vgate.yaml',
+  'guardrails.yaml',
+  '.vgate-ratchet.json',
+  '.vgate-quarantine.yaml',
   // The workflow `vgate init --ci github` installs: a pull request runs its own copy of it.
   '.github/workflows/vgate.yml',
   // A GitLab merge request runs its own pipeline definition too, and either CODEOWNERS file names who approves the
@@ -750,7 +765,11 @@ export const MACHINERY = [
   '.prettierignore',
   'framework/',
   'cli/',
+  'packages/',
+  'skills/',
   '.claude/skills/',
+  '.agents/skills/',
+  '.cursor/skills/',
   'Taskfile.yml',
   'playwright.config.ts',
   'eslint.config.js',
@@ -949,9 +968,13 @@ export interface GuardReport {
   info: Finding[];
 }
 
-export function guard(root: string, options: { service: string; base: string | undefined }): Result {
+export const REPO_GUARD_SERVICE = '_repo';
+
+export function guard(root: string, options: { service?: string; base: string | undefined }): Result {
   if (!options.base)
-    throw new UsageError(`Pass --base <git ref>, e.g. ${CLI} guard --service ${options.service} --base origin/main`);
+    throw new UsageError(
+      `Pass --base <git ref>, e.g. ${CLI} guard ${options.service ? `--service ${options.service} ` : ''}--base origin/main`,
+    );
   const realRoot = realpathSync(root);
   // An earlier report (or one committed with the change) must not outlive a guard that stops before judging: CI would
   // otherwise carry it to vgate decide as this run's answer.
@@ -976,64 +999,83 @@ export function guard(root: string, options: { service: string; base: string | u
   const repo = new Repo(topDir, realRoot, mb.code === 0 ? mb.out.trim() : options.base);
   const project = readProject(realRoot);
   const servicesDir = project.servicesDirName;
-  const svc = `${servicesDir}/${options.service}`;
   const both = (path: string) => [repo.baseFile(path), repo.headFile(path)] as const;
-  const [baseService, headService] = both(`${svc}/service.yaml`);
-  // A service the change deletes is judged against its base (every expectation of it removed). One that exists in
-  // neither is a wrong call: guarding nothing must never read as `auto`.
-  if (baseService === undefined && headService === undefined)
-    throw new UsageError(`Unknown service "${options.service}": no ${svc}/service.yaml at ${options.base} or here`);
-  const contractPath = (text: string | undefined) => {
-    const spec = at(yaml(text), 'spec');
-    return `${svc}/${typeof spec === 'string' ? spec : 'openapi.yaml'}`;
-  };
-  const baseContractPath = contractPath(baseService);
-  const headContractPath = contractPath(headService);
+  const serviceName = options.service ?? REPO_GUARD_SERVICE;
+  const outcomes: RuleOutcome[] = [];
 
-  const sources = (files: string[], read: (path: string) => string | undefined, only = SOURCE) =>
-    new Map(
-      files
-        .filter((path) => only.test(path))
-        .flatMap((path) => {
-          const text = read(path);
-          return text === undefined ? [] : [[path, text] as const];
-        }),
+  if (serviceName !== REPO_GUARD_SERVICE) {
+    const svc = `${servicesDir}/${serviceName}`;
+    const [baseService, headService] = both(`${svc}/service.yaml`);
+    // A service the change deletes is judged against its base (every expectation of it removed). One that exists in
+    // neither is a wrong call: guarding nothing must never read as `auto`.
+    if (baseService === undefined && headService === undefined)
+      throw new UsageError(`Unknown service "${serviceName}": no ${svc}/service.yaml at ${options.base} or here`);
+    const contractPath = (text: string | undefined) => {
+      const spec = at(yaml(text), 'spec');
+      return `${svc}/${typeof spec === 'string' ? spec : 'openapi.yaml'}`;
+    };
+    const baseContractPath = contractPath(baseService);
+    const headContractPath = contractPath(headService);
+
+    const sources = (files: string[], read: (path: string) => string | undefined, only = SOURCE) =>
+      new Map(
+        files
+          .filter((path) => only.test(path))
+          .flatMap((path) => {
+            const text = read(path);
+            return text === undefined ? [] : [[path, text] as const];
+          }),
+      );
+    const baseTests = sources(
+      TEST_DIRS(svc).flatMap((dir) => repo.baseFiles(dir)),
+      (path) => repo.baseFile(path),
     );
-  const baseTests = sources(
-    TEST_DIRS(svc).flatMap((dir) => repo.baseFiles(dir)),
-    (path) => repo.baseFile(path),
-  );
-  const headTests = sources(
-    TEST_DIRS(svc).flatMap((dir) => repo.headFiles(dir)),
-    (path) => repo.headFile(path),
-  );
+    const headTests = sources(
+      TEST_DIRS(svc).flatMap((dir) => repo.headFiles(dir)),
+      (path) => repo.headFile(path),
+    );
 
-  const outcomes = [
-    contractRule(
-      headContractPath,
-      repo.baseFile(baseContractPath),
-      repo.headFile(headContractPath),
-      baseService,
-      headService,
-    ),
-    planRule(`${svc}/inventory.yaml`, ...both(`${svc}/inventory.yaml`)),
-    configRule(`${svc}/service.yaml`, baseService, headService),
-    knownFailuresRule(`${svc}/known-failures.yaml`, ...both(`${svc}/known-failures.yaml`)),
-    incidentsRule(
-      sources(repo.baseFiles(`${svc}/incidents`), (path) => repo.baseFile(path), INCIDENT_FILE),
-      sources(repo.headFiles(`${svc}/incidents`), (path) => repo.headFile(path), INCIDENT_FILE),
-    ),
-    testsRule(baseTests, headTests),
-    uiConfigRule(`${svc}/service.yaml`, baseService, headService),
-    visualRule(repo.baseBlobs(`${svc}/tests`, isBaseline), repo.headBlobs(`${svc}/tests`, isBaseline)),
+    outcomes.push(
+      contractRule(
+        headContractPath,
+        repo.baseFile(baseContractPath),
+        repo.headFile(headContractPath),
+        baseService,
+        headService,
+      ),
+      planRule(`${svc}/inventory.yaml`, ...both(`${svc}/inventory.yaml`)),
+      configRule(`${svc}/service.yaml`, baseService, headService),
+      knownFailuresRule(`${svc}/known-failures.yaml`, ...both(`${svc}/known-failures.yaml`)),
+      incidentsRule(
+        sources(repo.baseFiles(`${svc}/incidents`), (path) => repo.baseFile(path), INCIDENT_FILE),
+        sources(repo.headFiles(`${svc}/incidents`), (path) => repo.headFile(path), INCIDENT_FILE),
+      ),
+      testsRule(baseTests, headTests),
+      uiConfigRule(`${svc}/service.yaml`, baseService, headService),
+      visualRule(repo.baseBlobs(`${svc}/tests`, isBaseline), repo.headBlobs(`${svc}/tests`, isBaseline)),
+    );
+  }
+
+  const parseFormalSpecs = (vgateText: string | undefined): FormalSpecConfig[] => {
+    const raw = yaml(vgateText);
+    return isObject(raw) && Array.isArray(raw.formal) ? (raw.formal as FormalSpecConfig[]) : [];
+  };
+  const [baseVgate, headVgate] = both('vgate.yaml');
+  const formalOutcome = formalGuardRule('vgate.yaml', parseFormalSpecs(baseVgate), parseFormalSpecs(headVgate));
+
+  outcomes.push(
+    guardrailsConfigRule(GUARDRAILS_FILE, ...both(GUARDRAILS_FILE)),
+    ratchetBaselineRule(RATCHET_FILE, ...both(RATCHET_FILE)),
+    quarantineGuardRule(QUARANTINE_FILE, ...both(QUARANTINE_FILE)),
+    formalOutcome,
     machineryRule(repo.changed(), servicesDir),
-  ];
+  );
   const findings = outcomes.flatMap((o) => o.findings);
   const info = outcomes.flatMap((o) => o.info);
   const decision = findings.length === 0 ? 'auto' : 'needs-human';
   const report: GuardReport = {
     schema: 'vgate.guard/1',
-    service: options.service,
+    service: serviceName,
     base: options.base,
     head: treeState(project),
     decision,
@@ -1042,8 +1084,7 @@ export function guard(root: string, options: { service: string; base: string | u
   };
 
   const out = join(project.reportsDir, 'guard.json');
-  mkdirSync(resolve(out, '..'), { recursive: true });
-  writeFileSync(out, `${JSON.stringify(report, null, 2)}\n`);
+  writeSignedOrPlainJson(out, report);
 
   const rules = [...new Set(findings.map((f) => f.rule))];
   const files = [...new Set(findings.map((f) => f.file))];
@@ -1053,8 +1094,8 @@ export function guard(root: string, options: { service: string; base: string | u
     exitCode: decision === 'auto' ? EXIT.ok : EXIT.failed,
     summary:
       decision === 'auto'
-        ? `GUARD auto ${options.service} vs ${options.base}: no expectation weakened (${info.length} additive change${info.length === 1 ? '' : 's'}); a green gate may merge`
-        : `GUARD needs-human ${options.service} vs ${options.base}: ${findings.length} finding${findings.length === 1 ? '' : 's'} (${rules.join(', ')})`,
+        ? `GUARD auto ${serviceName} vs ${options.base}: no expectation weakened (${info.length} additive change${info.length === 1 ? '' : 's'}); a green gate may merge`
+        : `GUARD needs-human ${serviceName} vs ${options.base}: ${findings.length} finding${findings.length === 1 ? '' : 's'} (${rules.join(', ')})`,
     data: report,
     next:
       decision === 'auto'

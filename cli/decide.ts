@@ -28,8 +28,15 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { touchedMigrations } from '../framework/env/migrate.ts';
 import type { Policy, ProjectConfig } from '../framework/project.ts';
+import { GUARDRAILS_FILE, type LintReport } from '../packages/guardrails/index.ts';
+import { buildReviewBundle, type ReviewBundle } from '../packages/verification/artifacts.ts';
+import type { FlakeEvaluation } from '../packages/verification/flake.ts';
+import { canCarryVerdict, computeSemanticPatchId } from '../packages/verification/patch-id.ts';
+import { verifyEvidenceSignature, type SignedEnvelope } from '../packages/verification/signing.ts';
+import { judgeVerifierReport, selectVerifierMode, type VerifierReport } from '../packages/verifier/swarm.ts';
 import { changeSet, computeAffected, serviceMigrationDirs } from './affected.ts';
 import { staleTree, treeState, type TreeState } from './commit.ts';
 import { compatFor, serviceSources, type CompatResult } from './compat.ts';
@@ -114,6 +121,13 @@ export interface MutationCheck {
   }>;
 }
 
+export interface VerifierCheck {
+  state: 'pass' | 'pass-notes' | 'fail' | 'missing' | 'not-required';
+  reasons: string[];
+  mode?: VerifierReport['mode'];
+  lanes?: number;
+}
+
 export interface Decision {
   schema: 'vgate.decision/1';
   decision: DecisionKind;
@@ -121,6 +135,7 @@ export interface Decision {
   base: string;
   mergeBase: string;
   head: string;
+  patchId?: string | null;
   policy: Policy;
   risk: RiskReport;
   services: ServiceDecision[];
@@ -128,6 +143,14 @@ export interface Decision {
   migrations: MigrationCheck[];
   /** Absent in decisions written before `vgate mutate` existed. */
   mutation?: MutationCheck[];
+  /** Independent live-app verifier result stacked fail-closed over deterministic gates. */
+  verifier?: VerifierCheck;
+  /** Flake policy evaluation when live-app flake telemetry is present. */
+  flake?: FlakeEvaluation;
+  /** Codebase guardrails lint report when present in evidence. */
+  lint?: { ok: boolean; violations: number; baselined: number };
+  /** Artifact-first review gallery metadata. */
+  reviewBundle?: { file: string; artifacts: number };
   knownFailures: Array<KnownFailureHit & { service: string }>;
   changedFiles: number;
   detailsUrl?: string;
@@ -136,10 +159,14 @@ export interface Decision {
 }
 
 interface Evidence {
-  verdicts: Map<string, Verdict & { file: string }>;
+  verdicts: Map<string, Verdict & { file: string; patchId?: string | null }>;
   migrations: Map<string, MigrationsReport & { file: string }>;
   mutation: Map<string, MutationReport & { file: string }>;
   guards: Map<string, Array<GuardReport & { file: string }>>;
+  verifier?: VerifierReport & { file: string };
+  flake?: FlakeEvaluation & { file: string };
+  lint?: LintReport & { file: string };
+  signatureErrors: string[];
   read: string[];
   ignored: string[];
 }
@@ -149,8 +176,55 @@ function walk(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) return entry.name === 'node_modules' || entry.name === '.git' ? [] : walk(path);
-    return ['verdict.json', 'guard.json', 'migrations.json', 'mutation.json'].includes(entry.name) ? [path] : [];
+    return [
+      'verdict.json',
+      'guard.json',
+      'migrations.json',
+      'mutation.json',
+      'verifier.json',
+      'flake.json',
+      'lint.json',
+    ].includes(entry.name)
+      ? [path]
+      : [];
   });
+}
+
+const FLAKE_RANK: Record<FlakeEvaluation['outcome'], number> = {
+  pass: 0,
+  quarantined: 1,
+  'flaky-passed': 2,
+  inconclusive: 3,
+  fail: 4,
+};
+
+function unwrapSignedEvidence(
+  raw: Record<string, unknown>,
+  verifyKey: string | undefined,
+  shown: string,
+): { data?: Record<string, unknown>; sigError?: string } {
+  const isEnvelope =
+    raw.payload !== undefined &&
+    typeof raw.payload === 'object' &&
+    raw.payload !== null &&
+    raw.signature !== undefined &&
+    typeof raw.signature === 'object';
+  if (isEnvelope) {
+    if (!verifyKey) {
+      return { sigError: `${shown}: signed evidence present but no VGATE_SIGNING key configured to verify it` };
+    }
+    const check = verifyEvidenceSignature(raw as unknown as SignedEnvelope<unknown>, {
+      key: verifyKey,
+      expectedIssuer: process.env.VGATE_EXPECTED_OIDC_ISSUER,
+      expectedRepository: process.env.VGATE_EXPECTED_OIDC_REPO,
+    });
+    if (!check.ok) return { sigError: `${shown}: ${check.reason ?? 'signature verification failed'}` };
+    return { data: raw.payload as Record<string, unknown> };
+  }
+  if (verifyKey) {
+    return { sigError: `${shown}: unsigned evidence rejected (VGATE_SIGNING key is configured)` };
+  }
+  return { data: raw };
 }
 
 /**
@@ -159,21 +233,53 @@ function walk(dir: string): string[] {
  * gives itself, cannot hide a failure.
  */
 export function readEvidence(dir: string, cwd: string): Evidence {
+  const verifyKey = process.env.VGATE_SIGNING_PUBLIC_KEY ?? process.env.VGATE_SIGNING_KEY;
   const evidence: Evidence = {
     verdicts: new Map(),
     guards: new Map(),
     migrations: new Map(),
     mutation: new Map(),
+    signatureErrors: [],
     read: [],
     ignored: [],
   };
   for (const file of walk(dir).sort()) {
     const shown = relative(cwd, file) || file;
-    let data: Record<string, unknown>;
+    let raw: Record<string, unknown>;
     try {
-      data = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+      raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
     } catch {
       evidence.ignored.push(`${shown} (not JSON)`);
+      continue;
+    }
+    const unwrapped = unwrapSignedEvidence(raw, verifyKey, shown);
+    if (unwrapped.sigError) {
+      evidence.signatureErrors.push(unwrapped.sigError);
+      evidence.ignored.push(unwrapped.sigError);
+      continue;
+    }
+    const data = unwrapped.data!;
+    if (data.schema === 'vgate.verifier/1') {
+      const report = { ...(data as unknown as VerifierReport), file };
+      // Fail-closed: FAIL wins over PASS+NOTES which wins over PASS.
+      const rank = (v: VerifierReport['verdict']) => (v === 'FAIL' ? 2 : v === 'PASS+NOTES' ? 1 : 0);
+      if (!evidence.verifier || rank(report.verdict) >= rank(evidence.verifier.verdict)) evidence.verifier = report;
+      evidence.read.push(shown);
+      continue;
+    }
+    if (data.schema === 'vgate.flake/1') {
+      const report = { ...(data as unknown as FlakeEvaluation), file };
+      // Fail-closed: worst outcome wins (fail > inconclusive > flaky-passed > quarantined > pass).
+      if (!evidence.flake || (FLAKE_RANK[report.outcome] ?? 4) >= (FLAKE_RANK[evidence.flake.outcome] ?? 0)) {
+        evidence.flake = report;
+      }
+      evidence.read.push(shown);
+      continue;
+    }
+    if (data.schema === 'vgate.lint/1') {
+      const report = { ...(data as unknown as LintReport), file };
+      if (!evidence.lint || !report.ok) evidence.lint = report;
+      evidence.read.push(shown);
       continue;
     }
     if (typeof data.service !== 'string' || data.service === '') {
@@ -181,7 +287,7 @@ export function readEvidence(dir: string, cwd: string): Evidence {
       continue;
     }
     if (data.schema === 'vgate.verdict/1') {
-      const verdict = { ...(data as unknown as Verdict), file };
+      const verdict = { ...(data as unknown as Verdict & { patchId?: string | null }), file };
       const previous = evidence.verdicts.get(verdict.service);
       const passed = (v: Verdict) => v.complete === true && v.verdict === 'pass';
       if (
@@ -325,16 +431,27 @@ function staleExpectation(verdict: Verdict, root: string): string | undefined {
 }
 
 function judgeGate(
-  verdict: (Verdict & { file: string }) | undefined,
+  verdict: (Verdict & { file: string; patchId?: string | null }) | undefined,
   root: string,
   now: TreeState,
+  currentPatchId?: string | null,
 ): Pick<ServiceDecision, 'gate' | 'gateDetail'> {
   if (!verdict) return { gate: 'missing', gateDetail: 'no gate verdict in the evidence' };
   const stale = staleExpectation(verdict, root);
   if (stale) return { gate: 'missing', gateDetail: `the verdict is stale: ${stale}` };
-  // A verdict from another commit (an earlier push, another branch) or a tree edited since says nothing about this one.
+  // A verdict from another commit (an earlier push, another branch) or a tree edited since says nothing about this one,
+  // unless BOTH trees are clean (no uncommitted edits) and the semantic Patch-ID matches across a clean rebase.
   const otherTree = staleTree(verdict.commit, now);
-  if (otherTree) return { gate: 'missing', gateDetail: `the verdict is stale: ${otherTree}` };
+  if (otherTree) {
+    const cleanRebase = !now.dirty && verdict.commit?.dirty !== true;
+    const carry = cleanRebase
+      ? canCarryVerdict(
+          { patchId: verdict.patchId, hasBuildOutputs: verdict.build !== undefined },
+          { patchId: currentPatchId },
+        )
+      : { carry: false, reason: 'uncommitted changes prevent patch-id carry' };
+    if (!carry.carry) return { gate: 'missing', gateDetail: `the verdict is stale: ${otherTree}` };
+  }
   if (!verdict.complete)
     return { gate: 'missing', gateDetail: `partial run (${verdict.steps.map((s) => s.name).join(', ')} only)` };
   if (verdict.verdict !== 'pass') {
@@ -407,6 +524,10 @@ export function decideFrom(input: {
   deploy?: DeploySafety;
   migrations?: MigrationCheck[];
   mutation?: MutationCheck[];
+  verifier?: VerifierCheck;
+  flake?: FlakeEvaluation;
+  lint?: { ok: boolean; violations: number };
+  signatureErrors?: string[];
 }): { decision: DecisionKind; reasons: string[] } {
   const reasons: string[] = [];
   const affected = input.services.filter((s) => s.change === 'affected');
@@ -414,14 +535,28 @@ export function decideFrom(input: {
   const checks = input.deploy?.checks ?? [];
   const block = input.deploy?.breakingPolicy === 'block';
   const blocked = [
+    ...(input.signatureErrors ?? []),
+    ...(input.lint && !input.lint.ok ? [`guardrails lint failed (${input.lint.violations} violation(s))`] : []),
     ...notGreen.map((s) => `${s.name}: gate ${s.gate === 'fail' ? 'failed' : 'evidence missing'} (${s.gateDetail})`),
     // Deploying would fail: the code needs a setting the environment does not have.
     ...checks.filter((c) => c.config.state === 'missing').map((c) => describeMissing(c.service, c.config)),
     ...(block ? checks.filter((c) => c.compat.state === 'breaking').map((c) => breakingReason(c)) : []),
     // A migration that does not apply, cannot be undone or breaks the running version; or one nobody verified.
     ...(input.migrations ?? []).filter((m) => m.state === 'blocked' || m.state === 'missing').flatMap((m) => m.reasons),
+    // Stacked fail-closed AI verifier: FAIL or missing required verifier blocks; PASS can never override red gates.
+    ...(input.verifier && (input.verifier.state === 'fail' || input.verifier.state === 'missing')
+      ? input.verifier.reasons
+      : []),
+    ...(input.flake && input.flake.outcome === 'fail' ? input.flake.reasons : []),
   ];
   if (blocked.length > 0) return { decision: 'blocked', reasons: blocked };
+  if (input.verifier && input.verifier.state === 'pass-notes') reasons.push(...input.verifier.reasons);
+  if (input.flake && input.flake.outcome === 'inconclusive')
+    reasons.push(
+      ...(input.flake.reasons.length > 0
+        ? input.flake.reasons
+        : ['live-app verification was inconclusive due to unquarantined flaky test(s)']),
+    );
   for (const c of checks) {
     if (c.compat.state === 'breaking') reasons.push(breakingReason(c));
     if (c.compat.state === 'unknown')
@@ -454,6 +589,12 @@ export function decideFrom(input: {
   if (judge.length > 0)
     reasons.push(
       `the change edits the files that decide how changes are judged (${judge.slice(0, 3).join(', ')}${judge.length > 3 ? ` +${judge.length - 3}` : ''}): a person approves this whatever policy.autoMerge says`,
+    );
+  // Taste vs. Mechanical boundary: user-facing UX/UI changes always require human taste & dogfooding approval.
+  const uxFiles = input.risk.matches.filter((m) => m.ux).map((m) => m.file);
+  if (uxFiles.length > 0)
+    reasons.push(
+      `the change touches user-facing UX/UI files (${uxFiles.slice(0, 3).join(', ')}${uxFiles.length > 3 ? ` +${uxFiles.length - 3}` : ''}): requires human taste and dogfooding approval`,
     );
   if (tierAbove(input.risk.tier, input.policy.autoMerge))
     reasons.push(
@@ -617,6 +758,22 @@ export function renderMarkdown(d: Decision): string {
   lines.push(...renderDeploy(d.deploy));
   lines.push(...renderMigrations(d.migrations ?? []));
   lines.push(...renderMutation(d.mutation ?? [], d.policy.mutationScore));
+  if (d.lint) {
+    lines.push(
+      `**Guardrails lint**: ${d.lint.ok ? '✅ pass' : `❌ fail (${d.lint.violations} violation(s))`} (${d.lint.baselined} baselined)`,
+      '',
+    );
+  }
+  if (d.verifier && d.verifier.state !== 'not-required') {
+    const icon = d.verifier.state === 'pass' ? '✅' : d.verifier.state === 'pass-notes' ? '🟡' : '❌';
+    lines.push(
+      `**Independent verifier**: ${icon} ${mdText(d.verifier.state)}${d.verifier.mode ? ` (${mdText(d.verifier.mode)}, ${d.verifier.lanes ?? 0} lane(s))` : ''}`,
+      '',
+    );
+  }
+  if (d.flake && d.flake.outcome !== 'pass') {
+    lines.push(`**Flake policy**: ${mdText(d.flake.outcome)}`, '');
+  }
   for (const s of d.services.filter((x) => x.failures.length > 0 || (x.gate !== 'pass' && x.gateDetail))) {
     lines.push(`**${mdText(s.name)}: what failed**`, '');
     if (s.gateDetail) lines.push(`- ${mdText(s.gateDetail)}`);
@@ -704,11 +861,60 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
   for (const file of [jsonFile, mdFile]) rmSync(file, { force: true });
   const change = changeSet(project, options.base);
   if ('result' in change) return { ...change.result, command: 'decide' };
+  // Security invariant: read trunk's vgate.yaml & guardrails.yaml presence from change.mergeBase when judging a PR so
+  // PR edits to vgate.yaml or deleting guardrails.yaml cannot downgrade hard-blocked gates into needs-approval.
+  const relProject = relative(change.top, realpathSync(project.root)).split('\\').join('/');
+  const projectPrefix = relProject === '' ? '' : `${relProject}/`;
+  const trunkVgateRun = git(change.top, ['show', `${change.mergeBase}:${projectPrefix}vgate.yaml`]);
+  const trunkVgate =
+    trunkVgateRun.code === 0
+      ? (() => {
+          try {
+            const parsed: unknown = parseYaml(trunkVgateRun.out);
+            return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+              ? (parsed as Record<string, unknown>)
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        })()
+      : undefined;
+  const effectivePolicy: Policy = (() => {
+    const tp = trunkVgate?.policy;
+    if (tp && typeof tp === 'object' && !Array.isArray(tp)) {
+      const r = tp as Record<string, unknown>;
+      const am = r.autoMerge;
+      const autoMerge: Policy['autoMerge'] =
+        am === 'none' || am === 'low' || am === 'medium' || am === 'high' ? am : project.policy.autoMerge;
+      const ms = typeof r.mutationScore === 'number' ? r.mutationScore : project.policy.mutationScore;
+      return { autoMerge, ...(ms !== undefined ? { mutationScore: ms } : {}) };
+    }
+    return project.policy;
+  })();
+  const effectiveUxPaths =
+    Array.isArray(trunkVgate?.uxPaths) && trunkVgate.uxPaths.every((p): p is string => typeof p === 'string')
+      ? trunkVgate.uxPaths
+      : project.uxPaths;
+  const trunkVerifier =
+    trunkVgate?.verifier && typeof trunkVgate.verifier === 'object' && !Array.isArray(trunkVgate.verifier)
+      ? (trunkVgate.verifier as Record<string, unknown>)
+      : undefined;
+  const effectiveVerifierRequired =
+    typeof trunkVerifier?.required === 'boolean' ? trunkVerifier.required : project.verifier?.required === true;
+  const effectiveWordingGlobs =
+    Array.isArray(trunkVerifier?.wordingOnlyGlobs) &&
+    trunkVerifier.wordingOnlyGlobs.every((g): g is string => typeof g === 'string')
+      ? trunkVerifier.wordingOnlyGlobs
+      : project.verifier?.wordingOnlyGlobs;
+  const guardrailsOnTrunk =
+    git(change.top, ['cat-file', '-e', `${change.mergeBase}:${projectPrefix}${GUARDRAILS_FILE}`]).code === 0;
+
   const affected = computeAffected(project, change);
-  const risk = assessRisk(change.files, project.risk);
+  const risk = assessRisk(change.files, project.risk, effectiveUxPaths);
   const evidence = readEvidence(evidenceDir, process.cwd());
   // The tree this decision is about; the evidence directory is vgate's own input, not part of the change.
   const now = treeState(project, [evidenceDir]);
+  const semanticPatch = computeSemanticPatchId(change.top, change.mergeBase);
 
   const services: ServiceDecision[] = [
     ...affected.services.map(({ name }) => ({ name, change: 'affected' as const })),
@@ -718,7 +924,7 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     const gate =
       kind === 'deleted'
         ? { gate: 'missing' as const, gateDetail: 'deleted: nothing to run' }
-        : judgeGate(verdict, project.root, now);
+        : judgeGate(verdict, project.root, now, semanticPatch.patchId);
     const usable = gate.gate !== 'missing' ? verdict : undefined;
     return {
       name,
@@ -737,6 +943,21 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
       knownFailures: usable?.tests?.knownFailures ?? [],
     };
   });
+
+  const repoGuardReports = evidence.guards.get('_repo');
+  if (repoGuardReports && repoGuardReports.length > 0) {
+    const repoJudged = judgeGuard(repoGuardReports, change.top, change.base, now);
+    if (repoJudged.guard !== 'auto') {
+      services.push({
+        name: '_repo',
+        change: 'affected',
+        gate: 'pass',
+        ...repoJudged,
+        failures: [],
+        knownFailures: [],
+      });
+    }
+  }
 
   const deploy = await deploySafety(
     project,
@@ -765,17 +986,60 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     if (sources.length > 0)
       mutation.push(judgeMutation(name, report, change.mergeBase, now, project.policy.mutationScore));
   }
+  const verifierRequired = effectiveVerifierRequired;
+  const allowSkip =
+    selectVerifierMode({
+      changedFiles: change.files,
+      wordingOnlyGlobs: effectiveWordingGlobs,
+    }).mode === 'skip';
+  const verifierJudged =
+    verifierRequired || evidence.verifier
+      ? {
+          ...judgeVerifierReport(evidence.verifier, now.sha, semanticPatch.patchId, verifierRequired, {
+            allowSkip,
+            expectedTreeFingerprint: now.fingerprint,
+          }),
+          mode: evidence.verifier?.mode,
+          lanes: evidence.verifier?.lanes.length,
+        }
+      : undefined;
+  const guardrailsConfigured = guardrailsOnTrunk || existsSync(join(project.root, GUARDRAILS_FILE));
+  const lintSummary = evidence.lint
+    ? {
+        ok: evidence.lint.ok,
+        violations: evidence.lint.violations.filter((v) => v.severity === 'error').length,
+        baselined: evidence.lint.baselined,
+      }
+    : guardrailsConfigured
+      ? { ok: false, violations: 1, baselined: 0 }
+      : undefined;
+  const extraBlockers =
+    guardrailsConfigured && !evidence.lint
+      ? [`${GUARDRAILS_FILE} is configured, but lint evidence (lint.json) is missing: run ${CLI} lint`]
+      : [];
+
   const { decision, reasons } = decideFrom({
     affected: affected.services.map((s) => s.name),
     risk,
-    policy: project.policy,
+    policy: effectivePolicy,
     services,
     deploy,
     migrations,
     mutation,
+    verifier: verifierJudged,
+    flake: evidence.flake,
+    lint: lintSummary,
+    signatureErrors: [...evidence.signatureErrors, ...extraBlockers],
   });
   const headSha = git(change.top, ['rev-parse', '--short', 'HEAD']).out.trim() || 'unknown';
   const dirty = git(change.top, ['status', '--porcelain']).out.trim() !== '';
+
+  // Artifact-first review bundle (screenshots, videos, traces, statecharts, benchmarks, verifier receipts).
+  const bundle: ReviewBundle = buildReviewBundle(evidenceDir);
+  const bundleFile = join(project.reportsDir, 'review-bundle.json');
+  mkdirSync(project.reportsDir, { recursive: true });
+  writeFileSync(bundleFile, `${JSON.stringify(bundle, null, 2)}\n`);
+
   const result: Decision = {
     schema: 'vgate.decision/1',
     decision,
@@ -783,21 +1047,27 @@ export async function decide(project: ProjectConfig, options: DecideOptions): Pr
     base: change.base,
     mergeBase: change.mergeBase,
     head: dirty ? `${headSha}+uncommitted` : headSha,
+    patchId: semanticPatch.patchId,
     policy: project.policy,
     risk,
     services,
     deploy,
     migrations,
     mutation,
+    ...(verifierJudged ? { verifier: verifierJudged } : {}),
+    ...(evidence.flake ? { flake: evidence.flake } : {}),
+    ...(lintSummary ? { lint: lintSummary } : {}),
+    reviewBundle: { file: relative(project.root, bundleFile) || bundleFile, artifacts: bundle.artifacts.length },
     knownFailures: services.flatMap((s) => s.knownFailures.map((k) => ({ ...k, service: s.name }))),
     changedFiles: change.files.length,
     detailsUrl: options.detailsUrl,
     evidence: { read: evidence.read, ignored: evidence.ignored },
   };
 
-  mkdirSync(project.reportsDir, { recursive: true });
   writeFileSync(jsonFile, `${JSON.stringify(result, null, 2)}\n`);
-  writeFileSync(mdFile, renderMarkdown(result));
+  const rendered =
+    bundle.artifacts.length > 0 ? `${renderMarkdown(result)}\n${bundle.markdown}\n` : renderMarkdown(result);
+  writeFileSync(mdFile, rendered);
 
   const blockedOn = services.filter((s) => s.change === 'affected' && s.gate !== 'pass').map((s) => s.name);
   return {

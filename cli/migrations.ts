@@ -28,6 +28,7 @@ import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { stringify } from 'yaml';
+import { writeSignedOrPlainJson } from '../packages/verification/signing.ts';
 import { loadService, type ServiceConfig } from '../framework/config.ts';
 import { runLabels, runMigration, statePath, type EnvState } from '../framework/env/lifecycle.ts';
 import { kindOf } from '../framework/env/catalog/index.ts';
@@ -326,8 +327,7 @@ export async function migrations(
   };
   const finish = (): Result => {
     report.durationMs = Date.now() - started;
-    mkdirSync(project.reportsDir, { recursive: true });
-    writeFileSync(outFile, `${JSON.stringify(report, null, 2)}\n`);
+    writeSignedOrPlainJson(outFile, report);
     return toResult(report, relative(process.cwd(), outFile) || outFile);
   };
   if (configs.length === 0) {
