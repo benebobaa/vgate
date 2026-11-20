@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { parseEnvironment } from './declare.ts';
 import { plan, type PlanInput } from './generate.ts';
-import { appImageName, contextHash, projectsFromListing, runLabels, splitSetup, supersededTags } from './lifecycle.ts';
+import {
+  appImageName,
+  contextHash,
+  processName,
+  projectsFromListing,
+  runLabels,
+  splitSetup,
+  supersededTags,
+} from './lifecycle.ts';
 
 const temps: string[] = [];
 after(() => temps.forEach((dir) => rmSync(dir, { recursive: true, force: true })));
@@ -182,5 +190,46 @@ describe('migrations of a dependency (migrate:)', () => {
     const seed = ['psql', '-f', 'seed.sql'];
     assert.deepEqual(splitSetup([ready, seed], true), { before: [ready], after: [seed] });
     assert.deepEqual(splitSetup([ready, seed], false), { before: [ready, seed], after: [] });
+  });
+});
+
+describe('processName (framework/env/lifecycle.ts)', () => {
+  it('prefers /proc/<pid>/exe over the thread name from ps comm (Node 24 MainThread on Linux)', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'vgate-proc-'));
+    temps.push(procRoot);
+    mkdirSync(join(procRoot, '4242'));
+    symlinkSync('/home/user/.nvm/versions/node/v24.22.1/bin/node', join(procRoot, '4242', 'exe'));
+    assert.equal(
+      processName(4242, procRoot, () => 'MainThread\n'),
+      'node',
+    );
+  });
+
+  it('strips the Linux (deleted) suffix from /proc/<pid>/exe', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'vgate-proc-'));
+    temps.push(procRoot);
+    mkdirSync(join(procRoot, '4243'));
+    symlinkSync('/tmp/build/my-api (deleted)', join(procRoot, '4243', 'exe'));
+    assert.equal(
+      processName(4243, procRoot, () => 'MainThread\n'),
+      'my-api',
+    );
+  });
+
+  it('falls back to the basename of ps comm when /proc/<pid>/exe is unavailable', () => {
+    const missing = join(tmpdir(), 'vgate-proc-nonexistent');
+    assert.equal(
+      processName(4244, missing, () => '  /opt/homebrew/bin/node  \n'),
+      'node',
+    );
+    assert.equal(
+      processName(4245, missing, () => ''),
+      '',
+    );
+  });
+
+  it('names the current node process through its default proc/ps lookup', () => {
+    const expected = basename(process.platform === 'linux' ? realpathSync(process.execPath) : process.execPath);
+    assert.equal(processName(process.pid), expected);
   });
 });
