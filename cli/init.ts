@@ -251,6 +251,8 @@ export function applyPlanned(root: string, planned: Planned, force: boolean): Ou
 export interface InitOptions {
   service?: string;
   ci?: string;
+  agents?: string;
+  packs?: string;
   force: boolean;
 }
 
@@ -281,8 +283,20 @@ export function init(target: string, runtime: Runtime, options: InitOptions): Re
   });
   const files = plan.map((planned) => ({ path: planned.path, result: applyPlanned(root, planned, options.force) }));
 
-  const installed = skills({ action: 'install', names: [], dir: join(root, '.claude', 'skills'), dryRun: false });
-  const skillRows = (installed.data as { skills: Array<{ skill: string; result: string }> }).skills;
+  const installed = skills({
+    action: 'install',
+    names: [],
+    dir: join(root, '.claude', 'skills'),
+    agents: options.agents,
+    packs: options.packs,
+    root,
+    dryRun: false,
+  });
+  const installedData = installed.data as {
+    skills?: Array<{ skill: string; result: string }>;
+    projected?: Array<{ skill: string; result: string }>;
+  };
+  const skillRows = installedData.skills ?? installedData.projected ?? [];
 
   const skipped = files.filter((file) => file.result === 'skipped');
   const notes: string[] = [];

@@ -93,8 +93,8 @@ export default defineConfig(
     },
   },
   {
-    // The framework's and the CLI's own tests (node:test): describe/it return promises the runner awaits itself.
-    files: ['framework/**/*.test.ts', 'cli/**/*.test.ts'],
+    // The framework's, CLI's and packages' own tests (node:test): describe/it return promises the runner awaits itself.
+    files: ['framework/**/*.test.ts', 'cli/**/*.test.ts', 'packages/**/*.test.ts'],
     rules: {
       '@typescript-eslint/no-floating-promises': [
         'error',

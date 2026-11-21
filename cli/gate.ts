@@ -4,16 +4,7 @@
  * responses are still unreached, and where the evidence is. The same verdict is written to reports/verdict.json.
  */
 import { createHash } from 'node:crypto';
-import {
-  createWriteStream,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { loadService, type ServiceConfig } from '../framework/config.ts';
 import type { ProjectConfig } from '../framework/project.ts';
@@ -26,6 +17,7 @@ import { prepare, stepEnv, type Runtime } from './runtime.ts';
 import { runStreamed } from './stack.ts';
 import { envOutbound, type Outbound } from '../framework/env/lifecycle.ts';
 import type { UiFindings } from '../framework/ui/fixtures.ts';
+import { writeSignedOrPlainJson } from '../packages/verification/index.ts';
 
 export const STEPS = ['selftest', 'typecheck', 'lint', 'test', 'contract', 'coverage'] as const;
 export type Step = (typeof STEPS)[number];
@@ -414,6 +406,15 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
   // RUN_ID left in the caller's environment would let coverage count calls from an earlier run.
   // Short, like the Taskfile's own: it becomes part of generated usernames, which have length caps.
   const runId = Date.now().toString(36).slice(-6);
+  // Strip judge/control-plane signing & autonomy secrets before running untrusted PR tests / stack.sh.
+  const childBaseEnv: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (/^(VGATE_SIGNING_|VGATE_ALLOW_AUTONOMY$|VGATE_OIDC_|VGATE_FACTORY_TOKEN$|VGATE_WEBHOOK_SECRET)/i.test(k)) {
+      continue;
+    }
+    childBaseEnv[k] = v;
+  }
+
   // Every step runs, even after a failure: the caller gets the whole picture from one run.
   for (const name of steps) {
     const logFile = join(logDir, `${name}.log`);
@@ -424,7 +425,7 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
       ['--taskfile', join(runtime.root, 'Taskfile.yml'), name, `SERVICE=${service}`, `TEST_ENV=${env}`],
       {
         cwd: runtime.root,
-        env: { ...process.env, ...stepEnv(project, runtime), SERVICE: service, TEST_ENV: env, RUN_ID: runId },
+        env: { ...childBaseEnv, ...stepEnv(project, runtime), SERVICE: service, TEST_ENV: env, RUN_ID: runId },
         live: options.live,
         log,
       },
@@ -497,7 +498,7 @@ export async function gate(project: ProjectConfig, runtime: Runtime, options: Ga
       verdict: shown(join(reports, 'verdict.json')),
     },
   };
-  writeFileSync(join(reports, 'verdict.json'), `${JSON.stringify(verdict, null, 2)}\n`);
+  writeSignedOrPlainJson(join(reports, 'verdict.json'), verdict);
 
   const next = failed.length === 0 ? [] : [`${CLI} gate --service ${service} --steps ${failed.join(',')}`];
   // The summary names the hosts; the fix is in the app's configuration, after which the gate runs again.

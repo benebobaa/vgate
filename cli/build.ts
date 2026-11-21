@@ -55,9 +55,12 @@ function run(command: string, argv: string[], cwd = root): void {
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version: string };
 if (!VERSION_PATTERN.test(version)) die(`package.json version "${version}" is not semver (x.y.z[-pre])`);
 
-const skills = readSkills(join(root, '.claude', 'skills'));
+const skills = {
+  ...readSkills(join(root, '.claude', 'skills')),
+  ...readSkills(join(root, 'skills')),
+};
 if (Object.keys(skills).length === 0)
-  die('No skills under .claude/skills: refusing to build a binary that carries none');
+  die('No skills under .claude/skills or skills/: refusing to build a binary that carries none');
 
 async function extraConstants(): Promise<Record<string, string>> {
   const file = join(root, 'cli', 'runtime.ts');

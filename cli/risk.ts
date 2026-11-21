@@ -16,10 +16,30 @@ import { EXIT, type Result } from './output.ts';
  */
 export const JUDGE_RISK: RiskRule[] = [
   { tier: 'high', path: '**/vgate.yaml', reason: 'the vgate pin, policy and risk rules' },
+  { tier: 'high', path: '**/guardrails.yaml', reason: 'codebase guardrails and architectural boundaries' },
+  { tier: 'high', path: '**/.vgate-ratchet.json', reason: 'brownfield guardrail ratchet baseline' },
+  { tier: 'high', path: '**/.vgate-quarantine.yaml', reason: 'expiring flaky-test quarantine ledger' },
   { tier: 'high', path: '**/known-failures.yaml', reason: 'failures the gate tolerates' },
   { tier: 'high', path: '.github/workflows/**', reason: 'CI: a pull request runs its own copy' },
   { tier: 'high', path: '.gitlab-ci.yml', reason: 'CI: a merge request runs its own copy' },
   { tier: 'high', path: '{.github/,.gitlab/,docs/,}CODEOWNERS', reason: 'who must approve what' },
+  {
+    tier: 'high',
+    path: '{.agents,.claude,.cursor}/skills/**',
+    reason: 'agent skills that guide verification and delivery',
+  },
+  { tier: 'high', path: '.cursor/rules/**', reason: 'agent instruction rules' },
+  { tier: 'high', path: 'skills/**', reason: 'canonical agent skills' },
+  { tier: 'high', path: '**/{AGENTS,CLAUDE}.md', reason: 'agent instruction and rule table file' },
+];
+
+/**
+ * Taste vs. Mechanical boundary: user-facing UI/UX files always require human taste & dogfooding review even when
+ * deterministic checks pass, preventing autonomous changes from drifting into a fragmented UX.
+ */
+export const DEFAULT_UX_PATHS: readonly string[] = [
+  '**/{components,pages,views,screens,layouts,design-system}/**',
+  '**/*.{tsx,jsx,vue,svelte,css,scss,less}',
 ];
 
 /**
@@ -84,6 +104,8 @@ export interface RiskMatch {
   reason?: string;
   /** Matched a JUDGE_RISK rule: the change edits what judges it, which no policy lets merge alone. */
   judge?: true;
+  /** Matched a user-facing UX/UI surface path: requires human taste & dogfooding review. */
+  ux?: true;
 }
 
 export interface RiskReport {
@@ -103,24 +125,27 @@ export function tierAbove(tier: RiskTier, limit: 'none' | RiskTier): boolean {
 }
 
 /** The tier of each file (judge rules first, then the project's or the built-in rules) and of the whole change. */
-export function assessRisk(files: string[], rules: RiskRule[] | undefined): RiskReport {
+export function assessRisk(files: string[], rules: RiskRule[] | undefined, uxPaths?: readonly string[]): RiskReport {
   const ordered = [...JUDGE_RISK, ...(rules ?? DEFAULT_RISK)];
+  const uxGlobs = uxPaths ?? DEFAULT_UX_PATHS;
   let tier: RiskTier = 'low';
   const matches: RiskMatch[] = [];
   let low = 0;
   for (const file of files) {
     const rule = ordered.find((candidate) => matchesGlob(file, candidate.path));
-    const fileTier = rule?.tier ?? 'low';
-    if (fileTier === 'low' || !rule) {
+    const isUx = uxGlobs.some((glob) => matchesGlob(file, glob));
+    const fileTier: RiskTier = rule?.tier ?? (isUx ? 'medium' : 'low');
+    if (fileTier === 'low' && !isUx) {
       low++;
       continue;
     }
     matches.push({
       file,
       tier: fileTier,
-      rule: rule.path,
-      reason: rule.reason,
-      ...(JUDGE_RISK.includes(rule) ? { judge: true as const } : {}),
+      rule: rule?.path ?? uxGlobs.find((glob) => matchesGlob(file, glob)) ?? 'ux-surface',
+      reason: rule?.reason ?? (isUx ? 'user-facing UX/UI surface (requires human taste review)' : undefined),
+      ...(rule && JUDGE_RISK.includes(rule) ? { judge: true as const } : {}),
+      ...(isUx ? { ux: true as const } : {}),
     });
     if (RANK[fileTier] > RANK[tier]) tier = fileTier;
   }
@@ -131,7 +156,7 @@ export function assessRisk(files: string[], rules: RiskRule[] | undefined): Risk
 export function risk(project: ProjectConfig, base: string | undefined): Result {
   const change = changeSet(project, base);
   if ('result' in change) return { ...change.result, command: 'risk' };
-  const report = assessRisk(change.files, project.risk);
+  const report = assessRisk(change.files, project.risk, project.uxPaths);
   const counts = (['high', 'medium'] as const).map((t) => `${report.matches.filter((m) => m.tier === t).length} ${t}`);
   return {
     command: 'risk',

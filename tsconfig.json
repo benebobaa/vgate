@@ -18,6 +18,7 @@
   "include": [
     "framework",
     "cli",
+    "packages",
     "scripts",
     "services/*/*.ts",
     "services/*/app/*.ts",

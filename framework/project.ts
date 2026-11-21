@@ -28,6 +28,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
+import type { CustomRunnerConfig } from '../packages/adapters/runner.ts';
+import type { FlakePolicy } from '../packages/verification/flake.ts';
+import type { FormalSpecConfig } from '../packages/verification/formal.ts';
+import type { BudgetLimits } from '../packages/verifier/budget.ts';
+import { parseRolesConfig, type RolesConfig } from '../packages/verifier/roles.ts';
 
 export const PROJECT_FILE = 'vgate.yaml';
 
@@ -165,6 +170,28 @@ function parseDeploy(value: unknown, file: string): DeployConfig | undefined {
 /** The directory that holds the framework, its configs and its node_modules. */
 export const runtimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+export interface VerifierSettings {
+  required?: boolean;
+  /** Number of independent live-app verifiers; defaults to 1. */
+  verifiers?: number;
+  mode?: 'auto' | 'full' | 'single' | 'skip';
+  wordingOnlyGlobs?: string[];
+}
+
+export interface AgentsSettings {
+  harnesses?: string[];
+  packs?: string[];
+  runners?: Record<string, CustomRunnerConfig>;
+}
+
+export interface FactorySettings {
+  sandbox?: 'docker' | 'local-worktree' | 'ci-runner' | 'custom';
+  host?: string;
+  port?: number;
+  defaultDenyEgress?: boolean;
+  egressAllowlist?: string[];
+}
+
 export interface ProjectConfig {
   /** Absolute path of the project (the directory of vgate.yaml). */
   root: string;
@@ -186,6 +213,22 @@ export interface ProjectConfig {
   deploy?: DeployConfig;
   /** `mutation:` with its defaults (absent in hand-built configs: use DEFAULT_MUTATION). */
   mutation?: MutationSettings;
+  /** Optional vendor-agnostic agent harness/runner settings. */
+  agents?: AgentsSettings;
+  /** Optional cross-vendor role assignments for author/verifier/coordinator separation. */
+  roles?: RolesConfig;
+  /** Optional hard spend & retry circuit breakers. */
+  budgets?: BudgetLimits;
+  /** Optional independent live-app verifier settings (defaults to 1 verifier). */
+  verifier?: VerifierSettings;
+  /** Optional user-facing UX/UI path globs that always require human taste approval. */
+  uxPaths?: string[];
+  /** Optional live-app flake retry/quarantine policy. */
+  flake?: Partial<FlakePolicy>;
+  /** Optional Tier-2 formal verification specs (TLA+, Lean, Bombadil). */
+  formal?: FormalSpecConfig[];
+  /** Optional Layer 1 self-hosted factory control-plane settings. */
+  factory?: FactorySettings;
 }
 
 const DEFAULT_POLICY: Policy = { autoMerge: 'none' };
@@ -259,7 +302,25 @@ function relativeDir(value: unknown, field: string, fallback: string): string {
   return value.replace(/\/+$/, '');
 }
 
-/** Reads `<root>/vgate.yaml`. Without one, the old layout: `services/` and `reports/` in the root. */
+const ALLOWED_PROJECT_KEYS = new Set([
+  'version',
+  'servicesDir',
+  'reportsDir',
+  'policy',
+  'risk',
+  'deploy',
+  'mutation',
+  'agents',
+  'roles',
+  'budgets',
+  'verifier',
+  'uxPaths',
+  'flake',
+  'formal',
+  'factory',
+]);
+
+/** Reads `<root>/vgate.yaml`. Without one, the default layout: `services/` and `reports/` in the root. */
 export function readProject(root: string): ProjectConfig {
   const dir = resolve(root);
   const file = join(dir, PROJECT_FILE);
@@ -276,12 +337,45 @@ export function readProject(root: string): ProjectConfig {
   }
   const raw = (parse(readFileSync(file, 'utf8')) ?? {}) as Record<string, unknown>;
   if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${file}: expected a mapping`);
+  const unknownKeys = Object.keys(raw).filter((k) => !ALLOWED_PROJECT_KEYS.has(k));
+  if (unknownKeys.length > 0) {
+    throw new Error(
+      `${file}: unknown top-level key(s): ${unknownKeys.join(', ')}. Allowed: ${[...ALLOWED_PROJECT_KEYS].join(', ')}`,
+    );
+  }
   // A YAML version such as 1.2 reads as a number: either way it is the text the user wrote.
   if (raw.version !== undefined && typeof raw.version !== 'string' && typeof raw.version !== 'number')
     throw new Error(`${file}: version must be a version such as 1.2.3`);
   const version = raw.version === undefined ? undefined : String(raw.version);
   const services = relativeDir(raw.servicesDir, 'servicesDir', 'regression');
   const reports = relativeDir(raw.reportsDir, 'reportsDir', 'reports');
+  const roles = raw.roles !== undefined && raw.roles !== null ? parseRolesConfig(raw.roles) : undefined;
+  const budgets =
+    raw.budgets && typeof raw.budgets === 'object' && !Array.isArray(raw.budgets)
+      ? (raw.budgets as BudgetLimits)
+      : undefined;
+  const verifier =
+    raw.verifier && typeof raw.verifier === 'object' && !Array.isArray(raw.verifier)
+      ? (raw.verifier as VerifierSettings)
+      : undefined;
+  const agents =
+    raw.agents && typeof raw.agents === 'object' && !Array.isArray(raw.agents)
+      ? (raw.agents as AgentsSettings)
+      : undefined;
+  const uxPaths =
+    Array.isArray(raw.uxPaths) && raw.uxPaths.every((p): p is string => typeof p === 'string')
+      ? raw.uxPaths
+      : undefined;
+  const flake =
+    raw.flake && typeof raw.flake === 'object' && !Array.isArray(raw.flake)
+      ? (raw.flake as Partial<FlakePolicy>)
+      : undefined;
+  const formal = Array.isArray(raw.formal) ? (raw.formal as FormalSpecConfig[]) : undefined;
+  const factory =
+    raw.factory && typeof raw.factory === 'object' && !Array.isArray(raw.factory)
+      ? (raw.factory as FactorySettings)
+      : undefined;
+
   return {
     root: dir,
     version,
@@ -293,6 +387,14 @@ export function readProject(root: string): ProjectConfig {
     risk: parseRisk(raw.risk, file),
     deploy: parseDeploy(raw.deploy, file),
     mutation: parseMutation(raw.mutation, file),
+    ...(agents ? { agents } : {}),
+    ...(roles ? { roles } : {}),
+    ...(budgets ? { budgets } : {}),
+    ...(verifier ? { verifier } : {}),
+    ...(uxPaths ? { uxPaths } : {}),
+    ...(flake ? { flake } : {}),
+    ...(formal ? { formal } : {}),
+    ...(factory ? { factory } : {}),
   };
 }
 

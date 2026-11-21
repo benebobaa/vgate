@@ -5,4 +5,10 @@
 /.github/workflows/           @your-org/verification-owners
 /.github/CODEOWNERS           @your-org/verification-owners
 /vgate.yaml                   @your-org/verification-owners
+/guardrails.yaml              @your-org/verification-owners
+/.vgate-ratchet.json          @your-org/verification-owners
+/.vgate-quarantine.yaml       @your-org/verification-owners
 **/known-failures.yaml        @your-org/verification-owners
+/.agents/skills/vgate-*       @your-org/verification-owners
+/.claude/skills/vgate-*       @your-org/verification-owners
+/.cursor/skills/vgate-*       @your-org/verification-owners

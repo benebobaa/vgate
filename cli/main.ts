@@ -22,6 +22,22 @@ import { canary, parseDuration } from './canary.ts';
 import { smoke } from './smoke.ts';
 import { decide, DECISION_FILE } from './decide.ts';
 import { doctor } from './doctor.ts';
+import {
+  benchmarkCommand,
+  evalCommand,
+  factoryCommand,
+  formalCommand,
+  lintCommand,
+  maintainCommand,
+  maturityCommand,
+  mcpCommand,
+  metricsCommand,
+  resumeCommand,
+  shipCommand,
+  statechartCommand,
+  stopCommand,
+  verifyCommand,
+} from './factory-commands.ts';
 import { gate, STEPS, VERDICT_FILE } from './gate.ts';
 import { GUARD_FILE, guard } from './guard.ts';
 import { init } from './init.ts';
@@ -45,6 +61,11 @@ const BOOLEANS = [
   'write',
   'smoke',
   'all-tests',
+  'test',
+  'update-ratchet',
+  'skip-native',
+  'verify-mutation',
+  'production-tuned',
 ] as const;
 
 /** Everything `help` says, as data: `help --json` is how an agent discovers the tool. */
@@ -91,8 +112,8 @@ const CATALOGUE = {
     },
     {
       name: 'guard',
-      usage: `${CLI} guard --service <name> --base <git ref>`,
-      about: `Compare the expectations (contract, plan, service.yaml, known failures, tests, gate machinery) of the working tree with a base ref: auto when nothing was weakened, needs-human (exit 1) otherwise. Writes ${GUARD_FILE}.`,
+      usage: `${CLI} guard [--service <name>] --base <git ref>`,
+      about: `Compare expectations (contract, plan, service.yaml, known failures, tests, guardrails, ratchets, quarantine, gate machinery) of the working tree with a base ref: auto when nothing was weakened, needs-human (exit 1) otherwise. Omit --service for repo-level guard. Writes ${GUARD_FILE}.`,
     },
     {
       name: 'affected',
@@ -174,6 +195,84 @@ const CATALOGUE = {
       name: 'reset',
       usage: `${CLI} reset --service <name> --yes`,
       about: "DESTRUCTIVE: wipe the service's local test data and re-seed it. Refused without --yes.",
+    },
+    {
+      name: 'lint',
+      usage: `${CLI} lint [--test] [--config <file>] [--ratchet <file>] [--update-ratchet] [--skip-native] [--files a,b]`,
+      about:
+        'Run polyglot codebase guardrails (guardrails.yaml boundaries, banned patterns, comment caps, brownfield ratchets, native linters, AGENTS.md rule table). --test verifies every rule against its known-bad/known-good fixtures; --config/--ratchet let CI run trunk-pinned rules.',
+    },
+    {
+      name: 'verify',
+      usage: `${CLI} verify --base <git ref> [--mode auto|full|single|skip] [--verifiers 1] [--author-harness <h>]`,
+      about:
+        'Run an independent cross-vendor live-app verifier (defaults to 1 verifier) and write reports/verifier.json (signed when VGATE_SIGNING_KEY is set).',
+    },
+    {
+      name: 'eval',
+      usage: `${CLI} eval --spec <eval.json>`,
+      about: 'Run blinded, anti-eval-awareness skill evaluations with transcript adherence auditing.',
+    },
+    {
+      name: 'maintain',
+      usage: `${CLI} maintain [--service <name>]`,
+      about:
+        'Read-only Feature Map drift audit (clean | changed | blocked). Strictly prohibited from editing product code.',
+    },
+    {
+      name: 'formal',
+      usage: `${CLI} formal [--verify-mutation]`,
+      about:
+        'Run Tier-2 formal verification specs (TLA+, Lean, Bombadil) with sync-commit drift tracking and mutation proof.',
+    },
+    {
+      name: 'statechart',
+      usage: `${CLI} statechart --input <spec.tla> [--output <file.mmd>] [--max-arrows 20]`,
+      about: 'Render a best-effort Mermaid statechart from a TLA+ specification or DOT graph.',
+    },
+    {
+      name: 'benchmark',
+      usage: `${CLI} benchmark --baseline "<cmd>" --candidate "<cmd>" --limiter "<why>" [--runs 5] [--production-tuned]`,
+      about: 'Run alternating A/B performance trials under the 7-question Explain-the-Number rigor checklist.',
+    },
+    {
+      name: 'ship',
+      usage: `${CLI} ship patch-id --base <ref> | rebase-check --rebases <n> | plan --stack <stack.json>`,
+      about:
+        'Merge-queue helpers: semantic Patch-ID, 3-rebase ceiling check, and bottom-up contiguous stacked landing plan.',
+    },
+    {
+      name: 'maturity',
+      usage: `${CLI} maturity [--require 1..5]`,
+      about:
+        'Evaluate the 5-phase maturity report (Phases 1-3 advisory; Phases 4-5 require out-of-band VGATE_ALLOW_AUTONOMY=1 to override).',
+    },
+    {
+      name: 'metrics',
+      usage: `${CLI} metrics record --kind <kind> [...] | ${CLI} metrics report [--days 30] [--format text|json|html|otel]`,
+      about:
+        'Local-first 5-KPI engineering ledger (accepted fixes, review time, rework, revert/escaped defects, cost/change).',
+    },
+    {
+      name: 'factory',
+      usage: `${CLI} factory serve|status|audit|dispatch [...]`,
+      about:
+        'Self-hosted Layer 1 outer-loop control plane: credential-isolated workers, untrusted signal framing, and hourly side-effect audits.',
+    },
+    {
+      name: 'stop',
+      usage: `${CLI} stop [--reason "<why>"]`,
+      about: 'Emergency zero-writes stop switch: halts all factory dispatches and worker writes immediately.',
+    },
+    {
+      name: 'resume',
+      usage: `${CLI} resume`,
+      about: 'Clear the zero-writes stop order and allow factory dispatches to resume.',
+    },
+    {
+      name: 'mcp',
+      usage: `${CLI} mcp`,
+      about: 'Start vgate as a stdio JSON-RPC 2.0 MCP server for any MCP-capable coding agent.',
     },
     { name: 'help', usage: `${CLI} help`, about: 'This catalogue.' },
     { name: 'version', usage: `${CLI} version`, about: 'The version of this build.' },
@@ -261,7 +360,24 @@ async function run(argv: string[]): Promise<Result> {
 
   // The skills travel in the binary: installing them needs no project.
   if (command === 'skills') {
-    return skills({ action: rest[0], names: rest.slice(1), dir: str(args.dir), dryRun: args['dry-run'] === true });
+    return skills({
+      action: rest[0],
+      names: rest.slice(1),
+      dir: str(args.dir),
+      agents: str(args.agents),
+      packs: str(args.packs),
+      root: str(args.root),
+      dryRun: args['dry-run'] === true,
+    });
+  }
+  if (command === 'mcp') {
+    let proj: ProjectConfig | undefined;
+    try {
+      proj = requireProject(str(args.root));
+    } catch {
+      proj = undefined;
+    }
+    return mcpCommand(proj);
   }
 
   const runtime = currentRuntime();
@@ -271,6 +387,8 @@ async function run(argv: string[]): Promise<Result> {
     return init(str(args.root) ?? process.cwd(), runtime, {
       service: str(args.service),
       ci: str(args.ci),
+      agents: str(args.agents),
+      packs: str(args.packs),
       force: args.force === true,
     });
   }
@@ -339,6 +457,57 @@ async function run(argv: string[]): Promise<Result> {
       text: args.write === true ? [] : [skeleton.trimEnd()],
     };
   }
+  if (command === 'lint') {
+    const files = str(args.files)
+      ?.split(',')
+      .map((f) => f.trim())
+      .filter(Boolean);
+    return lintCommand(project, {
+      testFixtures: args.test === true,
+      updateRatchet: args['update-ratchet'] === true,
+      skipNative: args['skip-native'] === true,
+      configPath: str(args.config),
+      ratchetPath: str(args.ratchet),
+      files,
+    });
+  }
+  if (command === 'maturity') {
+    const req = str(args.require);
+    return maturityCommand(project, req !== undefined ? Number(req) : undefined);
+  }
+  if (command === 'metrics') {
+    const num = (v: string | undefined) => (v !== undefined ? Number(v) : undefined);
+    return metricsCommand(project, rest[0], {
+      kind: str(args.kind),
+      pr: str(args.pr),
+      service: serviceFlag,
+      reviewMinutes: num(str(args['review-minutes'])),
+      tokens: num(str(args.tokens)),
+      usd: num(str(args.usd)),
+      role: str(args.role),
+      days: num(str(args.days)),
+      format: str(args.format),
+    });
+  }
+  if (command === 'stop') return stopCommand(project, str(args.reason));
+  if (command === 'resume') return resumeCommand(project);
+  if (command === 'maintain') return maintainCommand(project, serviceFlag);
+  if (command === 'statechart') {
+    const maxArrows = str(args['max-arrows']);
+    return statechartCommand(project, {
+      input: str(args.input),
+      output: str(args.output),
+      maxArrows: maxArrows !== undefined ? Number(maxArrows) : undefined,
+    });
+  }
+  if (command === 'ship') {
+    const rebases = str(args.rebases);
+    return shipCommand(project, rest[0], {
+      base: str(args.base),
+      rebases: rebases !== undefined ? Number(rebases) : undefined,
+      stackFile: str(args.stack),
+    });
+  }
   if (command === 'doctor') {
     // All services when none is named; a named one must exist.
     const service = serviceFlag === undefined ? undefined : resolveService(root, serviceFlag);
@@ -349,6 +518,39 @@ async function run(argv: string[]): Promise<Result> {
   const pinned = pinMismatch(command, project);
   if (pinned) return pinned;
 
+  if (command === 'verify') {
+    if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');
+    const verifiers = str(args.verifiers);
+    return verifyCommand(project, {
+      base: str(args.base),
+      mode: str(args.mode),
+      verifiers: verifiers !== undefined ? Number(verifiers) : undefined,
+      authorHarness: str(args['author-harness']),
+      authorModel: str(args['author-model']),
+    });
+  }
+  if (command === 'eval') return evalCommand(project, str(args.spec));
+  if (command === 'formal') return formalCommand(project, args['verify-mutation'] === true);
+  if (command === 'benchmark') {
+    const runs = str(args.runs);
+    return benchmarkCommand(project, {
+      baseline: str(args.baseline),
+      candidate: str(args.candidate),
+      limiter: str(args.limiter),
+      runs: runs !== undefined ? Number(runs) : undefined,
+      productionTuned: args['production-tuned'] === true,
+    });
+  }
+  if (command === 'factory') {
+    const port = str(args.port);
+    return factoryCommand(project, rest[0], {
+      host: str(args.host),
+      port: port !== undefined ? Number(port) : undefined,
+      source: str(args.source),
+      payloadFile: str(args.payload),
+      sandbox: str(args.sandbox),
+    });
+  }
   if (command === 'gate') {
     const steps = str(args.steps)
       ?.split(',')
@@ -423,10 +625,13 @@ async function run(argv: string[]): Promise<Result> {
   }
   if (command === 'guard') {
     if (args.base === true) throw new UsageError('--base needs a git ref, e.g. origin/main');
-    // A service the change deletes is no longer in the working tree, yet must still be guarded: guard() accepts any
-    // plain service name that exists at the base or here, and refuses the rest.
+    // Omit --service to run repo-level guardrails/ratchet/quarantine/machinery guard (_repo).
     const service =
-      serviceFlag !== undefined && /^\w[\w.-]*$/.test(serviceFlag) ? serviceFlag : resolveService(root, serviceFlag);
+      serviceFlag === undefined
+        ? undefined
+        : /^\w[\w.-]*$/.test(serviceFlag)
+          ? serviceFlag
+          : resolveService(root, serviceFlag);
     return guard(root, { service, base: str(args.base) });
   }
   if ((STACK_ACTIONS as readonly string[]).includes(command)) {
@@ -456,6 +661,6 @@ try {
     next: usage ? [`${CLI} help`] : [],
   };
 }
-emit(result, json);
+if (result.command !== 'mcp') emit(result, json);
 // Not process.exit(): a piped stdout must drain before the process ends.
 process.exitCode = result.exitCode;

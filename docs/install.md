@@ -16,7 +16,7 @@ verify. If the directory is not on your `PATH`, it prints the line to add.
 
 | Variable                | Default                          | Meaning                                                                     |
 | ----------------------- | -------------------------------- | --------------------------------------------------------------------------- |
-| `VGATE_VERSION`         | the latest release               | The version to install, e.g. `0.6.3`                                        |
+| `VGATE_VERSION`         | the latest release               | The version to install, e.g. `0.1.0`                                        |
 | `VGATE_INSTALL_DIR`     | `~/.local/bin`                   | Where the binary goes                                                       |
 | `VGATE_BASE_URL`        | `https://vgate.benelabs.tech`    | Where releases are served from (a mirror, or a local test)                  |
 | `VGATE_MINISIGN_PUBKEY` | the release key (`minisign.pub`) | The key the signature of `SHA256SUMS` is checked against (needs `minisign`) |
@@ -38,26 +38,26 @@ Then: `vgate doctor` checks that the machine can run the gate and names the fix 
 
 ## Pin a version
 
-A project pins the version it is verified with in `vgate.yaml` (`version: 0.6.3`), and its CI installs exactly that
+A project pins the version it is verified with in `vgate.yaml` (`version: 0.1.0`), and its CI installs exactly that
 one:
 
 ```bash
-curl -fsSL https://vgate.benelabs.tech/install.sh | VGATE_VERSION=0.6.3 sh
+curl -fsSL https://vgate.benelabs.tech/install.sh | VGATE_VERSION=0.1.0 sh
 ```
 
-Releases are immutable: `0.6.3` is the same bytes forever. Only `latest` moves.
+Releases are immutable: `0.1.0` is the same bytes forever. Only `latest` moves.
 
 ## Verify by hand
 
 ```bash
-v=0.6.3; f=vgate-$v-linux-x64.tar.gz
+v=0.1.0; f=vgate-$v-linux-x64.tar.gz
 curl -fsSLO https://vgate.benelabs.tech/v$v/$f
 curl -fsSLO https://vgate.benelabs.tech/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS        # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
 ```
 
 A checksum proves the download is the file the release lists; it does not prove who published the release. Releases
-from 0.6.0 on are signed with minisign, and `install.sh` verifies the signature itself when `minisign` is installed
+Releases are signed with minisign, and `install.sh` verifies the signature itself when `minisign` is installed
 (refusing the install on a missing or wrong signature). The public key is `minisign.pub` in the repository:
 
 ```

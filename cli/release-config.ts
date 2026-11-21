@@ -20,7 +20,7 @@ export const BUCKET_PREFIX = '';
 /** The R2 bucket the release script uploads to unless told otherwise. */
 export const BUCKET = 'vgate-releases';
 
-/** `v0.6.3`: the directory (and key prefix) of one release. */
+/** `v0.1.0`: the directory (and key prefix) of one release. */
 export function versionDir(version: string): string {
   return `v${version}`;
 }
@@ -49,7 +49,7 @@ export function platformId(platform: Pick<Platform, 'os' | 'arch' | 'libc'>): st
   return [platform.os, platform.arch, platform.libc].filter(Boolean).join('-');
 }
 
-/** `vgate-0.6.3-linux-x64.tar.gz` */
+/** `vgate-0.1.0-linux-x64.tar.gz` */
 export function assetName(version: string, platform: Pick<Platform, 'os' | 'arch' | 'libc'>): string {
   return `${NAME}-${version}-${platformId(platform)}.tar.gz`;
 }

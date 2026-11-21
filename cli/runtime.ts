@@ -37,6 +37,7 @@ declare const VGATE_RUNTIME: string | undefined;
 export const RUNTIME_PATHS = [
   'framework',
   'cli',
+  'packages',
   'package.json',
   'pnpm-lock.yaml',
   'tsconfig.json',
