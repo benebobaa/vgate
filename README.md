@@ -1,184 +1,71 @@
 # vgate
 
-A deterministic verification gate for merge requests written by AI agents.
+**Vendor-agnostic deterministic verification gate and guardrail harness for AI coding agents** — ship high-velocity PRs without degrading quality.
 
-Agents write the code, the tests and the setup. vgate judges them with plain open-source tooling and no model in the
-loop, and its guard decides when a human must look: only when a change weakens what the gate verifies. Every other
-change merges on a green gate.
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![CI](https://github.com/benebobaa/vgate/actions/workflows/ci.yml/badge.svg)](https://github.com/benebobaa/vgate/actions/workflows/ci.yml) [![Release](https://img.shields.io/badge/release-v0.1.1-green.svg)](https://vgate.benelabs.tech/latest.json) [![MCP](https://img.shields.io/badge/MCP-stdio-purple.svg)](docs/cli.md)
+
+Works with **Claude Code**, **Cursor**, **Codex**, **Antigravity**, **OpenCode**, **Pi**, **OMP**, **GrokBot**, or any MCP client.
+
+## Why vgate
+
+- **Deterministic first**: Polyglot architecture guardrails (`guardrails.yaml` + ratchets) and real runtime gates (API contracts, Chromium UI, migrations, mutation strength) judge PRs without model guesswork.
+- **Un-gameable judge**: CI pins the binary and reads policy/`guardrails.yaml` from trunk, supports HMAC/Ed25519 verdict signing, and routes UX-touching diffs to human approval (`vgate decide`).
+- **Vendor-agnostic**: A single binary projects non-clobbering `vgate-*` skills across agent harnesses, dispatches cross-vendor verifiers, and speaks stdio MCP (`vgate mcp`).
+
+## Quick Start
 
 ```bash
 curl -fsSL https://vgate.benelabs.tech/install.sh | sh
 cd your-project
-vgate init --service api --ci github   # vgate.yaml, regression/api/, agent skills, .github/workflows/vgate.yml
-vgate doctor --fix                     # checks the tools, installs the framework runtime (cached per version)
+vgate init --service api --ci github --agents claude,cursor,codex,agy
+vgate doctor --fix && vgate gate --service api
 ```
 
-Then ask your coding agent to _"onboard `api` from `<path to the backend>`"_. The `generate-api-tests` skill vendors
-the contract, writes a test plan and stops for your review, then writes the tests, runs the gate and reports where the
-backend disagrees with its spec. Install details, pinning and verification: [docs/install.md](docs/install.md).
+## How It Works
 
-> **Status:** early (0.x). Licensed under the [Apache License 2.0](LICENSE). Releases from 0.6.0 on are signed
-> (minisign; the public key is [minisign.pub](minisign.pub)).
+| Pillar                | Mechanism                                                                           | Guide                                                                        |
+| --------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Guardrails & Ratchets | Boundaries, banned patterns with `replaceWith`, presets, fixtures (`--test`)        | [docs/guard.md](docs/guard.md)                                               |
+| Live Runtime Gates    | OpenAPI, Schemathesis, Playwright UI, migrations, `vgate mutate`                    | [docs/deploy-safety.md](docs/deploy-safety.md)                               |
+| Trunk-Executed Guard  | `vgate guard` & `repo-guard` block weakened specs, ratchets, or judge files         | [docs/pr-verification.md](docs/pr-verification.md)                           |
+| Cross-Vendor Verifier | Separate-family live-app verifier layered fail-closed over deterministic gates      | [docs/architecture-agentic-factory.md](docs/architecture-agentic-factory.md) |
+| Harness Skills & MCP  | Multi-harness `vgate-*` skills, 1-source `vgate-verify`, stdio JSON-RPC `vgate mcp` | [docs/cli.md](docs/cli.md)                                                   |
+| Metrics & Factory     | 5-KPI ledger, advisory maturity, experimental primitives (`DockerSandbox`)          | [docs/architecture-agentic-factory.md](docs/architecture-agentic-factory.md) |
 
-## What the gate checks
+## Core Commands
 
-| Layer            | Tool                                         | Catches                                                                                                                                                                                      |
-| ---------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Contract types   | `openapi-typescript` + `tsc`                 | Tests that use a field, path or body the contract does not have                                                                                                                              |
-| Every response   | Playwright Test + Ajv                        | An undocumented status, a schema violation or undocumented field, a missing header, a datetime without its offset                                                                            |
-| Streams          | SSE parser + per-event schema                | An event that violates its schema, a stream cut off before its terminal event, a stalled stream ([docs/streaming.md](docs/streaming.md))                                                     |
-| Behaviour        | Playwright Test scenarios                    | Wrong codes and values, wrong rows in the database, writes on rejected calls, role and permission rules, signed webhooks                                                                     |
-| Generated inputs | Schemathesis                                 | Server errors, schema conformance and input handling on read-only operations, from the contract alone                                                                                        |
-| Dependencies     | WireMock, Kafka, Redis, Toxiproxy fixtures   | Wrong calls to a third party, stubs that lie about it, missing or malformed events, behaviour when a dependency is slow or down                                                              |
-| Completeness     | coverage gate                                | A documented (operation, status, code) no test reaches; a planned scenario no collected test runs; a provider answer no test simulates                                                       |
-| Web frontends    | Playwright (Chromium) + axe-core             | A broken user flow, a call to an undeclared origin, a console error, an accessibility violation, a changed screenshot, a web-vitals budget breach ([docs/frontend.md](docs/frontend.md))     |
-| Incidents        | `vgate incident`                             | A bug that escaped to production with no regression test guarding it ([docs/learning-loop.md](docs/learning-loop.md))                                                                        |
-| Provider drift   | `vgate drift`                                | A real third party (its sandbox) that no longer answers like its vendored contract, so the stubs would lie                                                                                   |
-| Deploy safety    | `vgate compat`, `config-check`, `migrations` | A contract break against what production runs, a setting production lacks, an unsafe migration, the deployed code failing on the new schema ([docs/deploy-safety.md](docs/deploy-safety.md)) |
-| Test strength    | `vgate mutate`                               | Tests that would not notice a bug planted in the lines a change wrote ([docs/mutation.md](docs/mutation.md))                                                                                 |
-| Known failures   | registry with ticket, owner and expiry       | An expired or stale entry; a known failure that now passes ([docs/known-failures.md](docs/known-failures.md))                                                                                |
-| The expectations | `vgate guard`                                | A change that weakens the judge: a breaking contract change, a removed scenario or assertion, a loosened rule, a new known failure, edited machinery                                         |
-| The framework    | `node:test` self-tests                       | A change to vgate itself that would make it judge wrongly                                                                                                                                    |
+Every command supports `--json` and exits `0` (pass), `1` (fail/human), `2` (usage), or `3` (not ready).
 
-Auth: Keycloak password users, static bearer tokens, API keys and cookie sessions with CSRF
-([docs/auth.md](docs/auth.md)). Reports: `reports/verdict.json` (the machine-readable verdict), JUnit XML, Playwright
-HTML with traces, Allure, `reports/coverage/coverage.md`.
+| Command                      | Purpose                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| `vgate init`                 | Initialize `vgate.yaml`, service skeleton, CI workflow, and agent skills  |
+| `vgate doctor [--fix]`       | Check host tools and unpack the version-pinned framework runtime          |
+| `vgate lint [--test]`        | Run `guardrails.yaml` rules/ratchets or prove rule fixtures can fail      |
+| `vgate gate --service <svc>` | Run full deterministic suite and write `reports/verdict.json`             |
+| `vgate guard --base <ref>`   | Flag weakened expectations, ratchets, quarantine, or judge machinery      |
+| `vgate decide --base <ref>`  | Produce stacked merge decision (`merge` \| `needs-approval` \| `blocked`) |
+| `vgate verify --base <ref>`  | Run independent cross-vendor live-app verifier (`reports/verifier.json`)  |
+| `vgate skills install`       | Project `vgate-*` skills cleanly across configured coding agents          |
+| `vgate mcp`                  | Start the built-in stdio JSON-RPC 2.0 MCP server                          |
+| `vgate metrics report`       | Summarize local 5-KPI ledger (`text`, `json`, `html`, `otel`)             |
 
-## Three rules
+Full command reference: [docs/cli.md](docs/cli.md) or `vgate help --json`.
 
-1. **Expectations come from the spec, never from what the backend returns today.** Every scenario cites its source
-   (contract, README rule, error-code enum, permission annotation, migration). A test that fails while matching its
-   source is a finding, not a test to "fix".
-2. **The AI writes the tests; it never runs in the gate.** The gate is plain tooling and gives the same answer every
-   time.
-3. **Whoever changes the code cannot weaken the judge.** In CI the gate and the guard run from the pinned vgate
-   version, never from the merge request's checkout. A change that removes or loosens an expectation, adds a known
-   failure or edits the machinery waits for a human approval ([docs/guard.md](docs/guard.md),
-   [docs/ci.md](docs/ci.md)).
+## Documentation
 
-## The CLI
+- [Architecture](docs/architecture-agentic-factory.md) — 3-layer factory design & security invariants
+- [CLI Reference](docs/cli.md) — all commands, flags, exit codes, experimental factory commands
+- [Installation](docs/install.md) — version pinning, minisign verification, Linux/macOS setup
+- [CI Integration](docs/ci.md) — GitHub Actions (`repo-guard` + `decide`) and GitLab components
+- [PR Verification](docs/pr-verification.md) — risk tiers, human-taste UX rules, failure triage
+- [Frontend](docs/frontend.md) · [Deploy Safety](docs/deploy-safety.md) · [Mutation](docs/mutation.md) · [Dependencies](docs/dependencies.md) · [Releasing](docs/releasing.md)
 
-Made for the agent that operates it as much as for a person: every command takes `--json` and returns one envelope,
-`{ command, ok, exitCode, summary, data, next }`; it never prompts; `next` lists the commands that move the caller
-forward.
-
-| Command                                                                                                                           | What it does                                                                                                                                                                                                                                                                                     |
-| --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `init [--service <svc>] [--ci github] [--force]`                                                                                  | Makes the current repository a project: `vgate.yaml` (pinned version), the service skeleton, the skills, the CI workflow                                                                                                                                                                         |
-| `doctor [--service <svc>] [--fix]`                                                                                                | Checks tools and versions, the runtime, each service's config, contract and stack; every failed check names its fix                                                                                                                                                                              |
-| `gate --service <svc> [--steps a,b]`                                                                                              | Runs every step and writes `reports/verdict.json`: steps, failed tests (scenario id, file, line, message), coverage, known failures                                                                                                                                                              |
-| `guard --service <svc> --base <ref>`                                                                                              | Compares the expectations with a base ref: exit 0 `auto`, exit 1 `needs-human` with the findings; writes `reports/guard.json`                                                                                                                                                                    |
-| `inventory --service <svc> [--write]`                                                                                             | The test plan's skeleton from the vendored contract, for the agent to enrich                                                                                                                                                                                                                     |
-| `smoke --service <svc> --env <env>`                                                                                               | After a deploy: the smoke subset against a deployed environment; writes are refused before they are sent                                                                                                                                                                                         |
-| `canary --service <svc> --env <env> [--for 10m]`                                                                                  | While a version takes traffic: metrics against limits and baseline; 1 on breach (runs `--on-fail` once), 3 unknown                                                                                                                                                                               |
-| `mutate --service <svc> --base <ref>`                                                                                             | Plants small bugs in the lines the change wrote and reruns the tests: the share caught is the mutation score; `policy.mutationScore` makes a low one ask for a human ([docs/mutation.md](docs/mutation.md))                                                                                      |
-| `compat` / `config-check` / `migrations --service <svc>`                                                                          | Safe to deploy: the contract against the deployed version, the settings each environment needs, the database migrations ([docs/deploy-safety.md](docs/deploy-safety.md))                                                                                                                         |
-| `incident add --service <svc> --title "…"` / `incident report`                                                                    | An escaped bug becomes a scenario the coverage step enforces (`[INC-<n>]`); the report shows the share of escapes the gate would catch today                                                                                                                                                     |
-| `drift --env <env> [--service <svc>]`                                                                                             | Asks each provider's sandbox and holds the answers to the vendored contract the stubs use; 1 on drift, 3 when nothing could be asked                                                                                                                                                             |
-| `affected --base <ref>`                                                                                                           | The services a change touches (by each `service.yaml`'s `paths:`) and the ones it deletes                                                                                                                                                                                                        |
-| `risk --base <ref>`                                                                                                               | The change's risk tier (low, medium, high) and the file and rule behind it                                                                                                                                                                                                                       |
-| `decide --base <ref> --evidence <dir>`                                                                                            | The pull request's decision from every verdict and guard result: `merge`, `needs-approval` or `blocked`, and the PR comment                                                                                                                                                                      |
-| `up` / `down` / `status --service <svc>`                                                                                          | The service's local stack                                                                                                                                                                                                                                                                        |
-| `reset --service <svc> --yes`                                                                                                     | **Destructive**: wipes the service's local test data; refused without `--yes`                                                                                                                                                                                                                    |
-| `skills list` / `skills install [--agents all\|claude,agy,cursor,codex,opencode,pi,omp,grokbot] [--packs core,rigor,scale\|full]` | Canonical vendor-agnostic `vgate-*` skills (auto-generating `vgate-verify` from `vgate.yaml` + `features/`) projected cleanly across harnesses                                                                                                                                                   |
-| `lint [--test] [--update-ratchet]`                                                                                                | Polyglot codebase guardrails (`guardrails.yaml`): boundaries, banned patterns with `replaceWith`, comment caps, brownfield ratchets, opt-in presets (`minimal-ts`, `dune-react`, `strict-go`, `strict-python`, `ast-grep`), rule fixtures (`--test`), native linters, and `AGENTS.md` rule table |
-| `verify --base <ref> [--verifiers 1]`                                                                                             | Independent cross-vendor live-app verifier (defaults to 1 verifier) stacked fail-closed over deterministic gates; signed when `VGATE_SIGNING_KEY` is set                                                                                                                                         |
-| `maintain [--service <svc>]`                                                                                                      | Read-only Feature Map drift audit (`clean` \| `changed` \| `blocked`); strictly prohibited from editing product code                                                                                                                                                                             |
-| `formal [--verify-mutation]` / `statechart` / `benchmark`                                                                         | Opt-in Tier-2/3 rigor: TLA+/Lean/Bombadil with sync-commit drift tracking & mutation proof, best-effort Mermaid statecharts, and 7-question alternating A/B performance benchmarks                                                                                                               |
-| `eval --spec <file.json>`                                                                                                         | Blinded, anti-eval-awareness skill evaluation runner with transcript file-open adherence auditing                                                                                                                                                                                                |
-| `ship patch-id\|rebase-check\|plan`                                                                                               | Merge-queue helpers: semantic Patch-ID, 3-rebase ceiling check, and bottom-up contiguous stacked landing plan                                                                                                                                                                                    |
-| `maturity [--require 1..5]` / `metrics record\|report`                                                                            | 5-phase maturity report (Phases 1–3 advisory; Phases 4–5 out-of-band `VGATE_ALLOW_AUTONOMY=1` seatbelt) and local-first 5-KPI ledger (CLI, static HTML, Prometheus/OTel)                                                                                                                         |
-| `factory serve\|status\|audit\|dispatch` / `stop` / `resume`                                                                      | Self-hosted Layer 1 control plane: untrusted-data signal framing, credential-isolated default-deny-egress sandboxes, 4-part handoff contract, hourly side-effect auditor, and instant zero-writes stop switch                                                                                    |
-| `mcp`                                                                                                                             | Built-in stdio JSON-RPC 2.0 MCP server exposing vgate tools to any MCP-capable coding agent                                                                                                                                                                                                      |
-| `services`, `help`, `version`                                                                                                     | The project's services; the command catalogue (`help --json` returns it as data); the build's version                                                                                                                                                                                            |
-
-Global flags: `--json`, `--quiet`, `--root <dir>` (default: the nearest parent holding `vgate.yaml`), `--service`,
-`--env` (default `$TEST_ENV` or `local`).
-
-| Exit code | Meaning                                                                          |
-| --------- | -------------------------------------------------------------------------------- |
-| 0         | Done, and the answer is yes (`guard`: may merge on a green gate)                 |
-| 1         | The verification ran and failed (`guard`: needs a human)                         |
-| 2         | The call was wrong: an unknown command, flag value or service                    |
-| 3         | Nothing was verified, because the machine, the project or the stack is not ready |
-
-## Pull request verification
-
-Every pull request gets one decision. `vgate affected` picks the services the change touches, `vgate gate` and
-`vgate guard` run for each, and `vgate decide` reads their evidence:
-
-- **merge**: every affected gate passed, nothing weakened the expectations, and the change's risk tier is within
-  `policy.autoMerge` in `vgate.yaml`. It merges without a person (GitHub auto-merge, GitLab merge when the pipeline
-  succeeds).
-- **needs-approval**: the gates passed, but the guard flagged weakened expectations or the change is riskier than the
-  policy allows. One person answers the specific questions in the pull request comment, not the whole diff.
-- **blocked**: a gate failed or evidence is missing. The author, person or agent, fixes the change.
-
-`vgate init --ci github` installs the workflow; GitLab gets two CI/CD components. How the decision works, risk rules,
-monorepos, regulated teams and adoption in shadow mode: [docs/pr-verification.md](docs/pr-verification.md). Setup:
-[docs/ci.md](docs/ci.md).
-
-After the merge, `vgate smoke` verifies the deployed environment with the service's own read-only scenarios (in an
-environment that is not disposable, every request that is not read-only is refused before it is sent) and
-`vgate canary` watches the new version's error rate and latency against limits, starting the rollback on a breach:
-[docs/after-deploy.md](docs/after-deploy.md).
-
-## A project
-
-```
-vgate.yaml                 version: 0.1.1, servicesDir: regression
-regression/<svc>/
-  service.yaml             rules, auth, dependencies, environments
-  openapi.yaml             the vendored contract: approved behaviour, changed only by a sync
-  inventory.yaml           the test plan, every scenario citing its source
-  known-failures.yaml      optional: failures the gate tolerates until a date (human-only)
-  FINDINGS.md              where the backend disagrees with its spec
-  stack.sh                 starts the service and its dependencies locally
-  support/ tests/
-```
-
-The framework itself is not in the project: the binary carries it and unpacks it once per version into
-`~/.cache/vgate`. Details: [docs/project-layout.md](docs/project-layout.md). Dependencies (third-party stubs checked
-against the provider's contract, Kafka, Redis, faults): [docs/dependencies.md](docs/dependencies.md). Signed webhooks:
-[docs/webhooks.md](docs/webhooks.md).
-
-## When the gate fails
-
-1. **Read the failure** in `reports/verdict.json` or the job log: method, path, status and `X-Request-Id`; search the
-   backend's logs for that id.
-2. **Open the evidence**: each failed test attaches `http-calls.json` (every request and response) and a Playwright
-   trace.
-3. **Classify:**
-
-   | It is              | Signs                                                  | Do                                                         |
-   | ------------------ | ------------------------------------------------------ | ---------------------------------------------------------- |
-   | A regression       | The test matches its cited source; the backend changed | Fix the backend                                            |
-   | An intended change | A source (contract, README, ticket) now says otherwise | Sync the tests (skill `sync-api-tests`); the plan cites it |
-   | A test defect      | The expectation has no source, or the data is wrong    | Fix the test                                               |
-   | The environment    | Stack down, stale data, an expired secret              | `vgate status`, `vgate reset --yes` (local)                |
-
-4. **Record** what you cannot resolve in `FINDINGS.md`. Only a human adds a known failure.
-
-## This repository
-
-The source of vgate: `cli/` (the command line), `framework/` (the Playwright-based test framework and its runners),
-`.claude/skills/` (the agent skills), `ci/` (GitHub workflow template, GitLab component, CI image), `scripts/` (installer
-and release), `docs/`. Two reference services run the whole gate: `services/example` (a REST API with an API key, a
-cookie session, a stream and a signed webhook; no Docker) and `services/example-orders` (PostgreSQL, Redis, Kafka and a
-third-party payment provider).
+## Development & License
 
 ```bash
 pnpm install
-pnpm vgate up --service example
-pnpm vgate gate --service example     # selftest, typecheck, lint, tests, contract, coverage
-pnpm vgate down --service example
-bun cli/build.ts                      # dist/vgate for this machine; --all for every release platform
+pnpm task selftest && pnpm vgate lint
+bun cli/build.ts
 ```
 
-Requirements for development: Node 22, pnpm 10, Bun 1.4, uv (Schemathesis), Docker (`example-orders`). Releasing:
-[docs/releasing.md](docs/releasing.md).
-
-## Roadmap
-
-- NDJSON and WebSocket streams; asymmetric webhook signatures; more databases than PostgreSQL.
-- Scheduled runs against shared environments, where cross-service flows belong.
+Licensed under [Apache-2.0](LICENSE). Release checksums are signed with [minisign.pub](minisign.pub).

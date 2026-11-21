@@ -216,3 +216,16 @@ A bug that still reaches production is recorded with `vgate incident add`: it be
 coverage step fails until a test titled `[INC-<n>]` guards it, so the same bug cannot escape twice. The guard asks a
 human before an incident is deleted or marked not testable. `vgate drift` checks, daily, that each provider's sandbox
 still answers as the vendored contract the stubs use says. See [learning-loop.md](learning-loop.md).
+
+## When the gate fails
+
+1. **Read the failure** in `reports/verdict.json` (or CI job summary): method, path, status, and `X-Request-Id`.
+2. **Inspect evidence**: Playwright attaches request/response logs (`http-calls.json`) and execution traces.
+3. **Classify the finding**:
+
+| Outcome              | Signs                                               | Action                                                      |
+| -------------------- | --------------------------------------------------- | ----------------------------------------------------------- |
+| Regression           | Test matches its cited source; implementation moved | Fix the code                                                |
+| Intended spec change | Source (contract, feature map, ticket) changed      | Sync tests and contract; approve expected guard diff        |
+| Test defect          | Expectation lacks a source or test data is wrong    | Fix the test                                                |
+| Environment issue    | Stack down, stale seed data, or missing config      | Check `vgate doctor` / `vgate status` / `vgate reset --yes` |
