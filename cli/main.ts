@@ -71,11 +71,12 @@ const BOOLEANS = [
 /** Everything `help` says, as data: `help --json` is how an agent discovers the tool. */
 const CATALOGUE = {
   name: CLI,
-  about: 'Regression gate for backend services: checks the environment, runs the gate, answers with one verdict.',
+  about:
+    'Vendor-agnostic deterministic verification gate and guardrail CLI for AI coding agents: guardrails, live verification, expectation guard, cross-vendor verifier, and MCP.',
   commands: [
     {
       name: 'init',
-      usage: `${CLI} init [--service <name>] [--ci github|gitlab] [--force]`,
+      usage: `${CLI} init [--service <name>] [--ci github|gitlab] [--agents <list>] [--packs <list>] [--force]`,
       about: `Make the current directory (or --root) a vgate project: ${PROJECT_FILE} pinned to this version, one service's skeleton, .gitignore entries, the agent skills, a pointer in AGENTS.md/CLAUDE.md, and with --ci the CI template. Never overwrites a file without --force.`,
     },
     {
@@ -86,9 +87,9 @@ const CATALOGUE = {
     },
     {
       name: 'skills',
-      usage: `${CLI} skills list|install [<skill>...] [--dir <skills dir>] [--dry-run]`,
+      usage: `${CLI} skills list|install [<skill>...] [--dir <skills dir>] [--agents <list>] [--packs <list>] [--dry-run]`,
       about:
-        'The agent skills carried by this build. install writes them to <cwd>/.claude/skills (or --dir); it works outside a project.',
+        'The agent skills carried by this build. install writes them to <cwd>/.claude/skills (or --dir) or projects across --agents (agy,claude,cursor,codex,opencode,pi,omp,grokbot); it works outside a project.',
     },
     {
       name: 'services',

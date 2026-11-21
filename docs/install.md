@@ -56,8 +56,7 @@ curl -fsSLO https://vgate.benelabs.tech/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS        # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
 ```
 
-A checksum proves the download is the file the release lists; it does not prove who published the release. Releases
-Releases are signed with minisign, and `install.sh` verifies the signature itself when `minisign` is installed
+A checksum proves the download is the file the release lists; it does not prove who published the release. Releases are signed with minisign, and `install.sh` verifies the signature itself when `minisign` is installed
 (refusing the install on a missing or wrong signature). The public key is `minisign.pub` in the repository:
 
 ```
@@ -70,8 +69,6 @@ By hand:
 curl -fsSLO https://vgate.benelabs.tech/v$v/SHA256SUMS.minisig
 minisign -Vm SHA256SUMS -P RWQi+ioDcIKPgRudn0qWcaeiayx8ZecM+sYU5HFz9LL3oTe/HlX2Ux3g
 ```
-
-Releases before 0.6.0 (0.1.2 to 0.5.0) were published before signing and carry checksums only.
 
 Every release also carries `v<version>/manifest.json` (platforms, sizes, checksums), and `latest.json` names the
 current version.

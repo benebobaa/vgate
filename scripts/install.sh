@@ -17,10 +17,9 @@ set -eu
 # Kept in step with NAME and BASE_URL in cli/release-config.ts (scripts/release.ts refuses a mismatch).
 NAME=vgate
 BASE_URL="${VGATE_BASE_URL:-https://vgate.benelabs.tech}"
-# The release signing key (minisign.pub in the repository, docs/install.md). Releases from 0.6.0 on are signed: with
-# minisign installed, a missing or wrong signature refuses the install. Releases made before signing are listed below.
+# The release signing key (minisign.pub in the repository, docs/install.md). With minisign installed,
+# a missing or wrong signature refuses the install.
 PUBKEY="${VGATE_MINISIGN_PUBKEY:-RWQi+ioDcIKPgRudn0qWcaeiayx8ZecM+sYU5HFz9LL3oTe/HlX2Ux3g}"
-UNSIGNED_RELEASES=" 0.1.2 0.2.0 0.2.1 0.3.0 0.4.0 0.5.0 "
 
 say() { printf '%s\n' "$*"; }
 fail() {
@@ -122,12 +121,6 @@ main() {
   fetch "$BASE_URL/v$version/SHA256SUMS" "$tmp/SHA256SUMS"
   fetch "$BASE_URL/v$version/$file" "$tmp/$file"
 
-  case "$UNSIGNED_RELEASES" in
-    *" $version "*)
-      say "$NAME $version predates release signing: the checksum is verified, there is no signature"
-      PUBKEY=""
-      ;;
-  esac
   if [ -n "$PUBKEY" ]; then
     if command -v minisign >/dev/null 2>&1; then
       fetch "$BASE_URL/v$version/SHA256SUMS.minisig" "$tmp/SHA256SUMS.minisig"

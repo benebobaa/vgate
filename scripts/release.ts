@@ -93,7 +93,7 @@ if (existsSync(installer)) {
     problems.push(`install.sh's default base URL is not ${BASE_URL}`);
   if (!script.includes(`\nNAME=${NAME}\n`)) problems.push(`install.sh's NAME is not ${NAME}`);
 }
-// Every release from 0.6.0 on is signed, and the signature must verify against the published key (minisign.pub):
+// Every release is signed, and the signature must verify against the published key (minisign.pub):
 // install.sh refuses a release whose signature is missing or wrong, so an unsigned one would break every install.
 const signature = join(localVersionDir, 'SHA256SUMS.minisig');
 const publicKey = join(root, 'minisign.pub');

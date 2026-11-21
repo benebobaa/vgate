@@ -218,3 +218,16 @@ describe('init', () => {
     assert.equal(readFileSync(join(root, service.path), 'utf8'), service.content);
   });
 });
+
+describe('README conciseness budget', () => {
+  const readmePath = join(repo, 'README.md');
+  const skipIfUnpacked = existsSync(readmePath) ? false : 'README.md is not unpacked into a project runtime';
+
+  it('stays concise (<= 130 lines and <= 850 words)', { skip: skipIfUnpacked }, () => {
+    const text = readFileSync(readmePath, 'utf8');
+    const lines = text.trimEnd().split('\n').length;
+    const words = text.trim().split(/\s+/).length;
+    assert.ok(lines <= 130, `README.md is ${lines} lines (budget: <= 130); move details into docs/`);
+    assert.ok(words <= 850, `README.md is ${words} words (budget: <= 850); keep top-level README focused`);
+  });
+});

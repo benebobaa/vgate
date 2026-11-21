@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "license": "Apache-2.0",
   "private": true,
-  "description": "A deterministic verification gate for merge requests written by AI agents: contract-checked API tests, an expectation guard, and an agent-first CLI",
+  "description": "Vendor-agnostic deterministic verification gate and guardrail harness for AI coding agents: polyglot guardrails, trunk-executed expectation guard, live verification, multi-harness skills, and MCP",
   "homepage": "https://vgate.benelabs.tech",
   "repository": {
     "type": "git",
