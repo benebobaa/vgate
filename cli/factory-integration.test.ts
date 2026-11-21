@@ -358,13 +358,24 @@ describe('out-of-band autonomy seatbelt, untrusted input framing, egress isolati
     assert.match(md, /vgate up --service api/);
     assert.match(md, /`auth` \(Auth\)/);
 
-    const res = skills({
-      action: 'install',
-      names: ['vgate-verify', 'vgate-correct'],
-      agents: 'agy,claude,cursor',
-      root: tmp,
-      dryRun: false,
-    });
+    const testBundle = {
+      'vgate-verify': {
+        'SKILL.md': '---\nname: vgate-verify\npack: core\ndescription: Verify live surfaces.\n---\n# Verify\n',
+      },
+      'vgate-correct': {
+        'SKILL.md': '---\nname: vgate-correct\npack: core\ndescription: Turn fixes into rules.\n---\n# Correct\n',
+      },
+    };
+    const res = skills(
+      {
+        action: 'install',
+        names: ['vgate-verify', 'vgate-correct'],
+        agents: 'agy,claude,cursor',
+        root: tmp,
+        dryRun: false,
+      },
+      testBundle,
+    );
     assert.equal(res.ok, true);
     assert.match(readFileSync(join(tmp, '.agents', 'skills', 'vgate-verify', 'SKILL.md'), 'utf8'), /`auth` \(Auth\)/);
     assert.match(readFileSync(join(tmp, '.cursor', 'rules', 'vgate.mdc'), 'utf8'), /alwaysApply: true/);

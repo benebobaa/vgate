@@ -22,6 +22,10 @@ import {
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SKILLS_DIR = join(REPO_ROOT, 'skills');
+const hasSkillsDir = existsSync(SKILLS_DIR);
+const skipIfUnpacked = hasSkillsDir
+  ? false
+  : 'canonical skills are embedded in the binary, not unpacked into a project runtime';
 
 const EXPECTED_CORE = [
   'vgate-automate',
@@ -40,23 +44,27 @@ const scratch = mkdtempSync(join(tmpdir(), 'vgate-playbooks-'));
 after(() => rmSync(scratch, { recursive: true, force: true }));
 
 describe('canonical skills and pack catalog', () => {
-  const bundle = readCanonicalSkills(SKILLS_DIR);
+  const bundle = hasSkillsDir ? readCanonicalSkills(SKILLS_DIR) : {};
 
-  it('loads all 8 lean namespaced vgate-* canonical skills with valid frontmatter and pack tags', () => {
-    const names = Object.keys(bundle).sort();
-    assert.equal(names.length, 8);
-    for (const name of names) {
-      assert.ok(name.startsWith('vgate-'), `canonical skill must be namespaced vgate-*, got ${name}`);
-      const skillMd = bundle[name]['SKILL.md'];
-      assert.equal(typeof skillMd, 'string');
-      const meta = parseSkillMeta(name, skillMd);
-      assert.equal(meta.name, name);
-      assert.ok(meta.description.length > 10, `description too short for ${name}`);
-      assert.ok(['core', 'rigor', 'scale'].includes(meta.pack), `invalid pack for ${name}`);
-    }
-  });
+  it(
+    'loads all 8 lean namespaced vgate-* canonical skills with valid frontmatter and pack tags',
+    { skip: skipIfUnpacked },
+    () => {
+      const names = Object.keys(bundle).sort();
+      assert.equal(names.length, 8);
+      for (const name of names) {
+        assert.ok(name.startsWith('vgate-'), `canonical skill must be namespaced vgate-*, got ${name}`);
+        const skillMd = bundle[name]['SKILL.md'];
+        assert.equal(typeof skillMd, 'string');
+        const meta = parseSkillMeta(name, skillMd);
+        assert.equal(meta.name, name);
+        assert.ok(meta.description.length > 10, `description too short for ${name}`);
+        assert.ok(['core', 'rigor', 'scale'].includes(meta.pack), `invalid pack for ${name}`);
+      }
+    },
+  );
 
-  it('categorizes skills accurately in listPackCatalog', () => {
+  it('categorizes skills accurately in listPackCatalog', { skip: skipIfUnpacked }, () => {
     const catalog = listPackCatalog(bundle);
     assert.deepEqual(
       catalog.core.map((s) => s.name),
@@ -72,7 +80,7 @@ describe('canonical skills and pack catalog', () => {
     );
   });
 
-  it('filters bundles by core, rigor, scale, combinations, and full', () => {
+  it('filters bundles by core, rigor, scale, combinations, and full', { skip: skipIfUnpacked }, () => {
     assert.deepEqual(Object.keys(filterBundleByPacks(bundle, ['core'])), EXPECTED_CORE);
     assert.deepEqual(Object.keys(filterBundleByPacks(bundle, ['rigor'])), EXPECTED_RIGOR);
     assert.deepEqual(Object.keys(filterBundleByPacks(bundle, ['scale'])), EXPECTED_SCALE);
