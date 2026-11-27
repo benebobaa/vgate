@@ -142,23 +142,45 @@ runs in a container fits:
 | Alembic, Prisma, knex, Rails | the app image with its migrate subcommand (`image:` = the app's), pointing it at `$DATABASE_URL`                                           |
 | plain SQL                    | psql in the postgres image, as `services/example-migrations/service.yaml` does                                                             |
 
-`vgate migrations --service <svc> --base <ref>` checks the migrations the change adds (forward files only: a
-`*.down.sql` or Flyway `U<n>__` file undoes one and is not counted):
+`vgate migrations --service <svc> --base <ref>` checks the migrations the change adds: the migration files of the
+directory that the base did not have (forward files only: a `*.down.sql` or Flyway `U<n>__` file undoes one and is not
+counted). Which files are migrations follows the tool, read from `command` and `image` (goose also from the
+`-- +goose Up` annotations in the files, for a project that runs goose through its own binary):
+
+| Tool           | Migration files                                                                                      |
+| -------------- | ---------------------------------------------------------------------------------------------------- |
+| goose          | `<version>_<name>.sql` and `.go` (so not an `embed.go`, nor a `_test.go`)                            |
+| golang-migrate | `<version>_<title>.up.<ext>` and `.down.<ext>`                                                       |
+| Flyway         | `V<version>__<desc>.sql`, `U<version>__<desc>.sql`, `R__<desc>.sql`                                  |
+| any other      | every file but dotfiles (`.gitkeep`) and documentation (`.md`, `.markdown`, `.txt`, `.rst`, `.adoc`) |
+
+A README beside the migrations is therefore never added, edited or undone as one. For a tool vgate does not know, a
+stray file counts rather than a real migration being missed.
+
+The base's migrations are the files of its `migrate.dir`, or, when the base does not declare the migrations yet (the
+service is new in this change, or has no `migrate:` there), the files at the same path in the base. Migrations usually
+exist, and are deployed, before a vgate service declares them; they are the base's, not this change's.
 
 1. **Lint** (PostgreSQL): the added `.sql` files through [squawk](https://squawkhq.com) (`squawk-cli`, pinned, run
    with npx on demand so only projects with Postgres migrations download it). The findings that are a real risk for
    the running version - a NOT NULL column without a default, an index built without `CONCURRENTLY`, a renamed or
    dropped column or table, a type change, a constraint or foreign key added without `NOT VALID`, a full-table lock -
-   are risky; squawk's hygiene rules (timeouts, `IF NOT EXISTS`, bigint over int) are shown as information only.
+   are risky; squawk's hygiene rules (timeouts, `IF NOT EXISTS`, bigint over int) are shown as information only. A
+   goose file is linted on its Up section only: its `-- +goose Down` section runs on a rollback, never on a deploy, and
+   dropping there what the Up adds is what makes the migration reversible. Findings keep the file's line numbers.
 2. **Apply**: a sealed environment of the merge base; its migrations, its seed, then this change's migrations. Each
    must succeed; the time each took is reported.
-3. **Round trip** (with `down`): the added migrations are undone and applied again.
+3. **Round trip** (with `down`): the added migrations are undone, one `down` per added forward migration, and applied
+   again.
 4. **Old code, new schema**: the app built from the merge base (the deployed code) starts on the migrated database,
    and the base's own read-only tests (the base's `smoke`, which the change cannot narrow) run against it.
 
 | Outcome                                                        | `vgate migrations` | `vgate decide`                                                                     |
 | -------------------------------------------------------------- | ------------------ | ---------------------------------------------------------------------------------- |
 | applies, undoes, the deployed code passes, nothing risky       | safe, exit 0       | no objection                                                                       |
+| no migration added (the service may be new at the base)        | safe, exit 0       | no objection                                                                       |
+| the service is new at the base and so are all its migrations   | safe, exit 0       | no objection: nothing is deployed, the old-code check is skipped and says so       |
+| migrations added where the base holds some but no service      | exit 1             | needs a human: the deployed code was not started on the migrated schema            |
 | a risky lint finding on migrations that otherwise pass         | exit 1             | needs a human                                                                      |
 | not verifiable: squawk did not run, no smoke test matched      | exit 1             | needs a human                                                                      |
 | an applied migration of the base edited or removed             | exit 1             | needs a human                                                                      |
