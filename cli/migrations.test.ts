@@ -286,6 +286,110 @@ describe('vgate migrations: what it cannot verify is not safe', () => {
     assert.match(data.reasons[0], /1\.up\.sql is edited, but the deployed databases already applied it/);
   });
 
+  /** A repo on `main` (`base` writes it) and a `feature` branch (`change` edits it); `vgate migrations` then runs. */
+  async function migrationsAfter(
+    service: string,
+    base: (root: string) => void,
+    change: (root: string) => void,
+  ): Promise<{ result: Awaited<ReturnType<typeof migrations>>; data: MigrationsReport }> {
+    const root = mkdtempSync(join(tmpdir(), 'vgate-migrations-files-'));
+    dirs.push(root);
+    git(root, 'init', '-q', '-b', 'main');
+    git(root, 'config', 'user.email', 't@example.invalid');
+    git(root, 'config', 'user.name', 't');
+    write(root, 'vgate.yaml', 'version: 0.2.0\nservicesDir: regression\n');
+    base(root);
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'base');
+    git(root, 'checkout', '-q', '-b', 'feature');
+    change(root);
+    git(root, 'add', '-A');
+    git(root, 'commit', '-qm', 'feature');
+    const result = await migrations(readProject(root), {} as Runtime, {
+      service,
+      base: 'main',
+      env: 'local',
+      live: false,
+    });
+    return { result, data: result.data as MigrationsReport };
+  }
+  const serviceYaml = (migrate: string) =>
+    [
+      'spec: openapi.yaml',
+      "environments: { local: { baseUrl: 'http://127.0.0.1:1' } }",
+      'environment:',
+      '  app: { image: items:1, port: 8080 }',
+      '  dependencies:',
+      `    db: { kind: postgres, migrate: ${migrate} }`,
+      '',
+    ].join('\n');
+
+  it('counts no README or dotfile in the migrations directory as a migration, added or edited', async () => {
+    const { result, data } = await migrationsAfter(
+      'items',
+      (root) => {
+        write(root, 'regression/items/service.yaml', serviceYaml('{ dir: app/db/migrations, command: up }'));
+        write(root, 'regression/items/openapi.yaml', 'openapi: 3.1.0\n');
+        write(root, 'app/db/migrations/1.up.sql', 'CREATE TABLE items (id int);\n');
+        write(root, 'app/db/migrations/README.md', 'Plain SQL, applied in name order.\n');
+      },
+      (root) => {
+        write(root, 'app/db/migrations/README.md', 'Plain SQL, applied in name order by psql.\n');
+        write(root, 'app/db/migrations/.gitkeep', '');
+      },
+    );
+    assert.equal(result.exitCode, 0, result.summary);
+    assert.deepEqual([data.verdict, data.added, data.reasons], ['safe', [], ['this change adds no migration']]);
+  });
+
+  it("reads the base's migrations from the same directory when the base does not declare the service yet", async () => {
+    // larasrouter: goose migrations (and a README) deployed for months, the vgate service that checks them is new.
+    const goose = 'goose -dir /migrations postgres "$DATABASE_URL" up';
+    const { result, data } = await migrationsAfter(
+      'api-migrations',
+      (root) => {
+        write(root, 'services/api/db/migrations/00001_init.sql', '-- +goose Up\nCREATE TABLE a (id int);\n');
+        write(root, 'services/api/db/migrations/00002_b.sql', '-- +goose Up\nCREATE TABLE b (id int);\n');
+        write(root, 'services/api/db/migrations/README.md', 'goose migrations\n');
+      },
+      (root) => {
+        write(
+          root,
+          'regression/api-migrations/service.yaml',
+          serviceYaml(`{ dir: services/api/db/migrations, command: '${goose}' }`),
+        );
+        write(root, 'regression/api-migrations/openapi.yaml', 'openapi: 3.1.0\n');
+      },
+    );
+    assert.equal(result.exitCode, 0, result.summary);
+    assert.equal(data.verdict, 'safe');
+    assert.deepEqual(data.added, []);
+    assert.equal(data.reasons[0], 'this change adds no migration');
+    assert.match(data.reasons[1], /api-migrations is new at main: the 2 migrations in services\/api\/db\/migrations/);
+  });
+
+  it("lints only a goose migration's Up section, with findings on the file's own lines", async (t) => {
+    const top = mkdtempSync(join(tmpdir(), 'vgate-migrations-lint-'));
+    dirs.push(top);
+    // Reversible and additive: its Down drops what its Up adds, which is not a risk for the running version.
+    write(
+      top,
+      'db/00003_note.sql',
+      '-- +goose Up\nALTER TABLE items ADD COLUMN note text;\n\n-- +goose Down\nALTER TABLE items DROP COLUMN note;\n',
+    );
+    // The Up section itself drops a column, on line 3 of the file.
+    write(
+      top,
+      'db/00004_drop.sql',
+      '-- +goose Up\n-- the legacy column is unused since v2\nALTER TABLE items DROP COLUMN legacy;\n-- +goose Down\nALTER TABLE items ADD COLUMN legacy text;\n',
+    );
+    const cfg = { dependency: 'db', kind: 'postgres', dir: join(top, 'db'), command: 'goose up', smoke: 'GET /' };
+    const linted = await lint(cfg, ['00003_note.sql', '00004_drop.sql'], top, false);
+    if (linted.unlinted) return t.skip(`squawk is not available here: ${linted.unlinted}`);
+    const risky = linted.findings.filter((f) => f.level === 'risky').map((f) => [f.file, f.line, f.rule]);
+    assert.deepEqual(risky, [['db/00004_drop.sql', 3, 'ban-drop-column']]);
+  });
+
   it('reports a squawk that did not run as unlinted, never as no findings', async () => {
     const saved = process.env.PATH;
     process.env.PATH = '/nonexistent';

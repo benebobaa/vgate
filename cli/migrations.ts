@@ -26,7 +26,7 @@ import {
 } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { stringify } from 'yaml';
 import { writeSignedOrPlainJson } from '../packages/verification/signing.ts';
 import { loadService, type ServiceConfig } from '../framework/config.ts';
@@ -37,10 +37,14 @@ import {
   addedMigrations,
   applyOrder,
   editedMigrations,
+  GOOSE_ANNOTATION,
+  isMigrationFile,
   isUndoFile,
   migrateConfigs,
+  migrationLayout,
   migrationsVerdict,
   parseSquawk,
+  upSection,
   type LintFinding,
   type MigrateConfig,
   type MigrationStep,
@@ -153,7 +157,30 @@ function listFiles(dir: string): string[] {
     .sort();
 }
 
-/** Lints the added .sql migrations of a Postgres dependency with squawk; other kinds and files are not linted. Exported for the tests. */
+const readText = (path: string): string | undefined => {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return undefined;
+  }
+};
+
+/** The migration files of a directory, as its tool names them: no README, dotfile or goose `embed.go`. */
+function migrationFiles(cfg: Pick<MigrateConfig, 'dir' | 'command' | 'image'>): string[] {
+  const files = listFiles(cfg.dir);
+  const goose = files.some(
+    (f) => f.endsWith('.sql') && (readText(join(cfg.dir, f)) ?? '').split('\n').some((l) => GOOSE_ANNOTATION.test(l)),
+  );
+  const layout = migrationLayout(cfg, goose);
+  return files.filter((f) => isMigrationFile(f, layout));
+}
+
+/**
+ * Lints the added .sql migrations of a Postgres dependency with squawk; other kinds and files are not linted. A goose
+ * file is linted on its Up section only (`upSection`, through a copy with the Down lines blanked): its Down section runs
+ * on a rollback, never on a deploy, and dropping there what the Up adds is what makes it reversible. Exported for the
+ * tests.
+ */
 export async function lint(
   cfg: MigrateConfig,
   added: string[],
@@ -165,8 +192,25 @@ export async function lint(
     return { findings: [], note: added.length > 0 ? 'the added migrations are not SQL files: not linted' : undefined };
   if (cfg.kind !== 'postgres')
     return { findings: [], note: `${cfg.kind} migrations are not linted (squawk reads PostgreSQL)` };
-  const files = sql.map((f) => join(cfg.dir, f));
-  const ran = await run('npx', ['--yes', SQUAWK, '--reporter', 'json', ...files], { env: toolEnv(), live: false });
+  const copies = mkdtempSync(join(tmpdir(), 'vgate-migrations-lint-'));
+  const original = new Map<string, string>(); // a linted copy -> the migration it was made from
+  const files = sql.map((f) => {
+    const path = join(cfg.dir, f);
+    const text = readText(path);
+    const up = text === undefined ? text : upSection(text);
+    if (up === text) return path;
+    const copy = join(copies, f);
+    mkdirSync(join(copy, '..'), { recursive: true });
+    writeFileSync(copy, up ?? '');
+    original.set(copy, path);
+    return copy;
+  });
+  let ran: Ran;
+  try {
+    ran = await run('npx', ['--yes', SQUAWK, '--reporter', 'json', ...files], { env: toolEnv(), live: false });
+  } finally {
+    rmSync(copies, { recursive: true, force: true });
+  }
   // squawk exits 1 when it finds anything; JSON on stdout either way. Anything else is a linter that did not run.
   const start = ran.out.indexOf('[');
   if (start < 0) {
@@ -176,7 +220,9 @@ export async function lint(
     return { findings: [], note, unlinted: `the added migrations were not linted: ${note}` };
   }
   const findings = parseSquawk(ran.out.slice(start, ran.out.lastIndexOf(']') + 1), (file) =>
-    relative(top, file).split('\\').join('/'),
+    relative(top, original.get(file) ?? file)
+      .split('\\')
+      .join('/'),
   );
   return { findings };
 }
@@ -358,14 +404,28 @@ export async function migrations(
         base = undefined; // the service did not exist (or had no environment) at the base: nothing is deployed
       }
     }
-    const baseFiles = baseCfg ? listFiles(baseCfg.dir) : [];
-    const headFiles = listFiles(cfg.dir);
+    // Where the base keeps the migrations: its own `migrate:`, else the same directory at the base. Migrations often
+    // exist, and are deployed, before a vgate service declares them; they are then the base's, not this change's.
+    let baseMig = baseCfg;
+    if (!baseMig) {
+      const rel = relative(change.top, cfg.dir);
+      if (rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)) baseMig = { ...cfg, dir: join(worktree, rel) };
+    }
+    const baseFiles = baseMig ? migrationFiles(baseMig) : [];
+    const headFiles = migrationFiles(cfg);
+    const baseForward = baseFiles.filter((f) => !isUndoFile(f));
     report.added = addedMigrations(baseFiles, headFiles);
-    const changed = baseCfg
+    const changed = baseMig
       ? editedMigrations(baseFiles, headFiles, (f) =>
-          readFileSync(join(baseCfg.dir, f)).equals(readFileSync(join(cfg.dir, f))),
+          readFileSync(join(baseMig.dir, f)).equals(readFileSync(join(cfg.dir, f))),
         )
       : { edited: [], removed: [] };
+    // The base does not declare the service: nothing of it is deployed that vgate could start on the new schema.
+    const newAtBase = base?.environment
+      ? undefined
+      : baseForward.length > 0
+        ? `${options.service} is new at ${change.base}: the ${baseForward.length} migrations in ${report.dirs[0]} are already there`
+        : `${options.service} is new at ${change.base}: nothing is deployed`;
     const unverified = [
       ...changed.edited.map(
         (f) => `${f} is edited, but the deployed databases already applied it and will not run it again`,
@@ -374,7 +434,8 @@ export async function migrations(
     ];
     if (report.added.length === 0) {
       report.verdict = unverified.length > 0 ? 'needs-approval' : 'safe';
-      report.reasons = unverified.length > 0 ? unverified : ['this change adds no migration'];
+      report.reasons =
+        unverified.length > 0 ? unverified : ['this change adds no migration', ...(newAtBase ? [newAtBase] : [])];
       return finish();
     }
 
@@ -405,13 +466,13 @@ export async function migrations(
 
     const steps = report.steps;
     const current = env;
-    if (baseCfg && baseFiles.length > 0)
+    if (baseMig && baseForward.length > 0)
       steps.push(
         await timed('apply-base', async () => {
-          const ran = await migrate(current, baseCfg, baseCfg.dir, baseCfg.command, options.live);
+          const ran = await migrate(current, baseMig, baseMig.dir, baseMig.command, options.live);
           return {
             ok: ran.code === 0,
-            detail: ran.code === 0 ? `${baseFiles.filter((f) => !isUndoFile(f)).length} migrations` : tail(ran.out),
+            detail: ran.code === 0 ? `${baseForward.length} migrations` : tail(ran.out),
           };
         }),
       );
@@ -468,17 +529,23 @@ export async function migrations(
             `no test of the deployed version matches the smoke filter "${smoke}": only its health was checked on the migrated schema`,
           );
       }
-    } else if (applied)
-      steps.push({
-        name: 'old-code',
-        status: 'skipped',
-        durationMs: 0,
-        detail: 'the service is new: nothing is deployed',
-      });
+    } else if (applied) {
+      steps.push({ name: 'old-code', status: 'skipped', durationMs: 0, detail: newAtBase ?? 'nothing is deployed' });
+      // Migrations at the base mean a deployed schema, and code running on it that no check started: a person decides.
+      if (baseForward.length > 0)
+        unverified.push(
+          `${options.service} is not declared at ${change.base}, so the deployed code was not started on the migrated schema (the ${baseForward.length} migrations there were applied first)`,
+        );
+    }
 
     const judged = migrationsVerdict(steps, report.lint, unverified);
     report.verdict = judged.verdict;
-    report.reasons = judged.reasons;
+    // Safe and new (migrations at the base would have asked a person): say so, so the verdict is not read as more
+    // than it is.
+    report.reasons =
+      judged.verdict === 'safe' && newAtBase
+        ? [`${newAtBase}; its ${report.added.length} migration(s) were checked on an empty database`]
+        : judged.reasons;
     return finish();
   } catch (error) {
     return notReady(options.service, (error as Error).message);

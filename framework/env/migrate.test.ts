@@ -5,13 +5,16 @@ import {
   addedMigrations,
   applyOrder,
   DEFAULT_SMOKE,
+  isMigrationFile,
   isUndoFile,
   migrateConfigs,
+  migrationLayout,
   migrationDirsOf,
   migrationsVerdict,
   editedMigrations,
   parseSquawk,
   touchedMigrations,
+  upSection,
   type MigrationStep,
 } from './migrate.ts';
 
@@ -62,6 +65,88 @@ describe('the files a change touches and adds', () => {
     );
     assert.ok(isUndoFile('0002_x.down.sql') && isUndoFile('U2__drop.sql'));
     assert.ok(!isUndoFile('V2__add.sql') && !isUndoFile('20260101_goose.sql') && !isUndoFile('download.sql'));
+  });
+});
+
+describe('the files that are migrations', () => {
+  it('reads the layout from the tool the command or image runs, or from goose annotations in the files', () => {
+    assert.equal(migrationLayout({ command: 'goose -dir /migrations postgres "$DATABASE_URL" up' }), 'goose');
+    assert.equal(migrationLayout({ command: 'up', image: 'ghcr.io/kukymbr/goose-docker:3.26.0' }), 'goose');
+    assert.equal(migrationLayout({ command: './api db up' }, true), 'goose');
+    assert.equal(
+      migrationLayout({ command: 'migrate -path /migrations -database "$DATABASE_URL?sslmode=disable" up' }),
+      'golang-migrate',
+    );
+    assert.equal(migrationLayout({ command: 'up', image: 'migrate/migrate:v4.18.1' }), 'golang-migrate');
+    assert.equal(migrationLayout({ command: 'flyway -locations=filesystem:/migrations migrate' }), 'flyway');
+    assert.equal(migrationLayout({ command: 'for f in /migrations/*.up.sql; do psql -f "$f"; done' }), 'generic');
+  });
+  it("selects each layout's migration files, never a README, a dotfile or a goose embed file", () => {
+    const dir = [
+      '.gitkeep',
+      '00001_init.sql',
+      '00002_backfill.go',
+      '00002_backfill_test.go',
+      '1_users.up.sql',
+      '1_users.down.sql',
+      'R__views.sql',
+      'README.md',
+      'U2__drop.sql',
+      'V1.1__add.sql',
+      'V2__add.sql',
+      'embed.go',
+      'notes.txt',
+      'env.py',
+    ];
+    const pick = (layout: Parameters<typeof isMigrationFile>[1]) => dir.filter((f) => isMigrationFile(f, layout));
+    assert.deepEqual(pick('goose'), ['00001_init.sql', '00002_backfill.go', '1_users.up.sql', '1_users.down.sql']);
+    assert.deepEqual(pick('golang-migrate'), ['1_users.up.sql', '1_users.down.sql']);
+    assert.deepEqual(pick('flyway'), ['R__views.sql', 'U2__drop.sql', 'V1.1__add.sql', 'V2__add.sql']);
+    // An unknown tool: every file but documentation and dotfiles, so an Alembic or knex migration is never missed.
+    assert.deepEqual(
+      pick('generic'),
+      dir.filter((f) => !['.gitkeep', 'README.md', 'notes.txt'].includes(f)),
+    );
+  });
+});
+
+describe('upSection', () => {
+  it("keeps a goose migration's Up statements and blanks its Down section, line for line", () => {
+    const goose = [
+      '-- +goose Up',
+      'ALTER TABLE items ADD COLUMN note text;',
+      '',
+      '-- +goose Down',
+      'ALTER TABLE items DROP COLUMN note;',
+      '',
+    ].join('\n');
+    const up = upSection(goose);
+    assert.equal(up.split('\n').length, goose.split('\n').length);
+    assert.deepEqual(up.split('\n'), ['-- +goose Up', 'ALTER TABLE items ADD COLUMN note text;', '', '', '', '']);
+  });
+  it('blanks every Down section, in any order, StatementBegin blocks included, and leaves other files alone', () => {
+    const goose = [
+      '-- +goose Down',
+      'DROP TABLE a;',
+      '--  +goose up',
+      '-- +goose StatementBegin',
+      'CREATE TABLE a (id int);',
+      '-- +goose StatementEnd',
+      '-- +goose Down',
+      'DROP TABLE b;\r',
+    ].join('\n');
+    assert.deepEqual(upSection(goose).split('\n'), [
+      '',
+      '',
+      '--  +goose up',
+      '-- +goose StatementBegin',
+      'CREATE TABLE a (id int);',
+      '-- +goose StatementEnd',
+      '',
+      '',
+    ]);
+    const plain = 'ALTER TABLE items DROP COLUMN note;\n-- the down file undoes it\n';
+    assert.equal(upSection(plain), plain);
   });
 });
 

@@ -102,6 +102,75 @@ export function touchedMigrations(files: string[], dirs: string[]): string[] {
 }
 
 /**
+ * How the migration tool names its files: what decides which files of the migrations directory are migrations (a
+ * README, a `.gitkeep` or goose's `embed.go` beside them is not one, and counting it would undo one migration too many
+ * in the round trip).
+ */
+export type MigrationLayout = 'goose' | 'golang-migrate' | 'flyway' | 'generic';
+
+/**
+ * The layout of the tool `command` (or `image`) runs. goose is also recognised from its `-- +goose Up` annotations
+ * (`gooseAnnotated`), for a project that runs goose through its own binary. Anything else is `generic`.
+ */
+export function migrationLayout(
+  cfg: Pick<MigrateConfig, 'command' | 'image'>,
+  gooseAnnotated = false,
+): MigrationLayout {
+  const tool = `${cfg.command}\n${cfg.image ?? ''}`;
+  if (gooseAnnotated || /\bgoose\b/i.test(tool)) return 'goose';
+  if (/\bflyway\b/i.test(tool)) return 'flyway';
+  if (
+    /(?:^|[\s;&|(/])migrate\s+-(?:path|source|database)\b/.test(cfg.command) ||
+    /\bmigrate\/migrate\b/.test(cfg.image ?? '')
+  )
+    return 'golang-migrate';
+  return 'generic';
+}
+
+/** A goose annotation line: `-- +goose Up`, `-- +goose Down`. Exported for the CLI's layout detection. */
+export const GOOSE_ANNOTATION = /^\s*--\s*\+goose\s+(up|down)\b/i;
+
+/**
+ * Whether `file` (a name in the migrations directory) is a migration of `layout`, forward or undo:
+ *
+ * - goose: `<version>_<name>.sql` or `.go` (not a `_test.go`)
+ * - golang-migrate: `<version>_<title>.up.<ext>` and `.down.<ext>`
+ * - Flyway: `V<version>__<desc>.sql`, `U<version>__<desc>.sql`, `R__<desc>.sql`
+ * - generic (a tool vgate does not know): every file but dotfiles and documentation, so an Alembic, knex or plain-SQL
+ *   migration is never missed; a file that is no migration then shows up as one, never the other way round
+ */
+export function isMigrationFile(file: string, layout: MigrationLayout): boolean {
+  const name = file.split('/').pop() ?? file;
+  switch (layout) {
+    case 'goose':
+      return /^\d+_.*\.(?:sql|go)$/.test(name) && !name.endsWith('_test.go');
+    case 'golang-migrate':
+      return /^\d+_.*\.(?:up|down)\.[^.]+$/.test(name);
+    case 'flyway':
+      return /^(?:[VU]\d+(?:[._]\d+)*|R)__.+\.sql$/.test(name);
+    case 'generic':
+      return !name.startsWith('.') && !/\.(?:md|markdown|txt|rst|adoc)$/i.test(name);
+  }
+}
+
+/**
+ * The SQL that deploys: a goose file keeps its undo in the same file, after `-- +goose Down`, and that section only runs
+ * on a rollback. The Down sections' lines are blanked, not removed, so a linter's line numbers stay the file's. Text
+ * without a Down annotation comes back unchanged.
+ */
+export function upSection(sql: string): string {
+  let down = false;
+  return sql
+    .split('\n')
+    .map((line) => {
+      const annotation = GOOSE_ANNOTATION.exec(line);
+      if (annotation) down = annotation[1].toLowerCase() === 'down';
+      return down ? '' : line;
+    })
+    .join('\n');
+}
+
+/**
  * A file that undoes a migration rather than being one: golang-migrate's and similar `*.down.sql`, Flyway's `U<n>__`.
  * Tools apply only the forward files; counting the undo files would undo too much in the round trip.
  */
