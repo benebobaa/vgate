@@ -15,15 +15,15 @@ owner review (step 5) is what stops that.
 `vgate init --ci github` copies `ci/github/vgate.yml` to `.github/workflows/vgate.yml`, and
 `ci/github/CODEOWNERS.example` to `.github/CODEOWNERS.vgate.example`.
 
-| Job         | When                                                                 | Does                                                                                                  |
-| ----------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `plan`      | always                                                               | the pinned version, the merge base, `vgate affected` (which services), `vgate risk` (how risky)       |
-| `gate`      | per affected service (every service on a push to the default branch) | `doctor --fix`, `up`, `gate`, `down`; the verdict as evidence, the full reports as an artifact        |
-| `guard`     | pull requests and merge queues, per affected or deleted service      | `vgate guard` against the merge base; its result as evidence                                          |
-| `decide`    | pull requests and merge queues, always                               | `vgate decide` over all evidence; one sticky comment on the pull request; the decision in the summary |
-| `approval`  | only on `needs-approval`                                             | waits in the protected environment `vgate-expectations` for a required reviewer                       |
-| `verdict`   | always                                                               | **the check to require**: passes on `merge`, or on `needs-approval` once approved                     |
-| `automerge` | pull requests from the same repository                               | on `merge` with `VGATE_AUTOMERGE: 'true'`, turns on GitHub auto-merge; otherwise turns it off         |
+| Job         | When                                                                 | Does                                                                                                                                       |
+| ----------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `plan`      | always                                                               | the pinned version, the merge base, `vgate affected` (which services), `vgate risk` (how risky)                                            |
+| `gate`      | per affected service (every service on a push to the default branch) | `doctor --fix`, `up`, `gate`, `down`, then migrations and mutation against the merge base; the verdict as evidence, the full reports       |
+| `guard`     | pull requests and merge queues, per affected or deleted service      | `vgate guard` against the merge base; its result as evidence                                                                               |
+| `decide`    | pull requests and merge queues, always                               | `vgate decide` over all evidence, `blocked` whenever a `gate` job failed or was cancelled; one sticky comment; the decision in the summary |
+| `approval`  | only on `needs-approval`, also when no service was gated             | waits in the protected environment `vgate-expectations` for a required reviewer                                                            |
+| `verdict`   | always                                                               | **the check to require**: passes on `merge`, or on `needs-approval` once approved                                                          |
+| `automerge` | pull requests from the same repository                               | on `merge` after a passed (or skipped) `gate` with `VGATE_AUTOMERGE: 'true'`, turns on GitHub auto-merge; otherwise turns it off           |
 
 Settings in the workflow's `env`:
 

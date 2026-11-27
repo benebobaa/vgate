@@ -123,3 +123,110 @@ describe('gate workflows: the mutation step', { skip }, () => {
     assert.ok(gitlab.includes(pattern), pattern);
   });
 });
+
+// The gate job's own result: decide and automerge must not trust a passing verdict.json from a gate job that failed
+// after writing it (a migrations or mutation step, a shallow checkout), and approval must run whatever the gate did.
+type Step = {
+  name?: string;
+  uses?: string;
+  run?: string;
+  with?: Record<string, unknown>;
+  env?: Record<string, string>;
+};
+type Job = { needs?: string | string[]; if?: string; steps: Step[] };
+const pr = (parse(read('github/vgate.yml')) ?? { jobs: {} }) as { jobs: Record<string, Job | undefined> };
+const job = (name: string): Job => pr.jobs[name] ?? { steps: [] };
+const needs = (name: string) => [job(name).needs ?? []].flat();
+const decideStep = job('decide').steps.find((step) => step.name === 'Decide') ?? {};
+const automergeStep = job('automerge').steps.find((step) => step.name === 'Auto-merge') ?? {};
+
+function sandbox(prefix: string, tools: Record<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  dirs.push(dir);
+  mkdirSync(join(dir, 'bin'));
+  for (const [name, body] of Object.entries(tools)) {
+    writeFileSync(join(dir, 'bin', name), body);
+    chmodSync(join(dir, 'bin', name), 0o755);
+  }
+  return dir;
+}
+
+function decides(gateResult: string, decision = 'merge'): string {
+  const exit = decision === 'merge' ? 0 : 1;
+  const dir = sandbox('vgate-decide-step-', {
+    vgate: `#!/usr/bin/env bash\necho '{"data":{"decision":"${decision}"}}'\nexit ${exit}\n`,
+  });
+  const output = join(dir, 'output');
+  writeFileSync(output, '');
+  spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', decideStep.run ?? 'exit 1'], {
+    cwd: dir,
+    encoding: 'utf8',
+    env: {
+      PATH: `${join(dir, 'bin')}:${process.env.PATH ?? ''}`,
+      RUNNER_TEMP: dir,
+      GITHUB_OUTPUT: output,
+      GITHUB_STEP_SUMMARY: join(dir, 'summary.md'),
+      VGATE_REPORTS_DIR: 'reports',
+      BASE: 'main',
+      DETAILS_URL: 'https://example.invalid/run',
+      GATE_RESULT: gateResult,
+    },
+  });
+  return /^decision=(.*)$/m.exec(readFileSync(output, 'utf8'))?.[1] ?? 'none';
+}
+
+function automerges(gate: string, decision = 'merge'): string {
+  const dir = sandbox('vgate-automerge-step-', { gh: `#!/usr/bin/env bash\necho "$*" >> "$GH_LOG"\n` });
+  const log = join(dir, 'gh.log');
+  writeFileSync(log, '');
+  spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', automergeStep.run ?? 'exit 1'], {
+    cwd: dir,
+    env: {
+      PATH: `${join(dir, 'bin')}:${process.env.PATH ?? ''}`,
+      GH_LOG: log,
+      REPO: 'o/r',
+      PR: '1',
+      DECISION: decision,
+      GATE: gate,
+      VGATE_AUTOMERGE: 'true',
+      VGATE_MERGE_METHOD: 'squash',
+    },
+  });
+  return readFileSync(log, 'utf8').trim();
+}
+
+describe('gate workflow: the gate job result', { skip }, () => {
+  it('checks out the full history in the gate job: migrations and mutation read the merge base from git', () => {
+    const checkout = job('gate').steps.find((step) => step.uses?.startsWith('actions/checkout@'));
+    assert.equal(checkout?.with?.['fetch-depth'], 0);
+  });
+
+  it('decide blocks when the gate job failed or was cancelled, whatever its evidence says', () => {
+    assert.equal(decideStep.env?.GATE_RESULT, '${{ needs.gate.result }}');
+    assert.equal(decides('failure'), 'blocked');
+    assert.equal(decides('cancelled'), 'blocked');
+    // success, or skipped because no service was affected: the evidence decides.
+    assert.equal(decides('success'), 'merge');
+    assert.equal(decides('skipped'), 'merge');
+    assert.equal(decides('skipped', 'needs-approval'), 'needs-approval');
+  });
+
+  it('automerge needs the gate job and turns auto-merge on only after a passed or skipped gate', () => {
+    assert.ok(needs('automerge').includes('gate'));
+    assert.equal(automergeStep.env?.GATE, '${{ needs.gate.result }}');
+    assert.match(automerges('success'), /pr merge 1 --repo o\/r --auto --squash/);
+    assert.match(automerges('skipped'), /--auto --squash/);
+    for (const gate of ['failure', 'cancelled', '']) {
+      assert.match(automerges(gate), /--disable-auto/);
+      assert.doesNotMatch(automerges(gate), /--auto /);
+    }
+    assert.match(automerges('success', 'blocked'), /--disable-auto/);
+  });
+
+  it('approval runs on needs-approval even when the gate job was skipped', () => {
+    const condition = job('approval').if ?? '';
+    assert.match(condition, /^always\(\) && /);
+    assert.match(condition, /needs\.decide\.result == 'success'/);
+    assert.match(condition, /needs\.decide\.outputs\.decision == 'needs-approval'/);
+  });
+});
