@@ -36,11 +36,11 @@ clicking through the service to see whether it still works.
 `vgate decide --base <merge base> --evidence <dir>` reads every `verdict.json` (from `vgate gate`) and `guard.json`
 (from `vgate guard`) under the evidence directory and decides:
 
-| Decision         | When                                                                                                                                           | What happens                                                   |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `blocked`        | an affected service's gate failed, or its verdict is missing, partial or stale                                                                 | the check fails; the author fixes the change                   |
-| `needs-approval` | every gate passed, but a guard said `needs-human` or did not run, a service was deleted, or the change's risk tier is above `policy.autoMerge` | the check waits for one approval of the reasons listed         |
-| `merge`          | every affected service's gate passed, every guard said `auto`, and the risk tier is within `policy.autoMerge`                                  | the check passes; with auto-merge on, the change merges itself |
+| Decision         | When                                                                                                                                            | What happens                                                   |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `blocked`        | an affected service's gate failed, or its verdict is missing, partial or stale; on GitHub also a gate job that failed after writing its verdict | the check fails; the author fixes the change                   |
+| `needs-approval` | every gate passed, but a guard said `needs-human` or did not run, a service was deleted, or the change's risk tier is above `policy.autoMerge`  | the check waits for one approval of the reasons listed         |
+| `merge`          | every affected service's gate passed, every guard said `auto`, and the risk tier is within `policy.autoMerge`                                   | the check passes; with auto-merge on, the change merges itself |
 
 `decide` recomputes which services the change affects instead of trusting the jobs that ran, so a job that was
 skipped, cancelled or never configured is missing evidence, and missing evidence blocks. The decision fails closed.

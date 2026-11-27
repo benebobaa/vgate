@@ -147,6 +147,10 @@ jobs:
       SERVICE: ${{ matrix.service }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # `vgate migrations --base` and `vgate mutate --base` read the merge base from git: the history down to it
+          # must be present. A shallow checkout answers "Unknown base ref" and fails the job after a passing gate.
+          fetch-depth: 0
       - name: Install vgate
         env:
           VGATE_VERSION: ${{ needs.plan.outputs.version }}
@@ -403,6 +407,7 @@ jobs:
         working-directory: ${{ env.VGATE_PROJECT_DIR }}
         env:
           DETAILS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GATE_RESULT: ${{ needs.gate.result }}
         run: |
           mkdir -p "$RUNNER_TEMP/evidence"
           # The decision is read from vgate's own output, never from a file the pull request could have committed.
@@ -418,6 +423,13 @@ jobs:
             echo "::error::vgate decide gave no usable decision (exit $code)"; cat "$RUNNER_TEMP/decide.json"
             decision=blocked
           fi
+          # A gate job can fail after its evidence is written (migrations, mutation, a crashed step) and leave a passing
+          # verdict.json behind: the job's own result wins, or a red gate could merge. skipped means no affected service.
+          case "$GATE_RESULT" in
+            failure | cancelled)
+              echo "::error::the gate job did not pass ($GATE_RESULT): blocked, whatever its evidence says"
+              decision=blocked ;;
+          esac
           echo "decision=$decision" >>"$GITHUB_OUTPUT"
           if [ -f "$VGATE_REPORTS_DIR/decision.md" ]; then cat "$VGATE_REPORTS_DIR/decision.md" >>"$GITHUB_STEP_SUMMARY"; fi
           echo "vgate decision: $decision"
@@ -457,7 +469,9 @@ jobs:
 
   approval:
     needs: decide
-    if: needs.decide.outputs.decision == 'needs-approval'
+    # always(): without it GitHub's implicit success() skips this job whenever any upstream job (the gate) was skipped
+    # or failed, so a change that gates no service but needs a person (a workflow change) could never be approved.
+    if: always() && needs.decide.result == 'success' && needs.decide.outputs.decision == 'needs-approval'
     runs-on: ubuntu-latest
     # Settings > Environments > vgate-expectations: required reviewers (people, not the bot that opens the pull
     # requests) and "Prevent self-review". The job waits here until one of them approves this run.
@@ -513,7 +527,9 @@ jobs:
           esac
 
   automerge:
-    needs: [decide]
+    # The gate job's own result too, not only decide's reading of its evidence. The job still runs when the gate failed,
+    # so that it turns off an auto-merge an earlier push turned on.
+    needs: [gate, decide]
     if: >-
       always() && github.event_name == 'pull_request' && needs.decide.result == 'success'
       && github.event.pull_request.head.repo.full_name == github.repository
@@ -530,13 +546,17 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           DECISION: ${{ needs.decide.outputs.decision }}
+          GATE: ${{ needs.gate.result }}
         run: |
           case "$VGATE_MERGE_METHOD" in merge | squash | rebase) ;; *) echo "::error::VGATE_MERGE_METHOD must be merge, squash or rebase"; exit 1 ;; esac
-          if [ "$DECISION" = merge ] && [ "$VGATE_AUTOMERGE" = true ]; then
+          # skipped: no affected service, nothing to gate. Any other gate result (failure, cancelled) never merges.
+          gate_ok=false
+          case "$GATE" in success | skipped) gate_ok=true ;; esac
+          if [ "$DECISION" = merge ] && [ "$gate_ok" = true ] && [ "$VGATE_AUTOMERGE" = true ]; then
             gh pr merge "$PR" --repo "$REPO" --auto "--$VGATE_MERGE_METHOD"
             echo "Auto-merge on: GitHub merges once the required checks pass."
           else
             # A later push that is no longer `merge` must not ride on an earlier push's auto-merge.
             gh pr merge "$PR" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
-            echo "No auto-merge (decision: ${DECISION:-none}, VGATE_AUTOMERGE=$VGATE_AUTOMERGE)."
+            echo "No auto-merge (decision: ${DECISION:-none}, gate: ${GATE:-none}, VGATE_AUTOMERGE=$VGATE_AUTOMERGE)."
           fi
